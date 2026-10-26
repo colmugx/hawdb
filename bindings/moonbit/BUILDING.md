@@ -8,8 +8,8 @@ release is subordinate to `bindings/ffi`.
 
 - Rust toolchain: `rust-toolchain.toml`, version 1.97.1.
 - Standalone dependency graph: `native/Cargo.lock` committed in this branch.
-- Production CI: `cargo build --release --locked`; Windows uses
-  `cargo check --locked` for a compile-only qualification.
+- Production CI: `cargo build --release --locked` on Linux, macOS and Windows;
+  Windows must link and run the same database conformance executable.
 - MoonBit toolchain: public installer currently returns HTTP 403 for the
   historical binary path `0.1.20261023` even though that build passed Linux
   CI. For availability, CI installs the official latest channel and
@@ -24,12 +24,13 @@ release is subordinate to `bindings/ffi`.
 | Host | Rust adapter | MoonBit API | Actual embedded execution |
 | --- | --- | --- | --- |
 | Ubuntu 24.04 (x86_64) | release staticlib | native | complete suite |
-| macOS latest (Apple Silicon) | release staticlib | native | complete suite (CI qualification pending) |
-| Windows 2025 | `cargo check --locked` | `moon check --target native` | **NOT YET** — MSVC/link flags and runtime qualification remain |
+| macOS latest (Apple Silicon) | release staticlib | native | complete suite |
+| Windows 2025 (x64) | release `.lib` staticlib | `moon check --target native` | full executable conformance (new CI qualification) |
 
 These are platform qualifications, not performance comparisons.
-The macOS job is required to pass for full Unix compatibility; do not mark
-macOS support complete merely because a workflow was created.
+Windows must also link the Rust staticlib into the MoonBit executable and
+execute every CASE_PASS test; a typecheck or cargo check is insufficient.
+Windows uses MSVC environment setup following colmugx/posoco's check.yml.
 
 ## Publishing
 
@@ -52,7 +53,7 @@ structs (see `tools/README.md`).
 
 ## Release staging (not registry publication)
 
-After native conformance, Unix jobs stage a per-OS/per-architecture tarball
+After native conformance, all three platforms stage a per-OS/per-architecture tarball
 and SHA256 checksum as a GitHub Actions artifact. The archive includes
 MoonBit source, the matching Rust staticlib, package documentation, license,
 and a provenance manifest containing the commit and tested toolchains.
@@ -66,10 +67,16 @@ python3 tools/stage_release.py --os Linux --arch X64
 This is a **review artifact**, not an upstream release or a working
 `moon install` distribution. Consumers still need to link the native static
 library in their executable `moon.pkg`. Third-party attribution/SBOM,
-stable native ABI policy, verified binary checksums and Windows native
-linking must be resolved before a public production release.
+stable native ABI policy, verified binary checksums and platform-native linker qualification must be reviewed before a public
+production release.
 
 On macOS, the full Rust static archive requires Apple frameworks
 `CoreFoundation` and `IOKit`; CI adds these to the MoonBit executable's
 `cc-link-flags` only on macOS. Applications linking the Rust staticlib must
 supply equivalent platform-native system flags.
+
+On Windows, CI initializes MSVC with `ilammy/msvc-dev-cmd@v1`, builds
+`hawdb_moonbit.lib` using `cargo build --release --locked`, and uses
+`tools/configure_native_link.py --os windows` to adapt the conformance
+executable's platform-specific linking flags. This is modeled on Posoco's
+3-OS testing strategy, extended to native database execution on every OS.

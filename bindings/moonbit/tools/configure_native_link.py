@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""Select platform-specific link inputs for the MoonBit conformance executable.
+
+Run after moon check and before moon run. The native Rust adapter is a
+platform-native static library, not the generic HawDB C FFI library.
+"""
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+SOURCE = "native/target/release/libhawdb_moonbit.a -ldl -lpthread -lm"
+FLAGS = {
+    "linux": SOURCE,
+    "macos": SOURCE + " -framework CoreFoundation -framework IOKit",
+    "windows": (
+        "native/target/release/hawdb_moonbit.lib"
+        " -lws2_32 -luserenv -lbcrypt -ladvapi32 -lntdll"
+        " -lshell32 -lsecur32 -lcrypt32 -liphlpapi -lole32"
+    ),
+}
+
+
+def configure(pkg: Path, system: str) -> None:
+    original = pkg.read_text(encoding="utf-8")
+    if original.count(SOURCE) != 1:
+        raise ValueError(f"Expected exactly one unconfigured link flag field in {pkg}")
+    pkg.write_text(original.replace(SOURCE, FLAGS[system]), encoding="utf-8")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--os", choices=sorted(FLAGS), required=True)
+    parser.add_argument("--pkg", type=Path, default=Path("tests/conformance/moon.pkg"))
+    args = parser.parse_args()
+    configure(args.pkg, args.os)
+    print(f"LINK_PLATFORM {args.os}")

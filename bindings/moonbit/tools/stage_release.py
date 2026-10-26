@@ -22,6 +22,7 @@ def main() -> None:
     parser.add_argument("--os", required=True)
     parser.add_argument("--arch", required=True)
     args = parser.parse_args()
+    library_name = ("hawdb_moonbit.lib" if args.os.lower() == "windows" else "libhawdb_moonbit.a")
     manifest = [
         ("moon.mod", MODULE / "moon.mod"),
         ("moon.pkg", MODULE / "moon.pkg"),
@@ -35,8 +36,8 @@ def main() -> None:
         ("tools/README.md", MODULE / "tools/README.md"),
         ("LICENSE", REPOSITORY / "LICENSE"),
         (
-            "native/target/release/libhawdb_moonbit.a",
-            MODULE / "native" / "target" / "release" / "libhawdb_moonbit.a",
+            "native/target/release/" + library_name,
+            MODULE / "native" / "target" / "release" / library_name,
         ),
     ]
     for _, path in manifest:
