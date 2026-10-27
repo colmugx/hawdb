@@ -6,7 +6,7 @@ First-class, in-process MoonBit SDK for the HawDB embedded Rust engine.
 
 ## Status
 
-Development SDK, validated on Ubuntu Linux native in CI. Not yet a release
+Development SDK, validated by real-engine native CI on Linux x64, macOS ARM64 and Windows x64. Not yet a release
 or a claim of parity with the full Python/Go feature set.
 
 ## Build and test
@@ -43,6 +43,38 @@ representation; the Rust adapter validates it when binding parameters.
 The transport uses JSON with tagged binary, UUID and vector envelopes,
 not an in-process borrowed Arrow/vector cursor. Materialized results
 are owned and remain accessible after the database closes.
+
+## Public API tiers (pre-1.0 review)
+
+The recommended application-facing surface is deliberately small:
+
+- **Core:** `open(path)`, `open_in_memory()`, `open_read_only(path)`,
+  `Database::query` (Cypher named `Map[String, Value]` parameters),
+  `Database::query_sql` (SQL positional `Array[Value]` parameters),
+  `Database::close`, `Value`, `QueryResult` and `HawdbError`.
+  Database calls return `Result[..., HawdbError]`; `get(row, column)`
+  returns `None` if the row or column is absent, but `Some(Value::Null)`
+  if the column exists and contains SQL/Cypher null.
+- **Transactional core:** `begin`, `begin_read`,
+  `Transaction::query` / `query_sql`, `commit`, `rollback`,
+  `close` and the `with_transaction` / `with_read_transaction`
+  scoped helpers. Never reuse a transaction after finish. If the caller
+  explicitly closes the parent database, keeping a transaction value alive
+  does not promise it can still execute.
+- **Convenience:** `query_or_raise` and `query_sql_or_raise` adapt
+  the same typed errors to MoonBit `raise`; they are not independent
+  query engines.
+- **Advanced/unstable:** `query_raw` and `query_sql_raw` expose
+  JSON transport and string error envelopes. `HawdbParams`, `HawdbRow`,
+  `to_params`, `from_row` and the external `#derive` source
+  generator are opt-in record mapping APIs, not a built-in macro or ORM.
+
+No existing public symbol has been removed in this consolidation pass.
+This is an API-review classification, **not a stable-version promise**.
+Transport JSON, generator syntax, transaction ownership and native linking
+must be reviewed before claiming a production/public ABI commitment.
+All recursive `Value::List` and `Value::Map` paths must respect the same
+64-level codec bound; typed queries reject deeper parameter trees.
 
 ## Conformance
 
