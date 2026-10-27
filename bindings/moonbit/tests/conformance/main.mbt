@@ -848,7 +848,23 @@ fn nested_depth_case() -> Bool {
     Err(@hawdb.HawdbError::Codec(message)) => message.contains("64")
     _ => false
   }
+  // A nested Map must consume the same depth budget as a nested List.
+  // Previously Map entries restarted depth at zero, bypassing the limit.
+  let mut map_deep = @hawdb.Value::Null
+  for i = 0; i < 70; i = i + 1 {
+    map_deep = @hawdb.Value::Map({"child": map_deep})
+  }
+  let map_answer = db.query("CREATE (:DeepMap {nested: $v})", {"v": map_deep})
+  let map_rejected = match map_answer {
+    Err(@hawdb.HawdbError::Codec(message)) => message.contains("64")
+    _ => false
+  }
+  if !map_rejected {
+    db.close()
+    return failed("typed.map_max_nesting", "over-deep maps bypassed codec depth limit")
+  }
   db.close()
+  println("CASE_PASS typed.map_max_nesting")
   if rejected {
     println("CASE_PASS typed.max_nesting")
     true
