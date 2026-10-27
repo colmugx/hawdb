@@ -15,8 +15,8 @@ FLAGS = {
     "macos": SOURCE + " -framework CoreFoundation -framework IOKit",
     "windows": (
         "native/target/release/hawdb_moonbit.lib"
-        " -lws2_32 -luserenv -lbcrypt -ladvapi32 -lntdll"
-        " -lshell32 -lsecur32 -lcrypt32 -liphlpapi -lole32"
+        " ws2_32.lib userenv.lib bcrypt.lib advapi32.lib ntdll.lib"
+        " shell32.lib secur32.lib crypt32.lib iphlpapi.lib ole32.lib"
     ),
 }
 
