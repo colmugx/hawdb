@@ -108,12 +108,14 @@ fn Database::run(
   params_json : String,
   sql : Int,
 ) -> Result[String, String] {
+  let statement_bytes = @utf8.encode(statement)
+  let params_bytes = @utf8.encode(params_json)
   let result = ffi_execute(
     self.handle,
-    @utf8.encode(statement),
-    @utf8.encode(statement).length(),
-    @utf8.encode(params_json),
-    @utf8.encode(params_json).length(),
+    statement_bytes,
+    statement_bytes.length(),
+    params_bytes,
+    params_bytes.length(),
     sql,
   )
   if result.length() == 0 {
