@@ -176,29 +176,62 @@ fn decode_value(value: &Json) -> Result<Value, Failure> {
         }
         Json::Object(values) => {
             if values.len() == 1 {
+                if let Some(v) = values.get("$map") {
+                    let entries = v
+                        .as_array()
+                        .ok_or_else(|| fail("invalid_argument", "$map must be an array"))?;
+                    let mut map = BTreeMap::new();
+                    for entry in entries {
+                        let pair = entry
+                            .as_array()
+                            .filter(|p| p.len() == 2)
+                            .ok_or_else(|| fail("invalid_argument", "$map entry must be a pair"))?;
+                        let key = pair[0]
+                            .as_str()
+                            .ok_or_else(|| fail("invalid_argument", "$map key must be a string"))?;
+                        if map.insert(key.to_owned(), decode_value(&pair[1])?).is_some() {
+                            return Err(fail("invalid_argument", "duplicate $map key"));
+                        }
+                    }
+                    return Ok(Value::Map(map));
+                }
                 if let Some(v) = values.get("$vector") {
                     let numbers = v
                         .as_array()
                         .ok_or_else(|| fail("invalid_argument", "$vector must be an array"))?
                         .iter()
                         .map(|v| {
-                            v.as_f64()
-                                .map(|x| x as f32)
-                                .ok_or_else(|| fail("invalid_argument", "$vector requires numbers"))
+                            let x = v
+                                .as_f64()
+                                .ok_or_else(|| fail("invalid_argument", "$vector requires numbers"))?;
+                            let coordinate = x as f32;
+                            if !coordinate.is_finite() {
+                                return Err(fail(
+                                    "invalid_argument",
+                                    "$vector coordinate is outside finite f32 range",
+                                ));
+                            }
+                            Ok(coordinate)
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     return hawdb::Vector::new(&numbers)
                         .map(Value::Vector)
                         .map_err(|e| fail("invalid_argument", e.to_string()));
                 }
-                if let Some(v) = values.get("$binary").and_then(Json::as_str) {
+                if let Some(v) = values.get("$binary") {
+                    let bytes = v
+                        .as_str()
+                        .ok_or_else(|| fail("invalid_argument", "$binary must be a string"))?;
                     return base64::engine::general_purpose::STANDARD
-                        .decode(v)
+                        .decode(bytes)
                         .map(Value::Binary)
                         .map_err(|e| fail("invalid_argument", e.to_string()));
                 }
-                if let Some(v) = values.get("$uuid").and_then(Json::as_str) {
-                    return v
+                if let Some(v) = values.get("$uuid") {
+                    let uuid = v
+                        .as_str()
+                        .ok_or_else(|| fail("invalid_argument", "$uuid must be a string"))?;
+                    return uuid
                         .parse::<Uuid>()
                         .map(Value::Uuid)
                         .map_err(|e| fail("invalid_argument", e.to_string()));
@@ -226,11 +259,27 @@ fn encode_value(value: &Value) -> Json {
         Value::Uuid(v) => json!({"$uuid":v.to_string()}),
         Value::Vector(v) => json!({"$vector":v.as_ref().coordinates().collect::<Vec<_>>()}),
         Value::List(v) => Json::Array(v.iter().map(encode_value).collect()),
-        Value::Map(v) => Json::Object(
-            v.iter()
-                .map(|(key, value)| (key.clone(), encode_value(value)))
-                .collect(),
-        ),
+        Value::Map(v) => {
+            let reserved = v.len() == 1
+                && v.keys()
+                    .next()
+                    .is_some_and(|key| matches!(key.as_str(), "$binary" | "$uuid" | "$vector" | "$map"));
+            if reserved {
+                let pairs: Vec<Json> = v
+                    .iter()
+                    .map(|(key, value)| {
+                        Json::Array(vec![Json::String(key.clone()), encode_value(value)])
+                    })
+                    .collect();
+                json!({"$map": pairs})
+            } else {
+                Json::Object(
+                    v.iter()
+                        .map(|(key, value)| (key.clone(), encode_value(value)))
+                        .collect(),
+                )
+            }
+        },
     }
 }
 

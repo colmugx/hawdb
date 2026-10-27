@@ -41,7 +41,13 @@ floating-point roundtrip. The other variants are Bool, Null, Float, Text,
 Binary, Uuid, Vector, List and Map. Note: UUID currently stores a textual
 representation; the Rust adapter validates it when binding parameters.
 The transport uses JSON with tagged binary, UUID and vector envelopes,
-not an in-process borrowed Arrow/vector cursor. Materialized results
+plus an escaped `$map` pair-list for singleton maps whose keys collide
+with those reserved tags. A `Value::Map` containing a single `$binary`,
+`$uuid`, `$vector` or `$map` key must remain a Map after roundtrip.
+The Rust bridge rejects malformed tag payloads and vector coordinates that
+would become infinite when stored as f32. Native transport changes are
+internal to matching SDK/staticlib versions; raw JSON is not a stable ABI.
+Results are materialized rather than borrowed Arrow/vector cursors. Materialized results
 are owned and remain accessible after the database closes.
 
 ## Public API tiers (pre-1.0 review)
@@ -84,7 +90,7 @@ All recursive `Value::List` and `Value::Map` paths must respect the same
 - vector schema and exact L2 distance
 - Session-like persistent storage and reopen
 - invalid query recovery, idempotent close, closed-handle rejection
-- exact minimum/maximum signed Int64 values, Unicode and nesting
+- exact minimum/maximum signed Int64 values, Unicode, nesting and singleton-map tag collisions
 - binary bytes, UUID, vector, Null and nested Map/List ADTs
 
 These are feature-contract tests, not certified TPC/LDBC/ANN benchmarks.

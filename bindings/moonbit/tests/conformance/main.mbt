@@ -874,6 +874,83 @@ fn nested_depth_case() -> Bool {
 }
 
 ///|
+/// A singleton map with a reserved ABI tag must survive a roundtrip as a
+/// Map, not turn into Uuid/Binary/Vector (nor lose a literal "$map" key).
+fn typed_marker_map_case() -> Bool {
+  let db = match @hawdb.open_in_memory() {
+    Ok(v) => v
+    Err(e) => return failed("typed.marker_map.open", e.describe())
+  }
+  let params : Map[String, @hawdb.Value] = {
+    "id": @hawdb.Value::Text("marker-map"),
+    "uuid_map": @hawdb.Value::Map({"$uuid": @hawdb.Value::Text("ordinary-text")}),
+    "binary_map": @hawdb.Value::Map({"$binary": @hawdb.Value::Text("not-base64")}),
+    "vector_map": @hawdb.Value::Map({"$vector": @hawdb.Value::Text("not-a-vector")}),
+    "escape_map": @hawdb.Value::Map({"$map": @hawdb.Value::Text("literal-key")}),
+  }
+  match db.query(
+    "CREATE (:MarkerMap {id: $id, uuid_map: $uuid_map, binary_map: $binary_map, vector_map: $vector_map, escape_map: $escape_map})",
+    params,
+  ) {
+    Err(e) => {
+      db.close()
+      return failed("typed.marker_map.create", e.describe())
+    }
+    Ok(_) => ()
+  }
+  let rows = db.query(
+    "MATCH (n:MarkerMap {id: $id}) RETURN n.uuid_map AS a, n.binary_map AS b, n.vector_map AS c, n.escape_map AS d",
+    {"id": @hawdb.Value::Text("marker-map")},
+  )
+  let ok = match rows {
+    Err(e) => failed("typed.marker_map.read", e.describe())
+    Ok(result) =>
+      match (result.get(0, "a"), result.get(0, "b"), result.get(0, "c"), result.get(0, "d")) {
+        (
+          Some(@hawdb.Value::Map(a)),
+          Some(@hawdb.Value::Map(b)),
+          Some(@hawdb.Value::Map(c)),
+          Some(@hawdb.Value::Map(d)),
+        ) =>
+          match (a.get("$uuid"), b.get("$binary"), c.get("$vector"), d.get("$map")) {
+            (
+              Some(@hawdb.Value::Text("ordinary-text")),
+              Some(@hawdb.Value::Text("not-base64")),
+              Some(@hawdb.Value::Text("not-a-vector")),
+              Some(@hawdb.Value::Text("literal-key")),
+            ) => true
+            _ => failed("typed.marker_map", "escaped map value changed")
+          }
+        _ => failed("typed.marker_map", "singleton map decoded as tagged value")
+      }
+  }
+  db.close()
+  if ok { println("CASE_PASS typed.marker_map") }
+  ok
+}
+
+///|
+/// Finite Double coordinates can still overflow HawDB's f32 vector storage.
+fn typed_vector_range_case() -> Bool {
+  let db = match @hawdb.open_in_memory() {
+    Ok(v) => v
+    Err(e) => return failed("typed.vector_range.open", e.describe())
+  }
+  let invalid = db.query_sql("SELECT 1", [@hawdb.Value::Vector([1.0e100])])
+  let rejected = match invalid {
+    Err(@hawdb.HawdbError::Engine(kind, _)) => kind == "invalid_argument"
+    _ => false
+  }
+  db.close()
+  if rejected {
+    println("CASE_PASS typed.vector_range")
+    true
+  } else {
+    failed("typed.vector_range", "f32-overflow coordinate was accepted")
+  }
+}
+
+///|
 fn main {
   if !graph_case() { return }
   if !sql_case() { return }
@@ -883,6 +960,8 @@ fn main {
   if !typed_case() { return }
   if !typed_value_roundtrip() { return }
   if !typed_vector_roundtrip() { return }
+  if !typed_marker_map_case() { return }
+  if !typed_vector_range_case() { return }
   if !typed_rejections() { return }
   if !transaction_case() { return }
   if !generated_codec_case() { return }

@@ -115,6 +115,17 @@ fn value_to_json_depth(value : Value, depth : Int) -> Result[Json, HawdbError] {
           Err(error) => return Err(error)
         }
       }
+      // A singleton map with a reserved tag name would otherwise be
+      // confused with a native binary/UUID/vector envelope.
+      if encoded.length() == 1 {
+        for key, item in encoded {
+          if key == "$binary" || key == "$uuid" || key == "$vector" || key == "$map" {
+            return Ok(Json::object({
+              "$map": Json::array([Json::array([Json::string(key), item])]),
+            }))
+          }
+        }
+      }
       Ok(Json::object(encoded))
     }
   }
@@ -165,6 +176,36 @@ fn json_to_value_depth(json : Json, depth : Int) -> Result[Value, HawdbError] {
     }
     Json::Object(values) => {
       if values.length() == 1 {
+        match values.get("$map") {
+          Some(Json::Array(entries)) => {
+            let decoded : Map[String, Value] = Map([])
+            for entry in entries {
+              match entry {
+                Json::Array(pair) => {
+                  if pair.length() != 2 {
+                    return Err(HawdbError::Codec("$map entries must contain two elements"))
+                  }
+                  let key = match pair[0] {
+                    Json::String(key) => key
+                    _ => return Err(HawdbError::Codec("$map key must be a string"))
+                  }
+                  match decoded.get(key) {
+                    Some(_) => return Err(HawdbError::Codec("duplicate $map key: " + key))
+                    None => ()
+                  }
+                  match json_to_value_depth(pair[1], depth + 1) {
+                    Ok(value) => decoded[key] = value
+                    Err(error) => return Err(error)
+                  }
+                }
+                _ => return Err(HawdbError::Codec("$map entry must be a pair"))
+              }
+            }
+            return Ok(Value::Map(decoded))
+          }
+          Some(_) => return Err(HawdbError::Codec("$map must be an array"))
+          None => ()
+        }
         match values.get("$binary") {
           Some(Json::String(s)) =>
             {
