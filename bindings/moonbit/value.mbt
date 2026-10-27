@@ -110,7 +110,7 @@ fn value_to_json_depth(value : Value, depth : Int) -> Result[Json, HawdbError] {
     Value::Map(values) => {
       let encoded : Map[String, Json] = Map([])
       for key, entry in values {
-        match value_to_json(entry) {
+        match value_to_json_depth(entry, depth + 1) {
           Ok(item) => encoded[key] = item
           Err(error) => return Err(error)
         }
@@ -204,7 +204,7 @@ fn json_to_value_depth(json : Json, depth : Int) -> Result[Value, HawdbError] {
       }
       let decoded : Map[String, Value] = Map([])
       for key, item in values {
-        match json_to_value(item) {
+        match json_to_value_depth(item, depth + 1) {
           Ok(v) => decoded[key] = v
           Err(error) => return Err(error)
         }
