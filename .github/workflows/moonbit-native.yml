@@ -5,10 +5,12 @@ on:
     branches: [feat/moonbit-native-sdk]
     paths:
       - "bindings/moonbit/**"
+      - "bindings/moonbit-consumer-smoke/**"
       - ".github/workflows/moonbit-native.yml"
   pull_request:
     paths:
       - "bindings/moonbit/**"
+      - "bindings/moonbit-consumer-smoke/**"
       - ".github/workflows/moonbit-native.yml"
   workflow_dispatch:
 
@@ -58,6 +60,7 @@ jobs:
           python3 --version
           python3 tools/hawdb_derive.py examples/records.mbt.in tests/conformance/records.generated.mbt --check
           python3 -m unittest discover -s tools/tests -p 'test_*.py'
+          python3 tools/check_api_surface.py
           moon check --target native
       - name: Build adapter with frozen dependencies
         working-directory: bindings/moonbit/native
@@ -81,6 +84,20 @@ jobs:
           moon run --target native tests/conformance 2>&1 | tee conformance.log
           ! grep -q '^CASE_FAIL ' conformance.log
           grep -Fxq 'HAWDB_MOONBIT_BUSINESS_SUITE_PASS' conformance.log
+      - name: Configure external consumer linker (macOS)
+        if: runner.os == 'macOS'
+        working-directory: bindings/moonbit
+        shell: bash
+        run: python3 tools/configure_native_link.py --os macos --pkg ../moonbit-consumer-smoke/consumer/moon.pkg --sdk-prefix ../../moonbit/
+      - name: Execute independent MoonBit consumer
+        working-directory: bindings/moonbit-consumer-smoke/consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          moon check --target native
+          moon run --target native . 2>&1 | tee external-consumer.log
+          ! grep -q '^EXTERNAL_CONSUMER_FAIL ' external-consumer.log
+          grep -Fxq 'EXTERNAL_CONSUMER_PASS' external-consumer.log
       - name: Stage ABI-specific SDK review artifact
         if: success()
         working-directory: bindings/moonbit
@@ -146,6 +163,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Derived MoonBit source is stale" }
           python -m unittest discover -s tools/tests -p 'test_*.py'
           if ($LASTEXITCODE -ne 0) { throw "Generator tests failed" }
+          python tools/check_api_surface.py
+          if ($LASTEXITCODE -ne 0) { throw "Public API drift" }
           moon check --target native
           if ($LASTEXITCODE -ne 0) { throw "MoonBit native check failed" }
       - name: Build Rust staticlib with locked dependencies
@@ -178,6 +197,38 @@ jobs:
           if ($log -notmatch '(?m)^HAWDB_MOONBIT_BUSINESS_SUITE_PASS\r?$') {
             throw "Missing real-engine conformance success marker"
           }
+      - name: Configure independent consumer linker
+        working-directory: bindings/moonbit
+        shell: pwsh
+        run: |
+          python tools/configure_native_link.py --os windows --pkg ../moonbit-consumer-smoke/consumer/moon.pkg --sdk-prefix ../../moonbit/
+          if ($LASTEXITCODE -ne 0) { throw "Consumer link setup failed" }
+      - name: Execute independent MoonBit consumer
+        working-directory: bindings/moonbit-consumer-smoke/consumer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          moon check --target native
+          if ($LASTEXITCODE -ne 0) { throw "Consumer check failed" }
+          moon run --target native . 2>&1 | Tee-Object -FilePath external-consumer.log
+          if ($LASTEXITCODE -ne 0) { throw "Consumer executable failed" }
+          $log = Get-Content external-consumer.log -Raw
+          if ($log -match '(?m)^EXTERNAL_CONSUMER_FAIL ') { throw "Consumer failure marker" }
+          if ($log -notmatch '(?m)^EXTERNAL_CONSUMER_PASS\r?
+        working-directory: bindings/moonbit
+        shell: pwsh
+        run: |
+          python tools/stage_release.py --os Windows --arch X64
+          if ($LASTEXITCODE -ne 0) { throw "Review artifact staging failed" }
+      - name: Upload Windows SDK review artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: moonbit-native-Windows-X64
+          path: |
+            bindings/moonbit/dist/*.tar.gz
+            bindings/moonbit/dist/*.sha256
+          if-no-files-found: error
+) { throw "Missing consumer pass marker" }
       - name: Stage Windows SDK review artifact
         working-directory: bindings/moonbit
         shell: pwsh

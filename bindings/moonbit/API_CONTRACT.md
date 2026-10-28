@@ -78,3 +78,13 @@ semantics. They are separate release/production acceptance gates.
 See `tests/conformance/main.mbt` (real engine) and
 `.github/workflows/moonbit-native.yml` (Linux, macOS, Windows).
 No test may be deleted to make a build green.
+
+## API drift guard and independent consumer
+
+The committed `public_api_surface.txt` is the reviewed export list; the
+`tools/check_api_surface.py` guard prevents accidental changes to public
+declaration names/kinds. The separate module in
+`bindings/moonbit-consumer-smoke/` is built and executed on all three native
+CI hosts against an unpublished local workspace dependency. Its success marker
+is `EXTERNAL_CONSUMER_PASS`. This verifies local-source consumption, not a
+registry install, prebuilt binary distribution or cross-thread safety.
