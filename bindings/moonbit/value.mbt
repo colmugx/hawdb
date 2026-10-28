@@ -340,6 +340,9 @@ pub fn Database::query(
   statement : String,
   params : Map[String, Value],
 ) -> Result[QueryResult, HawdbError] {
+  if !self.is_open() {
+    return Err(HawdbError::Closed)
+  }
   let encoded : Map[String, Json] = Map([])
   for name, item in params {
     match value_to_json(item) {
@@ -360,6 +363,9 @@ pub fn Database::query_sql(
   statement : String,
   params : Array[Value],
 ) -> Result[QueryResult, HawdbError] {
+  if !self.is_open() {
+    return Err(HawdbError::Closed)
+  }
   let encoded : Array[Json] = []
   for item in params {
     match value_to_json(item) {

@@ -74,6 +74,9 @@ pub fn Transaction::query(
   statement : String,
   params : Map[String, Value],
 ) -> Result[QueryResult, HawdbError] {
+  if !self.is_open() {
+    return Err(HawdbError::Closed)
+  }
   let encoded : Map[String, Json] = Map([])
   for key, value in params {
     match value_to_json(value) {
@@ -90,6 +93,9 @@ pub fn Transaction::query_sql(
   statement : String,
   params : Array[Value],
 ) -> Result[QueryResult, HawdbError] {
+  if !self.is_open() {
+    return Err(HawdbError::Closed)
+  }
   let values : Array[Json] = []
   for value in params {
     match value_to_json(value) {

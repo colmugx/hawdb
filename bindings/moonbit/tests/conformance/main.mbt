@@ -951,6 +951,81 @@ fn typed_vector_range_case() -> Bool {
 }
 
 ///|
+/// A parent close invalidates a transaction without freeing its engine
+/// before rollback or read snapshot cleanup.
+fn parent_close_transaction_case() -> Bool {
+  let db = match @hawdb.open_in_memory() {
+    Ok(v) => v
+    Err(e) => return failed("transaction.parent_close.open", e.describe())
+  }
+  let tx = match db.begin() {
+    Ok(v) => v
+    Err(e) => {
+      db.close()
+      return failed("transaction.parent_close.begin", e.describe())
+    }
+  }
+  match tx.query("CREATE (:ParentClose {id: 1})", {}) {
+    Ok(_) => ()
+    Err(e) => {
+      tx.close()
+      db.close()
+      return failed("transaction.parent_close.write", e.describe())
+    }
+  }
+  db.close()
+  if tx.is_open() {
+    tx.close()
+    return failed("transaction.parent_close.write", "write transaction remained open")
+  }
+  match tx.query("CREATE (:ParentClose {id: 2})", {}) {
+    Err(@hawdb.HawdbError::Closed) => ()
+    _ => {
+      tx.close()
+      return failed("transaction.parent_close.write", "query after parent close was not Closed")
+    }
+  }
+  match tx.commit() {
+    Err(@hawdb.HawdbError::Closed) => ()
+    _ => {
+      tx.close()
+      return failed("transaction.parent_close.write", "commit after parent close was not Closed")
+    }
+  }
+  tx.close()
+  tx.close()
+  println("CASE_PASS transaction.parent_close_write")
+
+  let reader_db = match @hawdb.open_in_memory() {
+    Ok(v) => v
+    Err(e) => return failed("transaction.parent_close.read_open", e.describe())
+  }
+  let read = match reader_db.begin_read() {
+    Ok(v) => v
+    Err(e) => {
+      reader_db.close()
+      return failed("transaction.parent_close.read_begin", e.describe())
+    }
+  }
+  reader_db.close()
+  if read.is_open() {
+    read.close()
+    return failed("transaction.parent_close.read", "read scope remained open")
+  }
+  match read.query_sql("SELECT 1", []) {
+    Err(@hawdb.HawdbError::Closed) => ()
+    _ => {
+      read.close()
+      return failed("transaction.parent_close.read", "read after parent close was not Closed")
+    }
+  }
+  read.close()
+  read.close()
+  println("CASE_PASS transaction.parent_close_read")
+  true
+}
+
+///|
 fn main {
   if !graph_case() { return }
   if !sql_case() { return }
@@ -964,6 +1039,7 @@ fn main {
   if !typed_vector_range_case() { return }
   if !typed_rejections() { return }
   if !transaction_case() { return }
+  if !parent_close_transaction_case() { return }
   if !generated_codec_case() { return }
   if !generated_missing_row_case() { return }
   if !transaction_boundary_case() { return }

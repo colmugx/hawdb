@@ -66,7 +66,10 @@ The recommended application-facing surface is deliberately small:
   `close` and the `with_transaction` / `with_read_transaction`
   scoped helpers. Never reuse a transaction after finish. If the caller
   explicitly closes the parent database, keeping a transaction value alive
-  does not promise it can still execute.
+  does not promise it can still execute. A parent close invalidates
+  active transactions: further query/commit return `HawdbError::Closed`.
+  Native cleanup retains the engine until rollback or read snapshot release.
+  Do not share an SDK handle concurrently across threads.
 - **Convenience:** `query_or_raise` and `query_sql_or_raise` adapt
   the same typed errors to MoonBit `raise`; they are not independent
   query engines.
