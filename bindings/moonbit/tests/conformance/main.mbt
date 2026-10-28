@@ -1026,6 +1026,126 @@ fn parent_close_transaction_case() -> Bool {
 }
 
 ///|
+/// Public typed API: missing columns must not be confused with database NULL,
+/// and the raise adapters must report the same structured error variants.
+fn api_error_contract_case() -> Bool {
+  let db = match @hawdb.open_in_memory() {
+    Ok(v) => v
+    Err(e) => return failed("api.error.open", e.describe())
+  }
+  let null_case = match db.query_sql("SELECT NULL AS present", []) {
+    Ok(result) =>
+      match (result.get(0, "present"), result.get(0, "missing"), result.get(10, "present")) {
+        (Some(@hawdb.Value::Null), None, None) => true
+        _ => false
+      }
+    Err(_) => false
+  }
+  if !null_case {
+    db.close()
+    return failed("api.null_absent", "NULL, missing column, or missing row semantics changed")
+  }
+  println("CASE_PASS api.null_absent")
+
+  let cypher_error : Result[@hawdb.QueryResult, @hawdb.HawdbError] =
+    Ok(db.query_or_raise("NOT A VALID CYPHER QUERY", {})) catch {
+      error => Err(error)
+    }
+  match cypher_error {
+    Err(@hawdb.HawdbError::Engine("parse", _)) => ()
+    _ => {
+      db.close()
+      return failed("api.raise_cypher", "raise adapter changed engine error")
+    }
+  }
+  let sql_error : Result[@hawdb.QueryResult, @hawdb.HawdbError] =
+    Ok(db.query_sql_or_raise("NOT A VALID SQL QUERY", [])) catch {
+      error => Err(error)
+    }
+  match sql_error {
+    Err(@hawdb.HawdbError::Engine(_, _)) => ()
+    _ => {
+      db.close()
+      return failed("api.raise_sql", "SQL raise adapter lost structured engine error")
+    }
+  }
+  println("CASE_PASS api.raise_bridge")
+
+  db.close()
+  let deep = @hawdb.Value::Vector([])
+  match db.query("CREATE (:Never {v: $v})", {"v": deep}) {
+    Err(@hawdb.HawdbError::Closed) => ()
+    _ => return failed("api.closed_precedence", "closed database must be checked before encoding")
+  }
+  println("CASE_PASS api.closed_precedence")
+  true
+}
+
+///|
+/// Calling code may finish a scope manually; the deferred cleanup must be
+/// idempotent and a later transaction on the same database must still work.
+fn scoped_cleanup_case() -> Bool {
+  let db = match @hawdb.open_in_memory() {
+    Ok(v) => v
+    Err(e) => return failed("transaction.cleanup.open", e.describe())
+  }
+  let first : Result[String, @hawdb.HawdbError] = db.with_transaction(fn(tx) {
+    match tx.query("CREATE (:ScopedCleanup {id: 1})", {}) {
+      Err(e) => Err(e)
+      Ok(_) => {
+        tx.close()
+        Ok("closed")
+      }
+    }
+  })
+  match first {
+    Err(@hawdb.HawdbError::Closed) => ()
+    _ => {
+      db.close()
+      return failed("transaction.cleanup.closed_scope", "commit after scope close was allowed")
+    }
+  }
+  let after = match db.query("MATCH (n:ScopedCleanup) RETURN n.id AS id", {}) {
+    Ok(rows) => rows.rows.length() == 0
+    Err(_) => false
+  }
+  if !after {
+    db.close()
+    return failed("transaction.cleanup.rollback", "abandoned writes escaped cleanup")
+  }
+  let committed : Result[String, @hawdb.HawdbError] = db.with_transaction(fn(tx) {
+    match tx.query("CREATE (:ScopedCleanup {id: 2})", {}) {
+      Ok(_) => Ok("ok")
+      Err(e) => Err(e)
+    }
+  })
+  match committed {
+    Ok("ok") => ()
+    _ => {
+      db.close()
+      return failed("transaction.cleanup.reuse", "subsequent transaction failed")
+    }
+  }
+  let read : Result[Int, @hawdb.HawdbError] = db.with_read_transaction(fn(tx) {
+    match tx.query("MATCH (n:ScopedCleanup) RETURN n.id AS id", {}) {
+      Ok(result) => {
+        tx.close()
+        Ok(result.rows.length())
+      }
+      Err(e) => Err(e)
+    }
+  })
+  db.close()
+  match read {
+    Ok(1) => {
+      println("CASE_PASS transaction.scoped_cleanup")
+      true
+    }
+    _ => failed("transaction.scoped_cleanup", "read-scope cleanup was not idempotent")
+  }
+}
+
+///|
 fn main {
   if !graph_case() { return }
   if !sql_case() { return }
@@ -1033,6 +1153,7 @@ fn main {
   if !session_case() { return }
   if !error_case() { return }
   if !typed_case() { return }
+  if !api_error_contract_case() { return }
   if !typed_value_roundtrip() { return }
   if !typed_vector_roundtrip() { return }
   if !typed_marker_map_case() { return }
@@ -1045,6 +1166,7 @@ fn main {
   if !transaction_boundary_case() { return }
   if !readonly_case() { return }
   if !scoped_transaction_case() { return }
+  if !scoped_cleanup_case() { return }
   if !transaction_sql_case() { return }
   if !nested_depth_case() { return }
   println("HAWDB_MOONBIT_BUSINESS_SUITE_PASS")

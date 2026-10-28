@@ -78,6 +78,10 @@ The recommended application-facing surface is deliberately small:
   `to_params`, `from_row` and the external `#derive` source
   generator are opt-in record mapping APIs, not a built-in macro or ORM.
 
+See [API_CONTRACT.md](API_CONTRACT.md) for the complete public-symbol
+inventory, Result/raise behavior, transaction lifecycle, and compatibility
+boundaries.
+
 No existing public symbol has been removed in this consolidation pass.
 This is an API-review classification, **not a stable-version promise**.
 Transport JSON, generator syntax, transaction ownership and native linking
@@ -101,6 +105,9 @@ Write transactions use real HawDB engine begin/commit/rollback; pinned
 read transactions provide stable snapshots. The MoonBit-first
 `db.with_transaction(fn(tx) { ... })` helper commits on `Ok` and rolls
 back on `Err`; `db.with_read_transaction` releases pinned snapshots.
+Both scoped helpers also use MoonBit `defer` for deterministic resource
+cleanup if their body exits non-locally. `with_transaction` accepts a
+non-raising `Result` callback, not an arbitrary throwing callback.
 Raw transaction handles also support explicit `begin`, `begin_read`,
 `commit`, `rollback` and `close`. There are no simulated transactions.
 

@@ -77,14 +77,11 @@ pub fn Transaction::query(
   if !self.is_open() {
     return Err(HawdbError::Closed)
   }
-  let encoded : Map[String, Json] = Map([])
-  for key, value in params {
-    match value_to_json(value) {
-      Ok(v) => encoded[key] = v
-      Err(err) => return Err(err)
-    }
+  let json = match encode_named_params(params) {
+    Ok(json) => json
+    Err(error) => return Err(error)
   }
-  self.run(statement, Json::object(encoded).stringify(), 0)
+  self.run(statement, json, 0)
 }
 
 ///|
@@ -96,14 +93,11 @@ pub fn Transaction::query_sql(
   if !self.is_open() {
     return Err(HawdbError::Closed)
   }
-  let values : Array[Json] = []
-  for value in params {
-    match value_to_json(value) {
-      Ok(v) => values.push(v)
-      Err(err) => return Err(err)
-    }
+  let json = match encode_sql_params(params) {
+    Ok(json) => json
+    Err(error) => return Err(error)
   }
-  self.run(statement, Json::array(values).stringify(), 1)
+  self.run(statement, json, 1)
 }
 
 ///|
@@ -166,6 +160,8 @@ pub fn[T] Database::with_transaction(
     Ok(tx) => tx
     Err(err) => return Err(err)
   }
+  // Deterministic rollback on any non-local exit; harmless after commit/rollback.
+  defer tx.close()
   match body(tx) {
     Ok(value) =>
       match tx.commit() {
@@ -192,7 +188,6 @@ pub fn[T] Database::with_read_transaction(
     Ok(tx) => tx
     Err(err) => return Err(err)
   }
-  let result = body(tx)
-  tx.close()
-  result
+  defer tx.close()
+  body(tx)
 }

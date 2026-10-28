@@ -334,6 +334,32 @@ fn native_error(response : String) -> HawdbError {
 }
 
 ///|
+/// Internal, shared parameter codecs for Database and Transaction. Keeping
+/// both call paths here prevents differences in nesting and number handling.
+fn encode_named_params(params : Map[String, Value]) -> Result[String, HawdbError] {
+  let encoded : Map[String, Json] = Map([])
+  for name, item in params {
+    match value_to_json(item) {
+      Ok(value) => encoded[name] = value
+      Err(error) => return Err(error)
+    }
+  }
+  Ok(Json::object(encoded).stringify())
+}
+
+///|
+fn encode_sql_params(params : Array[Value]) -> Result[String, HawdbError] {
+  let encoded : Array[Json] = []
+  for item in params {
+    match value_to_json(item) {
+      Ok(value) => encoded.push(value)
+      Err(error) => return Err(error)
+    }
+  }
+  Ok(Json::array(encoded).stringify())
+}
+
+///|
 /// Cypher with typed, named parameters, returning owned typed rows.
 pub fn Database::query(
   self : Database,
@@ -343,14 +369,11 @@ pub fn Database::query(
   if !self.is_open() {
     return Err(HawdbError::Closed)
   }
-  let encoded : Map[String, Json] = Map([])
-  for name, item in params {
-    match value_to_json(item) {
-      Ok(value) => encoded[name] = value
-      Err(error) => return Err(error)
-    }
+  let json = match encode_named_params(params) {
+    Ok(json) => json
+    Err(error) => return Err(error)
   }
-  match self.query_raw(statement, Json::object(encoded).stringify()) {
+  match self.query_raw(statement, json) {
     Ok(text) => result_from_json(text)
     Err(error) => Err(native_error(error))
   }
@@ -366,14 +389,11 @@ pub fn Database::query_sql(
   if !self.is_open() {
     return Err(HawdbError::Closed)
   }
-  let encoded : Array[Json] = []
-  for item in params {
-    match value_to_json(item) {
-      Ok(value) => encoded.push(value)
-      Err(error) => return Err(error)
-    }
+  let json = match encode_sql_params(params) {
+    Ok(json) => json
+    Err(error) => return Err(error)
   }
-  match self.query_sql_raw(statement, Json::array(encoded).stringify()) {
+  match self.query_sql_raw(statement, json) {
     Ok(text) => result_from_json(text)
     Err(error) => Err(native_error(error))
   }

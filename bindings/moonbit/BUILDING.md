@@ -25,7 +25,13 @@ release is subordinate to `bindings/ffi`.
 | --- | --- | --- | --- |
 | Ubuntu 24.04 (x86_64) | release staticlib | native | complete suite |
 | macOS latest (Apple Silicon) | release staticlib | native | complete suite |
-| Windows 2025 (x64) | release `.lib` staticlib | `moon check --target native` | full executable conformance (new CI qualification) |
+| Windows 2025 (x64) | release `.lib` staticlib | native | complete suite |
+
+All three platforms completed actual native conformance on commit
+`07860727fb6cb6c01b36ae2a122d1906d5972664`
+([Actions #40659147687](https://github.com/colmugx/hawdb/actions/runs/40659147687)).
+This is the last independently verified baseline before subsequent changes;
+each later commit must qualify itself again.
 
 These are platform qualifications, not performance comparisons.
 Windows must also link the Rust staticlib into the MoonBit executable and
