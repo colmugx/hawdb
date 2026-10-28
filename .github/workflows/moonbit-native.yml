@@ -214,21 +214,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Consumer executable failed" }
           $log = Get-Content external-consumer.log -Raw
           if ($log -match '(?m)^EXTERNAL_CONSUMER_FAIL ') { throw "Consumer failure marker" }
-          if ($log -notmatch '(?m)^EXTERNAL_CONSUMER_PASS\r?
-        working-directory: bindings/moonbit
-        shell: pwsh
-        run: |
-          python tools/stage_release.py --os Windows --arch X64
-          if ($LASTEXITCODE -ne 0) { throw "Review artifact staging failed" }
-      - name: Upload Windows SDK review artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: moonbit-native-Windows-X64
-          path: |
-            bindings/moonbit/dist/*.tar.gz
-            bindings/moonbit/dist/*.sha256
-          if-no-files-found: error
-) { throw "Missing consumer pass marker" }
+          if ($log -notmatch '(?m)^EXTERNAL_CONSUMER_PASS\r?$') {
+            throw "Missing consumer pass marker"
+          }
       - name: Stage Windows SDK review artifact
         working-directory: bindings/moonbit
         shell: pwsh
