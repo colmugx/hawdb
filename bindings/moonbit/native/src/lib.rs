@@ -189,7 +189,10 @@ fn decode_value(value: &Json) -> Result<Value, Failure> {
                         let key = pair[0]
                             .as_str()
                             .ok_or_else(|| fail("invalid_argument", "$map key must be a string"))?;
-                        if map.insert(key.to_owned(), decode_value(&pair[1])?).is_some() {
+                        if map
+                            .insert(key.to_owned(), decode_value(&pair[1])?)
+                            .is_some()
+                        {
                             return Err(fail("invalid_argument", "duplicate $map key"));
                         }
                     }
@@ -201,9 +204,9 @@ fn decode_value(value: &Json) -> Result<Value, Failure> {
                         .ok_or_else(|| fail("invalid_argument", "$vector must be an array"))?
                         .iter()
                         .map(|v| {
-                            let x = v
-                                .as_f64()
-                                .ok_or_else(|| fail("invalid_argument", "$vector requires numbers"))?;
+                            let x = v.as_f64().ok_or_else(|| {
+                                fail("invalid_argument", "$vector requires numbers")
+                            })?;
                             let coordinate = x as f32;
                             if !coordinate.is_finite() {
                                 return Err(fail(
@@ -261,9 +264,9 @@ fn encode_value(value: &Value) -> Json {
         Value::List(v) => Json::Array(v.iter().map(encode_value).collect()),
         Value::Map(v) => {
             let reserved = v.len() == 1
-                && v.keys()
-                    .next()
-                    .is_some_and(|key| matches!(key.as_str(), "$binary" | "$uuid" | "$vector" | "$map"));
+                && v.keys().next().is_some_and(|key| {
+                    matches!(key.as_str(), "$binary" | "$uuid" | "$vector" | "$map")
+                });
             if reserved {
                 let pairs: Vec<Json> = v
                     .iter()
@@ -279,7 +282,7 @@ fn encode_value(value: &Value) -> Json {
                         .collect(),
                 )
             }
-        },
+        }
     }
 }
 
