@@ -9,7 +9,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import pathlib
 import subprocess
 import tarfile
@@ -83,7 +82,7 @@ def main() -> None:
                      for name, path in manifest}
         inventory["PROVENANCE.json"] = hashlib.sha256(metadata.read_bytes()).hexdigest()
         filelist = dist / "SHA256SUMS.json"
-        filelist.write_text(json.dumps(inventory, sort_keys=True, indent=2) + "\\n", encoding="utf-8")
+        filelist.write_text(json.dumps(inventory, sort_keys=True, indent=2) + "\n", encoding="utf-8")
         archive.add(filelist, arcname=f"{slug}/SHA256SUMS.json")
     checksum = hashlib.sha256(output.read_bytes()).hexdigest()
     (dist / f"{slug}.tar.gz.sha256").write_text(
