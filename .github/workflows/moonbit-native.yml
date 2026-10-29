@@ -20,7 +20,7 @@ concurrency:
 
 env:
   # Exact toolchain observed in the passing Linux native conformance job.
-  MOONBIT_EXPECTED_VERSION: "0.1.20261023"
+  MOONBIT_EXPECTED_VERSION: "0.1.20261028"
 
 permissions:
   contents: read
