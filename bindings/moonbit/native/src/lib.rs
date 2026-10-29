@@ -31,23 +31,38 @@ unsafe extern "C" {
     ) -> *mut c_void;
 }
 
-// Shared ownership retains engine state until all transactions finish.
+// The Rust mutex protects each externally owned MoonBit handle's state.
+// A borrowed FFI parameter pins the payload through the native call.
 struct SharedDatabase {
     engine: Mutex<HawDBEmbedded>,
     closed: AtomicBool,
 }
 
-fn owned_database(engine: HawDBEmbedded) -> *mut Arc<SharedDatabase> {
-    Box::into_raw(Box::new(Arc::new(SharedDatabase {
-        engine: Mutex::new(engine),
-        closed: AtomicBool::new(false),
-    })))
+struct HandleState {
+    db: Option<Arc<SharedDatabase>>,
+    error: String,
 }
 
 #[repr(C)]
 pub struct Handle {
-    db: *mut Arc<SharedDatabase>,
-    error: *mut String,
+    state: Mutex<HandleState>,
+}
+
+fn owned_database(engine: HawDBEmbedded) -> Arc<SharedDatabase> {
+    Arc::new(SharedDatabase {
+        engine: Mutex::new(engine),
+        closed: AtomicBool::new(false),
+    })
+}
+
+fn clone_database(handle: *mut Handle) -> Option<Arc<SharedDatabase>> {
+    if handle.is_null() {
+        return None;
+    }
+    let state = unsafe { &(*handle).state }
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.db.clone()
 }
 
 type Failure = (String, String);
@@ -91,36 +106,37 @@ fn error_json((kind, message): Failure) -> String {
 }
 
 fn clear_error(handle: *mut Handle) {
-    if handle.is_null() {
-        return;
-    }
-    unsafe {
-        let old = (*handle).error;
-        (*handle).error = ptr::null_mut();
-        if !old.is_null() {
-            drop(Box::from_raw(old));
-        }
+    if !handle.is_null() {
+        let mut state = unsafe { &(*handle).state }
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.error.clear();
     }
 }
 
 fn save_error(handle: *mut Handle, message: String) {
-    clear_error(handle);
     if !handle.is_null() {
-        unsafe { (*handle).error = Box::into_raw(Box::new(message)) };
+        let mut state = unsafe { &(*handle).state }
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.error = message;
     }
 }
 
 fn close_db(handle: *mut Handle) {
-    if !handle.is_null() {
-        unsafe {
-            let old = (*handle).db;
-            (*handle).db = ptr::null_mut(); // Make repeated close safe.
-            if !old.is_null() {
-                let shared = Box::from_raw(old);
-                shared.closed.store(true, Ordering::Release);
-                drop(shared);
-            }
-        }
+    if handle.is_null() {
+        return;
+    }
+    let mut state = unsafe { &(*handle).state }
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(shared) = state.db.take() {
+        // Wait for in-flight engine work before marking the handle closed.
+        let _engine = shared
+            .engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        shared.closed.store(true, Ordering::Release);
     }
 }
 
@@ -128,8 +144,8 @@ extern "C" fn finalize(payload: *mut c_void) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let handle = payload.cast::<Handle>();
         close_db(handle);
-        clear_error(handle);
-        // MoonBit runtime frees the GC object itself.
+        // External payload memory belongs to MoonBit; Rust must drop fields.
+        unsafe { ptr::drop_in_place(&mut (*handle).state) };
     }));
 }
 
@@ -143,10 +159,12 @@ fn allocate_handle() -> *mut Handle {
             ptr::write(
                 ptr,
                 Handle {
-                    db: ptr::null_mut(),
-                    error: ptr::null_mut(),
+                    state: Mutex::new(HandleState {
+                        db: None,
+                        error: String::new(),
+                    }),
                 },
-            )
+            );
         };
     }
     ptr
@@ -345,7 +363,12 @@ pub extern "C" fn moonbit_hawdb_open(path: *const u8, len: i32, read_only: i32) 
         HawDBEmbedded::open_with_options(options).map_err(|e| engine_error(&e))
     }));
     match opened {
-        Ok(Ok(db)) => unsafe { (*handle).db = owned_database(db) },
+        Ok(Ok(db)) => {
+            let mut state = unsafe { &(*handle).state }
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.db = Some(owned_database(db));
+        }
         Ok(Err(e)) => save_error(handle, error_json(e)),
         Err(_) => save_error(handle, error_json(fail("panic", "panic during open"))),
     }
@@ -359,7 +382,12 @@ pub extern "C" fn moonbit_hawdb_open_in_memory() -> *mut Handle {
         return handle;
     }
     match catch_unwind(AssertUnwindSafe(HawDBEmbedded::open_in_memory)) {
-        Ok(db) => unsafe { (*handle).db = owned_database(db) },
+        Ok(db) => {
+            let mut state = unsafe { &(*handle).state }
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.db = Some(owned_database(db));
+        }
         Err(_) => save_error(
             handle,
             error_json(fail("panic", "panic during open_in_memory")),
@@ -370,11 +398,7 @@ pub extern "C" fn moonbit_hawdb_open_in_memory() -> *mut Handle {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn moonbit_hawdb_is_open(handle: *mut Handle) -> i32 {
-    if handle.is_null() || unsafe { (*handle).db }.is_null() {
-        0
-    } else {
-        1
-    }
+    i32::from(clone_database(handle).is_some_and(|db| !db.closed.load(Ordering::Acquire)))
 }
 
 #[unsafe(no_mangle)]
@@ -391,14 +415,13 @@ pub extern "C" fn moonbit_hawdb_execute(
     params_len: i32,
     sql: i32,
 ) -> *mut u8 {
-    if handle.is_null() || unsafe { (*handle).db }.is_null() {
+    let Some(db) = clone_database(handle) else {
         return to_moonbit_bytes(&[]);
-    }
+    };
     clear_error(handle);
     let result = catch_unwind(AssertUnwindSafe(|| {
         let statement = unsafe { input(text, text_len, "statement") }?;
         let params = unsafe { input(params, params_len, "params") }?;
-        let db = unsafe { &*(*handle).db };
         let mut locked = db
             .engine
             .lock()
@@ -436,10 +459,17 @@ pub extern "C" fn moonbit_hawdb_execute(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn moonbit_hawdb_error(handle: *mut Handle) -> *mut u8 {
-    let message = if handle.is_null() || unsafe { (*handle).error }.is_null() {
+    let message = if handle.is_null() {
         error_json(fail("closed", "HawDB handle is closed"))
     } else {
-        unsafe { &*(*handle).error }.clone()
+        let state = unsafe { &(*handle).state }
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.error.is_empty() {
+            error_json(fail("closed", "HawDB handle is closed"))
+        } else {
+            state.error.clone()
+        }
     };
     to_moonbit_bytes(message.as_bytes())
 }
@@ -449,88 +479,63 @@ pub extern "C" fn moonbit_hawdb_version() -> *mut u8 {
     to_moonbit_bytes(concat!("hawdb ", env!("CARGO_PKG_VERSION")).as_bytes())
 }
 
-// Native transaction ownership is independent of the parent Handle; after
-// Database::close, its own Arc remains until snapshot release / rollback.
-#[repr(C)]
-pub struct TransactionHandle {
-    db: *mut Arc<SharedDatabase>,
-    read: *mut DatabaseReadTransaction,
+// Per-transaction mutex serializes mutations and finalization.
+struct TransactionState {
+    db: Option<Arc<SharedDatabase>>,
+    read: Option<DatabaseReadTransaction>,
     active: bool,
     read_only: bool,
-    error: *mut String,
+    error: String,
 }
 
-fn tx_clear_error(tx: *mut TransactionHandle) {
-    if tx.is_null() {
-        return;
-    }
-    unsafe {
-        let ptr = (*tx).error;
-        (*tx).error = ptr::null_mut();
-        if !ptr.is_null() {
-            drop(Box::from_raw(ptr));
-        }
-    }
+#[repr(C)]
+pub struct TransactionHandle {
+    state: Mutex<TransactionState>,
 }
 
 fn tx_set_error(tx: *mut TransactionHandle, value: Failure) {
-    tx_clear_error(tx);
     if !tx.is_null() {
-        unsafe { (*tx).error = Box::into_raw(Box::new(error_json(value))) };
+        let mut state = unsafe { &(*tx).state }
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.error = error_json(value);
     }
 }
 
-fn tx_release_db(tx: *mut TransactionHandle) {
-    if tx.is_null() {
-        return;
-    }
-    unsafe {
-        let old = (*tx).db;
-        (*tx).db = ptr::null_mut();
-        if !old.is_null() {
-            drop(Box::from_raw(old));
+fn tx_abandon_state(state: &mut TransactionState) -> Result<(), Failure> {
+    let active = state.active;
+    state.active = false;
+    state.read.take();
+    let db = state.db.take();
+    if active && !state.read_only {
+        if let Some(shared) = db {
+            let mut engine = shared
+                .engine
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if engine.transaction_active() {
+                engine.rollback_transaction().map_err(|e| engine_error(&e))?;
+            }
         }
     }
+    Ok(())
 }
 
 fn tx_abandon(tx: *mut TransactionHandle) -> Result<(), Failure> {
     if tx.is_null() {
         return Ok(());
     }
-    let (db_ptr, read, write) = unsafe {
-        let tx = &mut *tx;
-        if !tx.active {
-            tx_release_db(tx);
-            return Ok(());
-        }
-        tx.active = false;
-        let read = tx.read;
-        tx.read = ptr::null_mut();
-        (tx.db, read, !tx.read_only)
-    };
-    if !read.is_null() {
-        unsafe { drop(Box::from_raw(read)) };
-    }
-    let outcome = (|| {
-        if write && !db_ptr.is_null() {
-            let shared = unsafe { &*db_ptr };
-            let mut db = shared
-                .engine
-                .lock()
-                .map_err(|_| fail("execution", "database mutex poisoned"))?;
-            db.rollback_transaction().map_err(|e| engine_error(&e))?;
-        }
-        Ok(())
-    })();
-    tx_release_db(tx);
-    outcome
+    let mut state = unsafe { &(*tx).state }
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    tx_abandon_state(&mut state)
 }
 
 extern "C" fn tx_finalize(payload: *mut c_void) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let tx = payload.cast::<TransactionHandle>();
         let _ = tx_abandon(tx);
-        tx_clear_error(tx);
+        unsafe { ptr::drop_in_place(&mut (*tx).state) };
     }));
 }
 
@@ -547,11 +552,13 @@ fn tx_alloc(read_only: bool) -> *mut TransactionHandle {
             ptr::write(
                 tx,
                 TransactionHandle {
-                    db: ptr::null_mut(),
-                    read: ptr::null_mut(),
-                    active: false,
-                    read_only,
-                    error: ptr::null_mut(),
+                    state: Mutex::new(TransactionState {
+                        db: None,
+                        read: None,
+                        active: false,
+                        read_only,
+                        error: String::new(),
+                    }),
                 },
             );
         }
@@ -569,10 +576,7 @@ pub extern "C" fn moonbit_hawdb_tx_begin(
         return tx;
     }
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        if parent.is_null() || unsafe { (*parent).db }.is_null() {
-            return Err(fail("closed", "database is closed"));
-        }
-        let shared = unsafe { &*(*parent).db }.clone();
+        let shared = clone_database(parent).ok_or_else(|| fail("closed", "database is closed"))?;
         let mut locked = shared
             .engine
             .lock()
@@ -580,20 +584,18 @@ pub extern "C" fn moonbit_hawdb_tx_begin(
         if shared.closed.load(Ordering::Acquire) {
             return Err(fail("closed", "database is closed"));
         }
-        if read_only != 0 {
-            let read = locked
-                .begin_read_transaction()
-                .map_err(|e| engine_error(&e))?;
-            unsafe {
-                (*tx).read = Box::into_raw(Box::new(read));
-            }
+        let read = if read_only != 0 {
+            Some(locked.begin_read_transaction().map_err(|e| engine_error(&e))?)
         } else {
             locked.begin_transaction().map_err(|e| engine_error(&e))?;
-        }
-        unsafe {
-            (*tx).db = Box::into_raw(Box::new(Arc::clone(&shared)));
-            (*tx).active = true;
-        }
+            None
+        };
+        let mut state = unsafe { &(*tx).state }
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.db = Some(shared.clone());
+        state.read = read;
+        state.active = true;
         Ok(())
     }));
     match outcome {
@@ -606,22 +608,30 @@ pub extern "C" fn moonbit_hawdb_tx_begin(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn moonbit_hawdb_tx_is_open(tx: *mut TransactionHandle) -> i32 {
-    if tx.is_null() || !unsafe { (*tx).active } {
+    if tx.is_null() {
         return 0;
     }
-    let db_ptr = unsafe { (*tx).db };
-    if db_ptr.is_null() {
-        return 0;
-    }
-    i32::from(!unsafe { &*db_ptr }.closed.load(Ordering::Acquire))
+    let state = unsafe { &(*tx).state }
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    i32::from(state.active && state.db.as_ref().is_some_and(|db| !db.closed.load(Ordering::Acquire)))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn moonbit_hawdb_tx_error(tx: *mut TransactionHandle) -> *mut u8 {
-    if tx.is_null() || unsafe { (*tx).error }.is_null() {
-        return to_moonbit_bytes(error_json(fail("closed", "transaction is closed")).as_bytes());
-    }
-    to_moonbit_bytes(unsafe { &*(*tx).error }.as_bytes())
+    let message = if tx.is_null() {
+        error_json(fail("closed", "transaction is closed"))
+    } else {
+        let state = unsafe { &(*tx).state }
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.error.is_empty() {
+            error_json(fail("closed", "transaction is closed"))
+        } else {
+            state.error.clone()
+        }
+    };
+    to_moonbit_bytes(message.as_bytes())
 }
 
 #[unsafe(no_mangle)]
@@ -633,44 +643,41 @@ pub extern "C" fn moonbit_hawdb_tx_query(
     params_len: i32,
     is_sql: i32,
 ) -> *mut u8 {
-    if tx.is_null() || !unsafe { (*tx).active } {
+    if tx.is_null() {
         return to_moonbit_bytes(&[]);
     }
-    tx_clear_error(tx);
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let stmt = unsafe { input(statement, statement_len, "statement") }?;
         let args = unsafe { input(params, params_len, "params") }?;
-        let db_ptr = unsafe { (*tx).db };
-        if db_ptr.is_null() {
+        let mut state = unsafe { &(*tx).state }
+            .lock()
+            .map_err(|_| fail("execution", "transaction mutex poisoned"))?;
+        state.error.clear();
+        if !state.active {
             return Err(fail("closed", "transaction is closed"));
         }
-        let shared = unsafe { &*db_ptr };
+        let shared = state.db.as_ref().cloned().ok_or_else(|| fail("closed", "transaction is closed"))?;
         if shared.closed.load(Ordering::Acquire) {
             return Err(fail("closed", "database is closed"));
         }
-        if unsafe { (*tx).read_only } {
-            let read = unsafe { &mut *(*tx).read };
+        if state.read_only {
+            let read = state.read.as_mut().ok_or_else(|| fail("closed", "read transaction is closed"))?;
             let result = if is_sql != 0 {
                 read.query_sql_with_params(stmt, &sql_params(args)?)
             } else {
                 read.query_with_params(stmt, &named_params(args)?)
-            }
-            .map_err(|e| engine_error(&e))?;
+            }.map_err(|e| engine_error(&e))?;
             Ok::<String, Failure>(encode_result(&result))
         } else {
-            let mut db = shared
-                .engine
-                .lock()
-                .map_err(|_| fail("execution", "database mutex poisoned"))?;
+            let mut engine = shared.engine.lock().map_err(|_| fail("execution", "database mutex poisoned"))?;
             if shared.closed.load(Ordering::Acquire) {
                 return Err(fail("closed", "database is closed"));
             }
             let result = if is_sql != 0 {
-                db.transaction_query_sql_with_params(stmt, &sql_params(args)?)
+                engine.transaction_query_sql_with_params(stmt, &sql_params(args)?)
             } else {
-                db.transaction_query_with_params(stmt, &named_params(args)?)
-            }
-            .map_err(|e| engine_error(&e))?;
+                engine.transaction_query_with_params(stmt, &named_params(args)?)
+            }.map_err(|e| engine_error(&e))?;
             Ok::<String, Failure>(encode_result(&result))
         }
     }));
@@ -689,47 +696,40 @@ pub extern "C" fn moonbit_hawdb_tx_query(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn moonbit_hawdb_tx_finish(tx: *mut TransactionHandle, commit: i32) -> *mut u8 {
-    if tx.is_null() || !unsafe { (*tx).active } {
+    if tx.is_null() {
         return to_moonbit_bytes(&[]);
     }
-    tx_clear_error(tx);
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        let db_ptr = unsafe { (*tx).db };
-        if db_ptr.is_null() {
+        let mut state = unsafe { &(*tx).state }
+            .lock()
+            .map_err(|_| fail("execution", "transaction mutex poisoned"))?;
+        state.error.clear();
+        if !state.active {
             return Err(fail("closed", "transaction is closed"));
         }
-        let shared = unsafe { &*db_ptr };
+        let shared = state.db.as_ref().cloned().ok_or_else(|| fail("closed", "transaction is closed"))?;
         if shared.closed.load(Ordering::Acquire) {
-            tx_abandon(tx)?;
+            tx_abandon_state(&mut state)?;
             return Err(fail("closed", "database is closed"));
         }
-        if unsafe { (*tx).read_only } {
-            tx_abandon(tx)?;
+        if state.read_only || commit == 0 {
+            tx_abandon_state(&mut state)?;
             return Ok::<String, Failure>(r#"{"columns":[],"rows":[]}"#.to_owned());
         }
-        if commit == 0 {
-            tx_abandon(tx)?;
-            return Ok(r#"{"columns":[],"rows":[]}"#.to_owned());
-        }
-        // Consume the transaction before calling commit: failed commit must
-        // never leave a committable prefix or keep parent handles locked.
-        unsafe {
-            (*tx).active = false;
-        }
-        let mut db = shared
-            .engine
-            .lock()
-            .map_err(|_| fail("execution", "database mutex poisoned"))?;
+        let mut engine = shared.engine.lock().map_err(|_| fail("execution", "database mutex poisoned"))?;
         if shared.closed.load(Ordering::Acquire) {
-            db.rollback_transaction().map_err(|e| engine_error(&e))?;
+            if engine.transaction_active() {
+                engine.rollback_transaction().map_err(|e| engine_error(&e))?;
+            }
+            state.active = false;
+            state.db.take();
             return Err(fail("closed", "database is closed"));
         }
-        let result = db.commit_transaction().map_err(|e| engine_error(&e))?;
-        Ok(encode_result(&result))
+        let result = engine.commit_transaction().map_err(|e| engine_error(&e));
+        state.active = false;
+        state.db.take();
+        result.map(|value| encode_result(&value))
     }));
-    if !unsafe { (*tx).active } {
-        tx_release_db(tx);
-    }
     match outcome {
         Ok(Ok(json)) => to_moonbit_bytes(json.as_bytes()),
         Ok(Err(err)) => {
@@ -737,6 +737,7 @@ pub extern "C" fn moonbit_hawdb_tx_finish(tx: *mut TransactionHandle, commit: i3
             to_moonbit_bytes(&[])
         }
         Err(_) => {
+            let _ = tx_abandon(tx);
             tx_set_error(tx, fail("panic", "panic during transaction finish"));
             to_moonbit_bytes(&[])
         }

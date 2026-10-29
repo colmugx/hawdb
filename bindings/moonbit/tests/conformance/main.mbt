@@ -1146,6 +1146,37 @@ fn scoped_cleanup_case() -> Bool {
 }
 
 ///|
+/// Repeated open/close and abandoned transactions must release engine state
+/// without leaking visible writes or breaking the next open.
+fn lifecycle_stress_case() -> Bool {
+  for i = 0; i < 80; i = i + 1 {
+    let db = match @hawdb.open_in_memory() {
+      Ok(db) => db
+      Err(e) => return failed("lifecycle.stress.open", e.describe())
+    }
+    let tx = match db.begin() {
+      Ok(v) => v
+      Err(e) => return failed("lifecycle.stress.begin", e.describe())
+    }
+    match tx.query("CREATE (:Transient {id: 1})", {}) {
+      Ok(_) => ()
+      Err(e) => return failed("lifecycle.stress.write", e.describe())
+    }
+    if i % 2 == 0 {
+      db.close()
+      tx.close()
+    } else {
+      tx.close()
+      db.close()
+    }
+    tx.close()
+    db.close()
+  }
+  println("CASE_PASS lifecycle.repeated_open_close")
+  true
+}
+
+///|
 fn main {
   if !graph_case() { return }
   if !sql_case() { return }
@@ -1161,6 +1192,7 @@ fn main {
   if !typed_rejections() { return }
   if !transaction_case() { return }
   if !parent_close_transaction_case() { return }
+  if !lifecycle_stress_case() { return }
   if !generated_codec_case() { return }
   if !generated_missing_row_case() { return }
   if !transaction_boundary_case() { return }

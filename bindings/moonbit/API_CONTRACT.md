@@ -88,3 +88,14 @@ declaration names/kinds. The separate module in
 CI hosts against an unpublished local workspace dependency. Its success marker
 is `EXTERNAL_CONSUMER_PASS`. This verifies local-source consumption, not a
 registry install, prebuilt binary distribution or cross-thread safety.
+
+## Native lifecycle hardening candidate
+
+The Rust adapter now serializes Handle/TransactionHandle mutable state using
+per-object Mutex guards and retains engine ownership with Arc. This removes
+unprotected mutation of raw error and database pointers. Calls use MoonBit
+borrowed foreign arguments; this does not extend the validity of a payload
+if native callers manually violate the MoonBit reference-lifetime contract.
+Native cross-thread use is still not part of the supported MoonBit API until
+stress/sanitizer qualification explicitly passes. This change is not a
+public ABI version or release approval.
