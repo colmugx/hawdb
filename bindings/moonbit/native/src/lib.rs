@@ -785,3 +785,67 @@ pub extern "C" fn moonbit_hawdb_tx_close(tx: *mut TransactionHandle) {
         }
     }));
 }
+
+
+// The following tests exercise the Rust-side locking without calling any
+// MoonBit allocation function. The MoonBit runtime owns external payloads,
+// while these test-owned payloads remain alive until all workers have joined.
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_close_and_clone_keep_owned_engine_alive() {
+        let handle = Box::new(Handle {
+            state: Mutex::new(HandleState {
+                db: Some(owned_database(HawDBEmbedded::open_in_memory())),
+                error: String::new(),
+            }),
+        });
+        let address = Box::into_raw(handle) as usize;
+        std::thread::scope(|scope| {
+            for worker in 0..12 {
+                scope.spawn(move || {
+                    let handle = address as *mut Handle;
+                    for iteration in 0..100 {
+                        if worker == 0 && iteration == 50 {
+                            close_db(handle);
+                        } else if let Some(shared) = clone_database(handle) {
+                            let _guard = shared
+                                .engine
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            // The clone prevents destruction across close.
+                            let _ = shared.closed.load(Ordering::Acquire);
+                        }
+                    }
+                });
+            }
+        });
+        let handle = unsafe { Box::from_raw(address as *mut Handle) };
+        assert!(handle
+            .state
+            .lock()
+            .unwrap()
+            .db
+            .is_none());
+    }
+
+    #[test]
+    fn dropped_write_scope_rolls_back_once() {
+        let shared = owned_database(HawDBEmbedded::open_in_memory());
+        shared.engine.lock().unwrap().begin_transaction().unwrap();
+        let mut state = TransactionState {
+            db: Some(Arc::clone(&shared)),
+            read: None,
+            active: true,
+            read_only: false,
+            error: String::new(),
+        };
+        tx_abandon_state(&mut state).unwrap();
+        tx_abandon_state(&mut state).unwrap();
+        assert!(!state.active);
+        assert!(state.db.is_none());
+        assert!(!shared.engine.lock().unwrap().transaction_active());
+    }
+}

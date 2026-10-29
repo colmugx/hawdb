@@ -68,6 +68,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo fmt --all -- --check
+          cargo test --release --locked --lib
           cargo build --release --locked
           test -s target/release/libhawdb_moonbit.a
       - name: Configure native linker for macOS
@@ -173,6 +174,8 @@ jobs:
         run: |
           cargo fmt --all -- --check
           if ($LASTEXITCODE -ne 0) { throw "Rust formatting failed" }
+          cargo test --release --locked --lib
+          if ($LASTEXITCODE -ne 0) { throw "Native lifecycle tests failed" }
           cargo build --release --locked
           if ($LASTEXITCODE -ne 0) { throw "Rust staticlib build failed" }
           if (!(Test-Path "target/release/hawdb_moonbit.lib")) { throw "Missing Rust .lib output" }
