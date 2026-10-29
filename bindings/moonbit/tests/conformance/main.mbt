@@ -659,6 +659,15 @@ fn readonly_case() -> Bool {
     }
     Ok(_) => ()
   }
+  // Explicitly materialize WAL replay; merely querying via a writable
+  // handle does not guarantee a checkpoint on rolling upstream.
+  match recovered.query("CHECKPOINT", {}) {
+    Err(e) => {
+      recovered.close()
+      return failed("readonly.checkpoint", e.describe())
+    }
+    Ok(_) => ()
+  }
   recovered.close()
   let db = match @hawdb.open_read_only("./tests/conformance-db") {
     Ok(v) => v

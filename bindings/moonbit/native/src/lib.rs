@@ -45,7 +45,8 @@ struct HandleState {
 
 #[repr(C)]
 pub struct Handle {
-    state: Mutex<HandleState>,
+    // Keep alignment-sensitive Mutex off the MoonBit GC payload.
+    state: *mut Mutex<HandleState>,
 }
 
 fn owned_database(engine: HawDBEmbedded) -> Arc<SharedDatabase> {
@@ -59,7 +60,7 @@ fn clone_database(handle: *mut Handle) -> Option<Arc<SharedDatabase>> {
     if handle.is_null() {
         return None;
     }
-    let state = unsafe { &(*handle).state }
+    let state = unsafe { &*(*handle).state }
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     state.db.clone()
@@ -107,7 +108,7 @@ fn error_json((kind, message): Failure) -> String {
 
 fn clear_error(handle: *mut Handle) {
     if !handle.is_null() {
-        let mut state = unsafe { &(*handle).state }
+        let mut state = unsafe { &*(*handle).state }
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.error.clear();
@@ -116,7 +117,7 @@ fn clear_error(handle: *mut Handle) {
 
 fn save_error(handle: *mut Handle, message: String) {
     if !handle.is_null() {
-        let mut state = unsafe { &(*handle).state }
+        let mut state = unsafe { &*(*handle).state }
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.error = message;
@@ -127,7 +128,7 @@ fn close_db(handle: *mut Handle) {
     if handle.is_null() {
         return;
     }
-    let mut state = unsafe { &(*handle).state }
+    let mut state = unsafe { &*(*handle).state }
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(shared) = state.db.take() {
@@ -147,7 +148,13 @@ extern "C" fn finalize(payload: *mut c_void) {
         close_db(handle);
         gc_trace("finalize.before_drop");
         // External payload memory belongs to MoonBit; Rust must drop fields.
-        unsafe { ptr::drop_in_place(&mut (*handle).state) };
+        unsafe {
+            let state = (*handle).state;
+            (*handle).state = ptr::null_mut();
+            if !state.is_null() {
+                drop(Box::from_raw(state));
+            }
+        }
         gc_trace("finalize.done");
     }));
 }
@@ -169,10 +176,10 @@ fn allocate_handle() -> *mut Handle {
             ptr::write(
                 ptr,
                 Handle {
-                    state: Mutex::new(HandleState {
+                    state: Box::into_raw(Box::new(Mutex::new(HandleState {
                         db: None,
                         error: String::new(),
-                    }),
+                    }))),
                 },
             );
         };
@@ -375,7 +382,7 @@ pub extern "C" fn moonbit_hawdb_open(path: *const u8, len: i32, read_only: i32) 
     }));
     match opened {
         Ok(Ok(db)) => {
-            let mut state = unsafe { &(*handle).state }
+            let mut state = unsafe { &*(*handle).state }
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.db = Some(owned_database(db));
@@ -395,7 +402,7 @@ pub extern "C" fn moonbit_hawdb_open_in_memory() -> *mut Handle {
     }
     match catch_unwind(AssertUnwindSafe(HawDBEmbedded::open_in_memory)) {
         Ok(db) => {
-            let mut state = unsafe { &(*handle).state }
+            let mut state = unsafe { &*(*handle).state }
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.db = Some(owned_database(db));
@@ -479,7 +486,7 @@ pub extern "C" fn moonbit_hawdb_error(handle: *mut Handle) -> *mut u8 {
     let message = if handle.is_null() {
         error_json(fail("closed", "HawDB handle is closed"))
     } else {
-        let state = unsafe { &(*handle).state }
+        let state = unsafe { &*(*handle).state }
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.error.is_empty() {
@@ -507,12 +514,12 @@ struct TransactionState {
 
 #[repr(C)]
 pub struct TransactionHandle {
-    state: Mutex<TransactionState>,
+    state: *mut Mutex<TransactionState>,
 }
 
 fn tx_set_error(tx: *mut TransactionHandle, value: Failure) {
     if !tx.is_null() {
-        let mut state = unsafe { &(*tx).state }
+        let mut state = unsafe { &*(*tx).state }
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.error = error_json(value);
@@ -544,7 +551,7 @@ fn tx_abandon(tx: *mut TransactionHandle) -> Result<(), Failure> {
     if tx.is_null() {
         return Ok(());
     }
-    let mut state = unsafe { &(*tx).state }
+    let mut state = unsafe { &*(*tx).state }
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     tx_abandon_state(&mut state)
@@ -554,7 +561,13 @@ extern "C" fn tx_finalize(payload: *mut c_void) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let tx = payload.cast::<TransactionHandle>();
         let _ = tx_abandon(tx);
-        unsafe { ptr::drop_in_place(&mut (*tx).state) };
+        unsafe {
+            let state = (*tx).state;
+            (*tx).state = ptr::null_mut();
+            if !state.is_null() {
+                drop(Box::from_raw(state));
+            }
+        }
     }));
 }
 
@@ -571,13 +584,13 @@ fn tx_alloc(read_only: bool) -> *mut TransactionHandle {
             ptr::write(
                 tx,
                 TransactionHandle {
-                    state: Mutex::new(TransactionState {
+                    state: Box::into_raw(Box::new(Mutex::new(TransactionState {
                         db: None,
                         read: None,
                         active: false,
                         read_only,
                         error: String::new(),
-                    }),
+                    }))),
                 },
             );
         }
@@ -613,7 +626,7 @@ pub extern "C" fn moonbit_hawdb_tx_begin(
             locked.begin_transaction().map_err(|e| engine_error(&e))?;
             None
         };
-        let mut state = unsafe { &(*tx).state }
+        let mut state = unsafe { &*(*tx).state }
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.db = Some(shared.clone());
@@ -634,7 +647,7 @@ pub extern "C" fn moonbit_hawdb_tx_is_open(tx: *mut TransactionHandle) -> i32 {
     if tx.is_null() {
         return 0;
     }
-    let state = unsafe { &(*tx).state }
+    let state = unsafe { &*(*tx).state }
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     i32::from(
@@ -651,7 +664,7 @@ pub extern "C" fn moonbit_hawdb_tx_error(tx: *mut TransactionHandle) -> *mut u8 
     let message = if tx.is_null() {
         error_json(fail("closed", "transaction is closed"))
     } else {
-        let state = unsafe { &(*tx).state }
+        let state = unsafe { &*(*tx).state }
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.error.is_empty() {
@@ -678,7 +691,7 @@ pub extern "C" fn moonbit_hawdb_tx_query(
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let stmt = unsafe { input(statement, statement_len, "statement") }?;
         let args = unsafe { input(params, params_len, "params") }?;
-        let mut state = unsafe { &(*tx).state }
+        let mut state = unsafe { &*(*tx).state }
             .lock()
             .map_err(|_| fail("execution", "transaction mutex poisoned"))?;
         state.error.clear();
@@ -741,7 +754,7 @@ pub extern "C" fn moonbit_hawdb_tx_finish(tx: *mut TransactionHandle, commit: i3
         return to_moonbit_bytes(&[]);
     }
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        let mut state = unsafe { &(*tx).state }
+        let mut state = unsafe { &*(*tx).state }
             .lock()
             .map_err(|_| fail("execution", "transaction mutex poisoned"))?;
         state.error.clear();
@@ -829,10 +842,10 @@ mod lifecycle_tests {
     #[test]
     fn concurrent_close_and_clone_keep_owned_engine_alive() {
         let handle = Box::new(Handle {
-            state: Mutex::new(HandleState {
+            state: Box::into_raw(Box::new(Mutex::new(HandleState {
                 db: Some(owned_database(HawDBEmbedded::open_in_memory())),
                 error: String::new(),
-            }),
+            }))),
         });
         let address = Box::into_raw(handle) as usize;
         std::thread::scope(|scope| {
@@ -855,7 +868,8 @@ mod lifecycle_tests {
             }
         });
         let handle = unsafe { Box::from_raw(address as *mut Handle) };
-        assert!(handle.state.lock().unwrap().db.is_none());
+        assert!(unsafe { &*handle.state }.lock().unwrap().db.is_none());
+        unsafe { drop(Box::from_raw(handle.state)) };
     }
 
     #[test]

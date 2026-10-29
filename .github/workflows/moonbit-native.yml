@@ -196,6 +196,7 @@ jobs:
           if (Test-Path tests/conformance-db) {
             Remove-Item -Recurse -Force tests/conformance-db
           }
+          $env:HAWDB_MOONBIT_TRACE = "1"
           moon run --target native tests/conformance 2>&1 | Tee-Object -FilePath conformance.log
           if ($LASTEXITCODE -ne 0) { throw "MoonBit/HawDB native executable failed" }
           $log = Get-Content -Path conformance.log -Raw
