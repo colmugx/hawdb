@@ -99,3 +99,13 @@ if native callers manually violate the MoonBit reference-lifetime contract.
 Native cross-thread use is still not part of the supported MoonBit API until
 stress/sanitizer qualification explicitly passes. This change is not a
 public ABI version or release approval.
+
+## Rolling upstream compatibility
+
+The adapter uses the currently checked-out HawDB sources via Cargo path
+without a HawDB version constraint. Its generated Cargo.lock is not tracked;
+CI uses rolling Rust stable/MoonBit installers and no Cargo --locked flag.
+The generated dependency graph and toolchain versions are retained **only**
+as provenance for a particular review archive. SDK module package identity
+is not a pin on HawDB. Breaking upstream changes are surfaced by full native
+and external-consumer CI rather than blocked by stale dependency locks.

@@ -642,6 +642,24 @@ fn generated_codec_case() -> Bool {
 /// A read-only file-backed connection must reject mutations while retaining
 /// the real persisted session data, not just an in-memory mock.
 fn readonly_case() -> Bool {
+  // The latest HawDB may require a writable WAL-tail recovery before a
+  // persisted project can service read-only queries. Recover explicitly
+  // using a write-capable connection, then verify read-only behavior.
+  let recovered = match @hawdb.open("./tests/conformance-db") {
+    Ok(v) => v
+    Err(e) => return failed("readonly.recover_open", e.describe())
+  }
+  match recovered.query(
+    "MATCH (s:SuiteSession {id: $id}) RETURN s.title AS title",
+    {"id": @hawdb.Value::Text("s1")},
+  ) {
+    Err(e) => {
+      recovered.close()
+      return failed("readonly.recover_query", e.describe())
+    }
+    Ok(_) => ()
+  }
+  recovered.close()
   let db = match @hawdb.open_read_only("./tests/conformance-db") {
     Ok(v) => v
     Err(e) => return failed("readonly.open", e.describe())

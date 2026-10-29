@@ -6,21 +6,25 @@ on:
     paths:
       - "bindings/moonbit/**"
       - "bindings/moonbit-consumer-smoke/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "src/**"
       - ".github/workflows/moonbit-native.yml"
   pull_request:
     paths:
       - "bindings/moonbit/**"
       - "bindings/moonbit-consumer-smoke/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "src/**"
       - ".github/workflows/moonbit-native.yml"
   workflow_dispatch:
 
 concurrency:
   group: moonbit-native-${{ github.ref }}
   cancel-in-progress: true
-
-env:
-  # Exact toolchain observed in the passing Linux native conformance job.
-  MOONBIT_EXPECTED_VERSION: "0.1.20261028"
 
 permissions:
   contents: read
@@ -36,7 +40,7 @@ jobs:
         os: [ubuntu-24.04, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -54,7 +58,6 @@ jobs:
         run: |
           set -euo pipefail
           moon version --all
-          moon version --all | grep -F "moon $MOONBIT_EXPECTED_VERSION "
           rustc --version
           cargo --version
           python3 --version
@@ -62,20 +65,15 @@ jobs:
           python3 -m unittest discover -s tools/tests -p 'test_*.py'
           python3 tools/check_api_surface.py
           moon check --target native
-      - name: Build adapter with frozen dependencies
+      - name: Build against current HawDB source (rolling)
         working-directory: bindings/moonbit/native
         shell: bash
         run: |
           set -euo pipefail
+          ! git ls-files --error-unmatch Cargo.lock >/dev/null 2>&1
           cargo fmt --all -- --check
-          # Transitional diagnostic only: reconcile the upstream dependency
-          # manifest and capture the exact resolved lock for a tracked commit.
-          cargo generate-lockfile
-          echo 'HAWDB_GENERATED_LOCK_BEGIN'
-          cat Cargo.lock
-          echo 'HAWDB_GENERATED_LOCK_END'
-          cargo test --release --locked --lib
-          cargo build --release --locked
+          cargo test --release --lib
+          cargo build --release
           test -s target/release/libhawdb_moonbit.a
       - name: Configure native linker for macOS
         if: runner.os == 'macOS'
@@ -141,7 +139,7 @@ jobs:
       - uses: actions/checkout@v4
       # Match colmugx/posoco's Windows native toolchain initialization.
       - uses: ilammy/msvc-dev-cmd@v1
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
@@ -160,9 +158,6 @@ jobs:
           $ErrorActionPreference = "Stop"
           moon version --all
           $version = moon version --all
-          if (-not (($version -join "`n") -match ("moon " + [regex]::Escape($env:MOONBIT_EXPECTED_VERSION)))) {
-            throw "Unexpected MoonBit version"
-          }
           rustc --version
           cargo --version
           python --version
@@ -174,17 +169,17 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Public API drift" }
           moon check --target native
           if ($LASTEXITCODE -ne 0) { throw "MoonBit native check failed" }
-      - name: Build Rust staticlib with locked dependencies
+      - name: Build against current HawDB source (rolling)
         working-directory: bindings/moonbit/native
         shell: pwsh
         run: |
+          git ls-files --error-unmatch Cargo.lock 2>$null
+          if ($LASTEXITCODE -eq 0) { throw "SDK Cargo.lock must not be committed" }
           cargo fmt --all -- --check
           if ($LASTEXITCODE -ne 0) { throw "Rust formatting failed" }
-          cargo generate-lockfile
-          if ($LASTEXITCODE -ne 0) { throw "Native Cargo lock resolution failed" }
-          cargo test --release --locked --lib
+          cargo test --release --lib
           if ($LASTEXITCODE -ne 0) { throw "Native lifecycle tests failed" }
-          cargo build --release --locked
+          cargo build --release
           if ($LASTEXITCODE -ne 0) { throw "Rust staticlib build failed" }
           if (!(Test-Path "target/release/hawdb_moonbit.lib")) { throw "Missing Rust .lib output" }
       - name: Configure Windows native linker

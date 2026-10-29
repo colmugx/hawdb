@@ -4,7 +4,6 @@ version = "0.12.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
-rust-version = "1.97.1"
 
 # First-class language adapter, not a dependent of bindings/ffi.
 [workspace]

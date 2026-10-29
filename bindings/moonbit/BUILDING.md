@@ -1,98 +1,64 @@
-# Build, release and platform qualification
+# MoonBit SDK build and release evidence
 
-The MoonBit package is the first-class SDK, and `native/` is its own
-Rust staticlib (direct HawDB engine dependency). Neither dependency nor
-release is subordinate to `bindings/ffi`.
+## Rolling HawDB source, not frozen versions
 
-## Reproducibility
+The Rust adapter depends on HawDB at its **current repository checkout** via
+`hawdb = { path = "../../.." }`. No HawDB version constraint is declared.
+The adapter's `native/Cargo.lock` is generated **per build**, ignored by Git,
+and not committed. CI calls `cargo test --release --lib` and
+`cargo build --release`, without `--locked` or dependency version freezing.
 
-- Rust toolchain: `rust-toolchain.toml`, version 1.97.1.
-- Standalone dependency graph: `native/Cargo.lock` committed in this branch.
-- Production CI: `cargo build --release --locked` on Linux, macOS and Windows;
-  Windows must link and run the same database conformance executable.
-- MoonBit toolchain: public installer currently returns HTTP 403 for the
-  historical binary path `0.1.20261023` even though that build passed Linux
-  CI. For availability, CI installs the official latest channel and
-  **fails closed unless the installed `moon` version is `0.1.20261023`**.
-  A verified immutable binary URL/SHA256 is still required for release-grade
-  supply-chain reproducibility.
-- Generated code is checked in and verified with `--check`, plus
-  negative-generator unit tests. Any divergence blocks CI.
+The CI uses Rust stable and the current official MoonBit toolchain. Their
+actual versions, the actual source commit, and the generated dependency
+resolution are recorded as review-artifact provenance.
 
-## Platform matrix
+The CI path filters cover `src/**`, `crates/**`, root `Cargo.toml` and
+`Cargo.lock`, as well as the SDK, so changes in current HawDB source rerun
+the full compatibility suite. Future upstream commits may introduce breaking
+behavior: CI must reveal this, not mask it with an old lockfile.
 
-| Host | Rust adapter | MoonBit API | Actual embedded execution |
-| --- | --- | --- | --- |
-| Ubuntu 24.04 (x86_64) | release staticlib | native | complete suite |
-| macOS latest (Apple Silicon) | release staticlib | native | complete suite |
-| Windows 2025 (x64) | release `.lib` staticlib | native | complete suite |
+The MoonBit `moon.mod` semver is package identity, **not** a dependency
+pin on HawDB. The external consumer's `moon.work` takes the SDK from local
+source; its declared `@version` is ignored for workspace-local modules.
 
-All three platforms completed actual native conformance on commit
-`07860727fb6cb6c01b36ae2a122d1906d5972664`
-([Actions #40659147687](https://github.com/colmugx/hawdb/actions/runs/40659147687)).
-This is the last independently verified baseline before subsequent changes;
-each later commit must qualify itself again.
+## Native platform qualification
 
-These are platform qualifications, not performance comparisons.
-Windows must also link the Rust staticlib into the MoonBit executable and
-execute every CASE_PASS test; a typecheck or cargo check is insufficient.
-Windows uses MSVC environment setup following colmugx/posoco's check.yml.
+| Host | Adapter | Tests |
+| --- | --- | --- |
+| Ubuntu 24.04 x64 | release staticlib | Rust lifecycle, MoonBit engine conformance, separate consumer |
+| macOS ARM64 | release staticlib | Rust lifecycle, MoonBit engine conformance, separate consumer |
+| Windows 2025 x64 | release staticlib | Rust lifecycle, MoonBit engine conformance, separate consumer |
 
-## Publishing
+For persisted databases with recoverable WAL-tail changes, the fixture
+performs explicit *writable* recovery before verifying read-only query and
+write refusal. Read-only operations never silently modify the database.
 
-`moon.mod` advertises the HawDB MoonBit module with engine-compatible
-version, but publishing should happen only after review of the API, test
-matrix, toolchain pin, platform support policy and required licenses.
-The native Rust adapter itself is intentionally `publish = false` (not a
-standalone crates.io crate). Native consumers must build the matching Rust
-library and link it with the MoonBit package; prebuilt artifacts/packaging
-are not yet supplied.
+Build in `bindings/moonbit/native/`:
 
-## Scope limitations
-
-The normal queries return owned `QueryResult` values. No Arrow/zero-copy,
-retained cursor, public query planner controls or benchmark numbers are
-implied. A scoped write transaction commits on successful callback and
-rolls back on error; read scopes pin an engine read snapshot. Source
-generation currently handles only simple annotated String/Int64/Bool
-structs (see `tools/README.md`).
-
-## Release staging (not registry publication)
-
-After native conformance, all three platforms stage a per-OS/per-architecture tarball
-and SHA256 checksum as a GitHub Actions artifact. The archive includes
-MoonBit source, the matching Rust staticlib, package documentation, license,
-and a provenance manifest containing the commit and tested toolchains.
-
-To stage locally after building:
 ```sh
-cd bindings/moonbit
+cargo test --release --lib
+cargo build --release
+```
+
+Then, in `bindings/moonbit/`:
+
+```sh
+moon check --target native
+moon run --target native tests/conformance
 python3 tools/stage_release.py --os Linux --arch X64
 ```
 
-This is a **review artifact**, not an upstream release or a working
-`moon install` distribution. Consumers still need to link the native static
-library in their executable `moon.pkg`. Third-party attribution/SBOM,
-stable native ABI policy, verified binary checksums and platform-native linker qualification must be reviewed before a public
-production release.
+On macOS and Windows, configure native linker flags with
+`tools/configure_native_link.py` (as in the workflow).
 
-On macOS, the full Rust static archive requires Apple frameworks
-`CoreFoundation` and `IOKit`; CI adds these to the MoonBit executable's
-`cc-link-flags` only on macOS. Applications linking the Rust staticlib must
-supply equivalent platform-native system flags.
+## Review archive versus publication
 
-On Windows, CI initializes MSVC with `ilammy/msvc-dev-cmd@v1`, builds
-`hawdb_moonbit.lib` using `cargo build --release --locked`, and uses
-`tools/configure_native_link.py --os windows` to adapt the conformance
-executable's platform-specific linking flags. This is modeled on Posoco's
-3-OS testing strategy, extended to native database execution on every OS.
+After full conformance, each runner stages a tarball with MoonBit source,
+Rust static library, API contract, license, native dependency resolution
+generated during the build, SHA-256 inventory and toolchain/source provenance.
+The graph captured in an artifact documents **that build**; it never pins
+future SDK builds. Rolling builds are not reproducible across time.
 
-## Production release gate
-
-Review archives are **not** a production registry release. The staged archive
-now includes the public API contract/snapshot, locked Rust dependency graph,
-provenance, and per-file SHA-256 inventory. A separate release approval is
-required after the native handle race audit and tested provenance checks.
-Do not describe the archive as security-certified, published, or installable
-via the registry; unsigned archives and unpinned MoonBit installer downloads
-are insufficient for a public production release.
+These review artifacts are not published releases. Third-party attribution,
+GC/finalizer race qualification, verified toolchain distribution, signature
+policy and production release approval are separate gates.
