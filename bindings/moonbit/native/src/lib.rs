@@ -514,7 +514,9 @@ fn tx_abandon_state(state: &mut TransactionState) -> Result<(), Failure> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if engine.transaction_active() {
-                engine.rollback_transaction().map_err(|e| engine_error(&e))?;
+                engine
+                    .rollback_transaction()
+                    .map_err(|e| engine_error(&e))?;
             }
         }
     }
@@ -585,7 +587,11 @@ pub extern "C" fn moonbit_hawdb_tx_begin(
             return Err(fail("closed", "database is closed"));
         }
         let read = if read_only != 0 {
-            Some(locked.begin_read_transaction().map_err(|e| engine_error(&e))?)
+            Some(
+                locked
+                    .begin_read_transaction()
+                    .map_err(|e| engine_error(&e))?,
+            )
         } else {
             locked.begin_transaction().map_err(|e| engine_error(&e))?;
             None
@@ -614,7 +620,13 @@ pub extern "C" fn moonbit_hawdb_tx_is_open(tx: *mut TransactionHandle) -> i32 {
     let state = unsafe { &(*tx).state }
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    i32::from(state.active && state.db.as_ref().is_some_and(|db| !db.closed.load(Ordering::Acquire)))
+    i32::from(
+        state.active
+            && state
+                .db
+                .as_ref()
+                .is_some_and(|db| !db.closed.load(Ordering::Acquire)),
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -656,20 +668,31 @@ pub extern "C" fn moonbit_hawdb_tx_query(
         if !state.active {
             return Err(fail("closed", "transaction is closed"));
         }
-        let shared = state.db.as_ref().cloned().ok_or_else(|| fail("closed", "transaction is closed"))?;
+        let shared = state
+            .db
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| fail("closed", "transaction is closed"))?;
         if shared.closed.load(Ordering::Acquire) {
             return Err(fail("closed", "database is closed"));
         }
         if state.read_only {
-            let read = state.read.as_mut().ok_or_else(|| fail("closed", "read transaction is closed"))?;
+            let read = state
+                .read
+                .as_mut()
+                .ok_or_else(|| fail("closed", "read transaction is closed"))?;
             let result = if is_sql != 0 {
                 read.query_sql_with_params(stmt, &sql_params(args)?)
             } else {
                 read.query_with_params(stmt, &named_params(args)?)
-            }.map_err(|e| engine_error(&e))?;
+            }
+            .map_err(|e| engine_error(&e))?;
             Ok::<String, Failure>(encode_result(&result))
         } else {
-            let mut engine = shared.engine.lock().map_err(|_| fail("execution", "database mutex poisoned"))?;
+            let mut engine = shared
+                .engine
+                .lock()
+                .map_err(|_| fail("execution", "database mutex poisoned"))?;
             if shared.closed.load(Ordering::Acquire) {
                 return Err(fail("closed", "database is closed"));
             }
@@ -677,7 +700,8 @@ pub extern "C" fn moonbit_hawdb_tx_query(
                 engine.transaction_query_sql_with_params(stmt, &sql_params(args)?)
             } else {
                 engine.transaction_query_with_params(stmt, &named_params(args)?)
-            }.map_err(|e| engine_error(&e))?;
+            }
+            .map_err(|e| engine_error(&e))?;
             Ok::<String, Failure>(encode_result(&result))
         }
     }));
@@ -707,7 +731,11 @@ pub extern "C" fn moonbit_hawdb_tx_finish(tx: *mut TransactionHandle, commit: i3
         if !state.active {
             return Err(fail("closed", "transaction is closed"));
         }
-        let shared = state.db.as_ref().cloned().ok_or_else(|| fail("closed", "transaction is closed"))?;
+        let shared = state
+            .db
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| fail("closed", "transaction is closed"))?;
         if shared.closed.load(Ordering::Acquire) {
             tx_abandon_state(&mut state)?;
             return Err(fail("closed", "database is closed"));
@@ -716,10 +744,15 @@ pub extern "C" fn moonbit_hawdb_tx_finish(tx: *mut TransactionHandle, commit: i3
             tx_abandon_state(&mut state)?;
             return Ok::<String, Failure>(r#"{"columns":[],"rows":[]}"#.to_owned());
         }
-        let mut engine = shared.engine.lock().map_err(|_| fail("execution", "database mutex poisoned"))?;
+        let mut engine = shared
+            .engine
+            .lock()
+            .map_err(|_| fail("execution", "database mutex poisoned"))?;
         if shared.closed.load(Ordering::Acquire) {
             if engine.transaction_active() {
-                engine.rollback_transaction().map_err(|e| engine_error(&e))?;
+                engine
+                    .rollback_transaction()
+                    .map_err(|e| engine_error(&e))?;
             }
             state.active = false;
             state.db.take();
