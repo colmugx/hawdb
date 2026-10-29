@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import pathlib
 import subprocess
 import tarfile
@@ -32,6 +33,9 @@ def main() -> None:
         ("traits.mbt", MODULE / "traits.mbt"),
         ("README.md", MODULE / "README.md"),
         ("BUILDING.md", MODULE / "BUILDING.md"),
+        ("API_CONTRACT.md", MODULE / "API_CONTRACT.md"),
+        ("public_api_surface.txt", MODULE / "public_api_surface.txt"),
+        ("native/Cargo.lock", MODULE / "native" / "Cargo.lock"),
         ("tools/hawdb_derive.py", MODULE / "tools/hawdb_derive.py"),
         ("tools/README.md", MODULE / "tools/README.md"),
         ("LICENSE", REPOSITORY / "LICENSE"),
@@ -63,12 +67,24 @@ def main() -> None:
         "moon": subprocess.check_output(["moon", "version", "--all"], text=True).strip(),
         "native_library_sha256": hashlib.sha256(manifest[-1][1].read_bytes()).hexdigest(),
     }
+    lock = (MODULE / "native" / "Cargo.lock").read_bytes()
+    provenance["cargo_lock_sha256"] = hashlib.sha256(lock).hexdigest()
+    provenance["sdk_source_tree"] = subprocess.check_output(
+        ["git", "rev-parse", "HEAD:bindings/moonbit"], cwd=REPOSITORY, text=True
+    ).strip()
     metadata = dist / "PROVENANCE.json"
     metadata.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     with tarfile.open(output, "w:gz") as archive:
         for inside, path in sorted(manifest):
             archive.add(path, arcname=f"{slug}/{inside}", recursive=False)
         archive.add(metadata, arcname=f"{slug}/PROVENANCE.json")
+        # File-level inventory; empty/missing files were rejected above.
+        inventory = {name: hashlib.sha256(path.read_bytes()).hexdigest()
+                     for name, path in manifest}
+        inventory["PROVENANCE.json"] = hashlib.sha256(metadata.read_bytes()).hexdigest()
+        filelist = dist / "SHA256SUMS.json"
+        filelist.write_text(json.dumps(inventory, sort_keys=True, indent=2) + "\\n", encoding="utf-8")
+        archive.add(filelist, arcname=f"{slug}/SHA256SUMS.json")
     checksum = hashlib.sha256(output.read_bytes()).hexdigest()
     (dist / f"{slug}.tar.gz.sha256").write_text(
         f"{checksum}  {output.name}\n", encoding="ascii"

@@ -86,3 +86,13 @@ On Windows, CI initializes MSVC with `ilammy/msvc-dev-cmd@v1`, builds
 `tools/configure_native_link.py --os windows` to adapt the conformance
 executable's platform-specific linking flags. This is modeled on Posoco's
 3-OS testing strategy, extended to native database execution on every OS.
+
+## Production release gate
+
+Review archives are **not** a production registry release. The staged archive
+now includes the public API contract/snapshot, locked Rust dependency graph,
+provenance, and per-file SHA-256 inventory. A separate release approval is
+required after the native handle race audit and tested provenance checks.
+Do not describe the archive as security-certified, published, or installable
+via the registry; unsigned archives and unpinned MoonBit installer downloads
+are insufficient for a public production release.
