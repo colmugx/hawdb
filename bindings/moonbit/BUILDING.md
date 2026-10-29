@@ -29,9 +29,11 @@ source; its declared `@version` is ignored for workspace-local modules.
 | macOS ARM64 | release staticlib | Rust lifecycle, MoonBit engine conformance, separate consumer |
 | Windows 2025 x64 | release staticlib | Rust lifecycle, MoonBit engine conformance, separate consumer |
 
-For persisted databases with recoverable WAL-tail changes, the fixture
-performs explicit *writable* recovery before verifying read-only query and
-write refusal. Read-only operations never silently modify the database.
+Read-only open selects HawDB's `RecoveryMode::Strict` rather than
+`AutoRepairTornTail`. Conformance reopens the already-persisted session
+without a writable recovery or checkpoint, verifies its contents, and
+confirms read-only mutation refusal. A genuinely corrupt/torn WAL must
+still fail closed in strict mode.
 
 Build in `bindings/moonbit/native/`:
 

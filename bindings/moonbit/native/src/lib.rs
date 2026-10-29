@@ -19,7 +19,7 @@ use std::sync::{
 use base64::Engine;
 use hawdb::{
     DatabaseReadTransaction, EmbeddedQueryError, HawDBEmbedded, HawDBEmbeddedOpenOptions,
-    HawDBError, QueryOutput, Uuid, Value,
+    HawDBError, QueryOutput, RecoveryMode, Uuid, Value,
 };
 use serde_json::{json, Value as Json};
 
@@ -368,6 +368,17 @@ fn sql_params(data: &str) -> Result<Vec<Value>, Failure> {
     arr.iter().map(decode_value).collect()
 }
 
+// Opening read-only must select strict WAL replay. HawDB explicitly
+// rejects AutoRepairTornTail for read-only open, even on a healthy database.
+fn open_options(path: PathBuf, read_only: bool) -> HawDBEmbeddedOpenOptions {
+    let mut options = HawDBEmbeddedOpenOptions::new(path);
+    options.config.read_only = read_only;
+    if read_only {
+        options.config.recovery_mode = RecoveryMode::Strict;
+    }
+    options
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn moonbit_hawdb_open(path: *const u8, len: i32, read_only: i32) -> *mut Handle {
     let handle = allocate_handle();
@@ -376,8 +387,7 @@ pub extern "C" fn moonbit_hawdb_open(path: *const u8, len: i32, read_only: i32) 
     }
     let opened = catch_unwind(AssertUnwindSafe(|| {
         let path = unsafe { input(path, len, "path") }?;
-        let mut options = HawDBEmbeddedOpenOptions::new(PathBuf::from(path));
-        options.config.read_only = read_only != 0;
+        let options = open_options(PathBuf::from(path), read_only != 0);
         HawDBEmbedded::open_with_options(options).map_err(|e| engine_error(&e))
     }));
     match opened {
@@ -838,6 +848,20 @@ mod lifecycle_tests {
     }
 
     use super::*;
+
+    #[test]
+    fn readonly_open_requests_strict_wal_recovery() {
+        let options = open_options(PathBuf::from("readonly-fixture"), true);
+        assert!(options.config.read_only);
+        assert_eq!(options.config.recovery_mode, RecoveryMode::Strict);
+
+        let writable = open_options(PathBuf::from("writable-fixture"), false);
+        assert!(!writable.config.read_only);
+        assert_eq!(
+            writable.config.recovery_mode,
+            RecoveryMode::AutoRepairTornTail
+        );
+    }
 
     #[test]
     fn concurrent_close_and_clone_keep_owned_engine_alive() {
