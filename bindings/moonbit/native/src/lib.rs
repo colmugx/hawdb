@@ -786,7 +786,6 @@ pub extern "C" fn moonbit_hawdb_tx_close(tx: *mut TransactionHandle) {
     }));
 }
 
-
 // The following tests exercise the Rust-side locking without calling any
 // MoonBit allocation function. The MoonBit runtime owns external payloads,
 // while these test-owned payloads remain alive until all workers have joined.
@@ -823,12 +822,7 @@ mod lifecycle_tests {
             }
         });
         let handle = unsafe { Box::from_raw(address as *mut Handle) };
-        assert!(handle
-            .state
-            .lock()
-            .unwrap()
-            .db
-            .is_none());
+        assert!(handle.state.lock().unwrap().db.is_none());
     }
 
     #[test]
