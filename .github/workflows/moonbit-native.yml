@@ -68,6 +68,12 @@ jobs:
         run: |
           set -euo pipefail
           cargo fmt --all -- --check
+          # Transitional diagnostic only: reconcile the upstream dependency
+          # manifest and capture the exact resolved lock for a tracked commit.
+          cargo generate-lockfile
+          echo 'HAWDB_GENERATED_LOCK_BEGIN'
+          cat Cargo.lock
+          echo 'HAWDB_GENERATED_LOCK_END'
           cargo test --release --locked --lib
           cargo build --release --locked
           test -s target/release/libhawdb_moonbit.a
@@ -174,6 +180,8 @@ jobs:
         run: |
           cargo fmt --all -- --check
           if ($LASTEXITCODE -ne 0) { throw "Rust formatting failed" }
+          cargo generate-lockfile
+          if ($LASTEXITCODE -ne 0) { throw "Native Cargo lock resolution failed" }
           cargo test --release --locked --lib
           if ($LASTEXITCODE -ne 0) { throw "Native lifecycle tests failed" }
           cargo build --release --locked
