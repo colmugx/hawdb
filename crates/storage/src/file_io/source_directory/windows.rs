@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 use super::*;
 use std::ffi::c_void;
@@ -89,6 +89,70 @@ const SYNCHRONOUS_NONALERT: u32 = 0x20;
 const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 
+pub(super) fn link_child_new(
+    source: &std::fs::File,
+    source_name: ChildName<'_>,
+    expected: &std::fs::File,
+    target: &std::fs::File,
+    target_name: ChildName<'_>,
+    context: &FileOpenContext,
+) -> io::Result<()> {
+    #[repr(C)]
+    struct FileLinkInformation {
+        replace_if_exists: u8,
+        root_directory: *mut c_void,
+        file_name_length: u32,
+        file_name: [u16; 256],
+    }
+    // Modern Windows hard-link creation requires FILE_WRITE_ATTRIBUTES.
+    // Open through the captured source directory and compare the fresh handle
+    // before the first target effect; no saved path or reparse traversal.
+    let _permit = context.acquire(DescriptorKind::Transient)?;
+    let input = relative_open(source, source_name, 0x100, false)?;
+    if crate::native_file_identity::of_file(&input)?
+        != crate::native_file_identity::of_file(expected)?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "immutable link source binding changed",
+        ));
+    }
+    let mut information = FileLinkInformation {
+        replace_if_exists: 0,
+        root_directory: target.as_raw_handle(),
+        file_name_length: u32::try_from(target_name.0.len() * 2)
+            .expect("bounded component fits u32"),
+        file_name: [0; 256],
+    };
+    for (slot, byte) in information.file_name.iter_mut().zip(target_name.0.bytes()) {
+        *slot = u16::from(byte);
+    }
+    let mut status = IoStatusBlock {
+        status_or_pointer: 0,
+        information: 0,
+    };
+    // SAFETY: FILE_LINK_INFORMATION is repr(C), aligned and fully bounded by
+    // its supplied buffer. Both handles remain live through this synchronous
+    // NtSetInformationFile(FileLinkInformation=11). Replacement is disabled.
+    let result = unsafe {
+        nt_set_information_file(
+            input.as_raw_handle(),
+            &mut status,
+            (&raw const information).cast(),
+            u32::try_from(std::mem::size_of::<FileLinkInformation>())
+                .expect("bounded link information fits u32"),
+            11,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::from_raw_os_error(
+            unsafe { status_to_error(result) } as i32,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 pub(super) fn create_directory(root: &std::fs::File, name: ChildName<'_>) -> io::Result<()> {
     let mut encoded = [0_u16; 256];
     for (slot, byte) in encoded.iter_mut().zip(name.0.bytes()) {
@@ -100,6 +164,42 @@ pub(super) fn create_directory(root: &std::fs::File, name: ChildName<'_>) -> io:
     let file = relative_open_encoded_raw(root, &mut encoded[..name.0.len()], 1, 2, 1)?;
     drop(file);
     Ok(())
+}
+
+fn component_units(name: DirectoryComponent<'_>) -> ([u16; 255], usize) {
+    use std::os::windows::ffi::OsStrExt;
+    let mut units = [0; 255];
+    let mut length = 0;
+    for unit in name.0.encode_wide() {
+        units[length] = unit;
+        length += 1;
+    }
+    (units, length)
+}
+
+pub(super) fn create_directory_component(
+    root: &std::fs::File,
+    name: DirectoryComponent<'_>,
+) -> io::Result<()> {
+    let (mut units, length) = component_units(name);
+    // Exact native component, held RootDirectory, exclusive FILE_CREATE.
+    // Keep successful creation observable before any fallible metadata query.
+    drop(relative_open_encoded_raw(
+        root,
+        &mut units[..length],
+        1,
+        2,
+        1,
+    )?);
+    Ok(())
+}
+
+pub(super) fn open_directory_component(
+    root: &std::fs::File,
+    name: DirectoryComponent<'_>,
+) -> io::Result<std::fs::File> {
+    let (mut units, length) = component_units(name);
+    relative_open_encoded(root, &mut units[..length], READ_DATA, 1, 1)
 }
 
 pub(super) fn create_control_candidate(

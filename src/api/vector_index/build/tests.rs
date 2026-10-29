@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 use super::*;
 use hawdb_core::Vector;
@@ -7,7 +7,9 @@ use hawdb_qos::RuntimeWorkRequest;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
+mod diskann;
 mod eligibility;
+mod incremental;
 
 struct Fixture(PathBuf);
 impl Fixture {
@@ -108,13 +110,12 @@ fn vector_index_builds_both_canonical_source_families_and_reopens() {
                 Default::default(),
             )
             .unwrap();
-        assert_eq!(consumer.search_index().unwrap().document_count(), 3);
+        assert_eq!(consumer.document_count().unwrap(), 3);
         assert_eq!(distances(&mut db, &consumer), [0.0, 1.0, 2.0]);
         assert_eq!(
             consumer
-                .search_index()
-                .unwrap()
                 .vector_index_descriptor()
+                .unwrap()
                 .unwrap()
                 .dimension()
                 .get(),
@@ -242,9 +243,8 @@ fn vector_index_build_preserves_empty_and_null_only_dimensions() {
             .unwrap();
         assert_eq!(
             consumer
-                .search_index()
-                .unwrap()
                 .vector_index_descriptor()
+                .unwrap()
                 .unwrap()
                 .dimension()
                 .get(),

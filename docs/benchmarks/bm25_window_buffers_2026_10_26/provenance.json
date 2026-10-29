@@ -1,0 +1,14 @@
+{
+  "baseline_production_revision": "bb69b33664fc7523997c670d57df661e8ff204fd",
+  "candidate_test_binary_sha256": "00b363102d40047e3605e9dd0a1504cf48f907714ce8cd9d33d5123c26617c12",
+  "measured_patch_sha256": "0caca2571ee9f2b6822c2e0c28d87963a7d8a264f58378e7ce2c69ce2a046e19",
+  "measured_bm25_windows_sha256": "6af635800c303269b4dccdea9e70f46de875a99c15396f77639a5b06b68bd46e",
+  "cargo_lock_sha256": "bb58b40de4e6283e06f6904646dd9594f5b1e2462f8a55c98204b819c284379a",
+  "cargo_profile_sha256": "06c7ca26d39223bd90a6412acd8609c380ce2d1650a72b70c90171656ca89819",
+  "toolchain_sha256": "8e390d6a0838315f972690f46ef8bae8b7ecc9ee6c1ed70140ef852869c2482e",
+  "measurement_scope": "repository optimized test profile, all Search features, synthetic allocator/read counters; not timing or RSS",
+  "source_note": "Final production differs from measured implementation only by canonical license headers and a floor/tie comment. The measured patch plus the separate test module reconstruct its source on the baseline revision.",
+  "baseline_test_binary_sha256": "6c43402ca11b8aa4b69847abdb02a02c67f061f18292faecbbce32fa038a6f09",
+  "binary_custody": "Both test executables copied to independent immutable paths before subsequent Cargo operations; baseline RED checks executed from the captured baseline binary.",
+  "cache_note": "An intermediate invocation reused a shared Cargo target executable and was discarded. The recorded baseline log shows a forced baseline crate rebuild, and its captured executable fails both unchanged regression assertions."
+}

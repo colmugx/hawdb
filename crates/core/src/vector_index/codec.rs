@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 use super::*;
 
@@ -42,6 +42,23 @@ impl VectorIndexDescriptor {
             VectorDistance::Euclidean => 1,
         });
         match self.backend {
+            VectorIndexBackend::DiskAnn {
+                max_degree,
+                build_beam,
+                alpha_milli,
+                lsg,
+            } => {
+                output.push(1);
+                for value in [max_degree, build_beam, alpha_milli] {
+                    output.extend_from_slice(&value.to_le_bytes());
+                }
+                output.push(u8::from(lsg.is_some()));
+                if let Some(lsg) = lsg {
+                    for value in [lsg.sample_size, lsg.neighbors, lsg.exponent_milli] {
+                        output.extend_from_slice(&value.to_le_bytes());
+                    }
+                }
+            }
             VectorIndexBackend::RaBitQ {
                 bit_width,
                 segment_rows,
@@ -89,9 +106,30 @@ impl VectorIndexDescriptor {
             .ok_or_else(|| invalid("dimension must be positive"))?;
         let distance = match input.read::<1>()?[0] {
             0 => VectorDistance::Cosine,
+            1 => VectorDistance::Euclidean,
             _ => return Err(invalid("unsupported index metric")),
         };
         let backend = match input.read::<1>()?[0] {
+            1 => {
+                let max_degree = u32::from_le_bytes(input.read()?);
+                let build_beam = u32::from_le_bytes(input.read()?);
+                let alpha_milli = u32::from_le_bytes(input.read()?);
+                let lsg = match input.read::<1>()?[0] {
+                    0 => None,
+                    1 => Some(VectorIndexLsg {
+                        sample_size: u32::from_le_bytes(input.read()?),
+                        neighbors: u32::from_le_bytes(input.read()?),
+                        exponent_milli: u32::from_le_bytes(input.read()?),
+                    }),
+                    _ => return Err(invalid("unsupported local scaling encoding")),
+                };
+                VectorIndexBackend::DiskAnn {
+                    max_degree,
+                    build_beam,
+                    alpha_milli,
+                    lsg,
+                }
+            }
             0 => VectorIndexBackend::RaBitQ {
                 bit_width: input.read::<1>()?[0],
                 segment_rows: u32::from_le_bytes(input.read()?),
@@ -232,5 +270,84 @@ mod tests {
         let mut oversized_name = valid.encode();
         oversized_name[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
         assert!(VectorIndexDescriptor::decode(&oversized_name).is_err());
+    }
+
+    #[test]
+    fn diskann_descriptor_roundtrips_metrics_lsg_and_rejects_truncation() {
+        let target = VectorIndexTarget::Relational {
+            table: "vectors".into(),
+            column: "embedding".into(),
+            column_ordinal: 1,
+        };
+        for metric in [VectorDistance::Cosine, VectorDistance::Euclidean] {
+            for lsg in [
+                None,
+                Some(VectorIndexLsg {
+                    sample_size: 256,
+                    neighbors: 10,
+                    exponent_milli: 1000,
+                }),
+            ] {
+                let definition = VectorIndexDescriptor::new(
+                    "vectors.embedding".into(),
+                    target.clone(),
+                    VectorDimension::new(3).unwrap(),
+                    metric,
+                    VectorIndexBackend::DiskAnn {
+                        max_degree: 32,
+                        build_beam: 128,
+                        alpha_milli: 1200,
+                        lsg,
+                    },
+                    [17; 32],
+                )
+                .unwrap();
+                let encoded = definition.encode();
+                assert_eq!(VectorIndexDescriptor::decode(&encoded).unwrap(), definition);
+                for end in 0..encoded.len() {
+                    assert!(VectorIndexDescriptor::decode(&encoded[..end]).is_err());
+                }
+            }
+        }
+        for backend in [
+            VectorIndexBackend::DiskAnn {
+                max_degree: 1,
+                build_beam: 128,
+                alpha_milli: 1200,
+                lsg: None,
+            },
+            VectorIndexBackend::DiskAnn {
+                max_degree: 32,
+                build_beam: 16,
+                alpha_milli: 1200,
+                lsg: None,
+            },
+            VectorIndexBackend::DiskAnn {
+                max_degree: 32,
+                build_beam: 128,
+                alpha_milli: 999,
+                lsg: None,
+            },
+            VectorIndexBackend::DiskAnn {
+                max_degree: 32,
+                build_beam: 128,
+                alpha_milli: 1200,
+                lsg: Some(VectorIndexLsg {
+                    sample_size: 16,
+                    neighbors: 17,
+                    exponent_milli: 1000,
+                }),
+            },
+        ] {
+            assert!(VectorIndexDescriptor::new(
+                "invalid".into(),
+                target.clone(),
+                VectorDimension::new(3).unwrap(),
+                VectorDistance::Cosine,
+                backend,
+                [0; 32]
+            )
+            .is_err());
+        }
     }
 }

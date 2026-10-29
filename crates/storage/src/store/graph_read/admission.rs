@@ -23,6 +23,9 @@ use crate::read_view::{
 use std::cell::{Cell, RefCell};
 use std::ops::Deref;
 
+#[path = "admission/indexed.rs"]
+mod indexed;
+
 pub(super) struct AdmittedProjection {
     pub(super) node: ProjectedNodeRecord,
     _allocation: Box<dyn GraphReadAllocation>,

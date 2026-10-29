@@ -43,6 +43,220 @@ impl Drop for Fixture {
     }
 }
 
+fn recovery_baseline() -> CrashImage {
+    let mut engine = ImageEngine::new(ImageLimits::default()).unwrap();
+    engine.create_directory(Path::new("payloads")).unwrap();
+    engine.create_directory(Path::new("empty")).unwrap();
+    let file = engine.create_file(Path::new("payloads/data")).unwrap();
+    engine.write(file, 0, b"original").unwrap();
+    engine
+        .hard_link(Path::new("payloads/data"), Path::new("retained"))
+        .unwrap();
+    engine.crash(&engine.persist_all_plan()).unwrap()
+}
+
+#[test]
+fn recovery_recording_preserves_baseline_aliases_and_models_the_next_torn_write() {
+    let image = recovery_baseline();
+    let original = Fixture::new(ImageLimits::default());
+    let root = original.root.with_extension("resumed");
+    image.materialize(&root).unwrap();
+    let project = ProjectFileDescriptors::acquire_with_capacity_limit(&root, 32, true).unwrap();
+    let bounded = ImageEngine::from_crash_image(
+        &image,
+        ImageLimits {
+            max_inodes: 4,
+            max_pending_operations: 1,
+            max_bytes: 8,
+        },
+    )
+    .unwrap();
+    assert!(bounded.persist_all_plan().persistence.is_empty());
+    let model = PowerLossModel::resume_from_image(
+        &project,
+        &image,
+        ImageLimits {
+            max_inodes: 4,
+            max_pending_operations: 1,
+            max_bytes: 32,
+        },
+    )
+    .unwrap();
+    let fixture = Fixture { root, model };
+    let captured = fixture.model.capture().unwrap();
+    let baseline = captured.crash(&CrashPlan::default()).unwrap();
+    assert!(captured.persist_all_plan().persistence.is_empty());
+    assert!(baseline.directory_paths().eq(image.directory_paths()));
+    assert!(baseline.paths().eq(image.paths()));
+    for path in image.paths() {
+        assert_eq!(baseline.bytes(path), image.bytes(path));
+        assert_eq!(baseline.file_inode(path), image.file_inode(path));
+    }
+    fixture
+        .model
+        .observe(ObservationPoint {
+            event: IoEvent::Write,
+            relative_path: "payloads/data".into(),
+            boundary: ObservationBoundary::After,
+            skip_matches: 0,
+            include_descendants: false,
+            keep_last: false,
+        })
+        .unwrap();
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fixture.root.join("payloads/data"))
+        .unwrap();
+    file.write_all(b"changed!").unwrap();
+    fixture.model.capture().unwrap();
+    let second = fixture.model.take_observation().unwrap().unwrap();
+    let writes = second.uncovered_writes(Path::new("payloads/data")).unwrap();
+    assert_eq!(writes.len(), 1);
+    let lost = second.crash(&CrashPlan::default()).unwrap();
+    let torn = second
+        .crash(&CrashPlan {
+            persistence: vec![PersistOperation::TornWrite {
+                operation: writes[0].operation,
+                bytes: 0..4,
+            }],
+        })
+        .unwrap();
+    let complete = second.crash(&second.persist_all_plan()).unwrap();
+    for path in [Path::new("payloads/data"), Path::new("retained")] {
+        assert_eq!(lost.bytes(path), Some(b"original".as_slice()));
+        assert_eq!(torn.bytes(path), Some(b"chaninal".as_slice()));
+        assert_eq!(complete.bytes(path), Some(b"changed!".as_slice()));
+    }
+    file.sync_all().unwrap();
+    let durable = fixture
+        .model
+        .capture()
+        .unwrap()
+        .crash(&CrashPlan::default())
+        .unwrap();
+    assert_eq!(
+        durable.bytes(Path::new("retained")),
+        Some(b"changed!".as_slice())
+    );
+    drop(file);
+}
+
+#[test]
+fn recovery_attachment_refuses_drift_and_limits_without_leaking_registration() {
+    let image = recovery_baseline();
+    for mutation in [
+        "bytes",
+        "alias",
+        "namespace",
+        "bytes_limit",
+        "inode_limit",
+        "open",
+    ] {
+        let original = Fixture::new(ImageLimits::default());
+        let root = original.root.with_extension("refused");
+        image.materialize(&root).unwrap();
+        let project = ProjectFileDescriptors::acquire_with_capacity_limit(&root, 32, true).unwrap();
+        let mut limits = ImageLimits::default();
+        let mut held = None;
+        match mutation {
+            "bytes" => std::fs::write(root.join("payloads/data"), b"modified").unwrap(),
+            "alias" => {
+                std::fs::remove_file(root.join("retained")).unwrap();
+                std::fs::write(root.join("retained"), b"original").unwrap();
+            }
+            "namespace" => std::fs::write(root.join("extra"), []).unwrap(),
+            "bytes_limit" => limits.max_bytes = 7,
+            "inode_limit" => limits.max_inodes = 3,
+            "open" => held = Some(fs::File::open(root.join("payloads/data")).unwrap()),
+            _ => unreachable!(),
+        }
+        assert!(
+            PowerLossModel::resume_from_image(&project, &image, limits).is_err(),
+            "{mutation}"
+        );
+        drop(held);
+        assert_eq!(project.metrics().open, 0);
+        assert_eq!(project.metrics().reserved, 0);
+        assert!(project.state.power_loss.lock().unwrap().upgrade().is_none());
+        drop(project);
+        std::fs::remove_dir_all(&root).unwrap();
+        image.materialize(&root).unwrap();
+        let project = ProjectFileDescriptors::acquire_with_capacity_limit(&root, 32, true).unwrap();
+        let model =
+            PowerLossModel::resume_from_image(&project, &image, ImageLimits::default()).unwrap();
+        let fixture = Fixture { root, model };
+        fixture.model.capture().unwrap();
+    }
+}
+
+#[test]
+fn observations_capture_root_barriers_and_descendants_without_accepting_escaped_paths() {
+    for boundary in [ObservationBoundary::Before, ObservationBoundary::After] {
+        let fixture = Fixture::new(ImageLimits::default());
+        let mut file = fs::File::create(fixture.root.join("candidate")).unwrap();
+        file.write_all(b"complete").unwrap();
+        file.sync_all().unwrap();
+        fixture
+            .model
+            .observe(ObservationPoint {
+                event: IoEvent::DirectorySync,
+                relative_path: PathBuf::new(),
+                boundary,
+                skip_matches: 0,
+                include_descendants: false,
+                keep_last: false,
+            })
+            .unwrap();
+        crate::durability::sync_directory(&fixture.root).unwrap();
+        let root = fixture.model.take_observation().unwrap().unwrap();
+        assert_eq!(root.observed_path(), Some(Path::new("")));
+        let lost = root.crash(&CrashPlan::default()).unwrap();
+        assert_eq!(
+            lost.bytes(Path::new("candidate")),
+            match boundary {
+                ObservationBoundary::Before => None,
+                ObservationBoundary::After => Some(b"complete".as_slice()),
+            }
+        );
+        for path in [".", "../escape", "nested/../escape", "/absolute"] {
+            assert!(
+                fixture
+                    .model
+                    .observe(ObservationPoint {
+                        event: IoEvent::Write,
+                        relative_path: path.into(),
+                        boundary: ObservationBoundary::After,
+                        skip_matches: 0,
+                        include_descendants: true,
+                        keep_last: false,
+                    })
+                    .is_err(),
+                "{path}"
+            );
+        }
+        fixture
+            .model
+            .observe(ObservationPoint {
+                event: IoEvent::Write,
+                relative_path: PathBuf::new(),
+                boundary: ObservationBoundary::After,
+                skip_matches: 0,
+                include_descendants: true,
+                keep_last: false,
+            })
+            .unwrap();
+        file.write_all(b"tail").unwrap();
+        let write = fixture.model.take_observation().unwrap().unwrap();
+        assert_eq!(write.observed_path(), Some(Path::new("candidate")));
+        assert!(!write
+            .uncovered_writes(Path::new("candidate"))
+            .unwrap()
+            .is_empty());
+        fixture.model.capture().unwrap();
+    }
+}
+
 #[test]
 fn observations_capture_actual_file_barriers_before_later_flushes() {
     for boundary in [ObservationBoundary::Before, ObservationBoundary::After] {

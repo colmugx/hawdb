@@ -37,7 +37,7 @@ use hawdb_storage::file_io::{self as fs, File, OpenOptions};
 #[cfg(test)]
 use publication::file_len_checksum;
 use publication::{publish_generation, ActiveManifestUpdate, PublishGenerationInput};
-use rabitq::RaBitQArtifactBuilder;
+use rabitq::VectorArtifactBuilder;
 use serde::Serialize;
 pub use spool::SearchStagingCleanupReport;
 pub(in crate::out_of_core) use spool::StageDirectory;
@@ -71,6 +71,8 @@ pub use unordered::{
     SearchOutOfCoreUnorderedReplacementWriter, SearchUnorderedMutationLimits,
     SearchUnorderedMutationReport,
 };
+#[cfg(feature = "vector-search")]
+mod diskann;
 mod prepared;
 mod publication;
 mod rabitq;
@@ -141,8 +143,15 @@ pub struct SearchOutOfCoreGenerationBuildOptions {
     /// Weighted analyzed token events admitted per document, independent of body bytes.
     pub lexical_max_document_tokens: NonZeroUsize,
     pub rabitq_segment_rows: NonZeroUsize,
+    /// Shared candidate construction bound, including DiskANN graph builds.
     pub rabitq_build_memory_bytes: NonZeroUsize,
     pub rabitq_transform_seed: u64,
+    /// Default raw-vector graph for unbound projections. `None` explicitly
+    /// selects the legacy RaBitQ builder and its options below. A schema-bound
+    /// definition always owns its backend and construction settings instead.
+    /// Legacy unbound cosine content with zero vectors retains RaBitQ storage;
+    /// ordinary queries use exact scoring for those incompatible graph layers.
+    pub vector_backend: Option<hawdb_core::VectorIndexBackend>,
     #[cfg(feature = "vector-search")]
     pub rabitq_bit_width: hawdb_vector_projection::RaBitQBitWidth,
     pub source_graph_commit_epoch: Option<u64>,
@@ -179,6 +188,7 @@ impl Default for SearchOutOfCoreGenerationBuildOptions {
             rabitq_segment_rows: NonZeroUsize::new(1_024).unwrap(),
             rabitq_build_memory_bytes: NonZeroUsize::new(64 * 1024 * 1024).unwrap(),
             rabitq_transform_seed: 0x534b_4549_4e56_5134,
+            vector_backend: Some(Default::default()),
             #[cfg(feature = "vector-search")]
             rabitq_bit_width: hawdb_vector_projection::RaBitQBitWidth::default(),
             source_graph_commit_epoch: None,
@@ -248,6 +258,7 @@ pub struct SearchOutOfCoreGenerationWriter {
     last_document_id: Option<String>,
     document_count: usize,
     vector_document_count: usize,
+    has_zero_vector: bool,
     logical_document_bytes: u64,
     spool_bytes: u64,
     peak_record_bytes: u64,
@@ -524,6 +535,7 @@ impl SearchOutOfCoreGenerationWriter {
             last_document_id: None,
             document_count: 0,
             vector_document_count: 0,
+            has_zero_vector: false,
             logical_document_bytes: 0,
             spool_bytes: SPOOL_HEADER.len() as u64,
             peak_record_bytes: 0,
@@ -1092,7 +1104,7 @@ impl SearchOutOfCoreGenerationWriter {
             self.memory.clone(),
             self.task_context.clone(),
         )?;
-        let mut vectors = RaBitQArtifactBuilder::new(self, generation)?;
+        let mut vectors = VectorArtifactBuilder::new(self, generation)?;
         let mut completed = None;
         let lexical_config = LexicalProjectionConfig {
             max_manifest_bytes: self.max_lexical_manifest_bytes,
@@ -1189,6 +1201,19 @@ impl SearchOutOfCoreGenerationWriter {
             self.embedding_dimension,
             self.options.embedding_manifest.as_ref(),
         )?;
+        let has_zero_vector = document
+            .embedding
+            .map(|embedding| {
+                for chunk in embedding.chunks(4096) {
+                    checkpoint(&self.task_context)?;
+                    if chunk.iter().any(|coordinate| *coordinate != 0.0) {
+                        return Ok(false);
+                    }
+                }
+                Ok::<_, HawDBError>(true)
+            })
+            .transpose()?
+            .unwrap_or(false);
         if record_bytes > self.options.max_record_bytes.get() {
             return Err(HawDBError::Storage(format!(
                 "search generation document {} requires {record_bytes} encoded bytes, exceeding {}",
@@ -1253,6 +1278,7 @@ impl SearchOutOfCoreGenerationWriter {
         checkpoint(&self.task_context)?;
         Ok(PreparedRecord {
             next_dimension,
+            has_zero_vector,
             logical_document_bytes,
             spool_bytes,
             next_field_bytes,
@@ -1324,6 +1350,7 @@ impl SearchOutOfCoreGenerationWriter {
         self.last_document_id = Some(header.id);
         self.document_count += 1;
         self.vector_document_count += usize::from(header.embedding.is_some());
+        self.has_zero_vector |= prepared.has_zero_vector;
         self.logical_document_bytes = prepared.logical_document_bytes;
         self.spool_bytes = prepared.spool_bytes;
         self.peak_record_bytes = self.peak_record_bytes.max(record_bytes);
@@ -1336,6 +1363,7 @@ impl SearchOutOfCoreGenerationWriter {
 
 struct PreparedRecord {
     next_dimension: Option<usize>,
+    has_zero_vector: bool,
     logical_document_bytes: u64,
     spool_bytes: u64,
     next_field_bytes: u64,
@@ -1347,7 +1375,7 @@ struct GenerationArtifacts {
     lexical_artifact_name: artifact_name::Name,
     lexical_artifact_bytes: u64,
     lexical_manifest_bytes: u64,
-    rabitq: Option<RaBitQGenerationArtifact>,
+    rabitq: Option<VectorGenerationArtifact>,
 }
 
 impl GenerationArtifacts {
@@ -1377,7 +1405,8 @@ impl GenerationArtifacts {
 }
 
 #[derive(Debug)]
-pub(super) struct RaBitQGenerationArtifact {
+pub(super) struct VectorGenerationArtifact {
+    pub(super) diskann_source_digest: Option<[u8; 32]>,
     pub(super) file_name: artifact_name::Name,
     pub(super) artifact_bytes: u64,
     pub(super) artifact_checksum: u64,
@@ -1396,7 +1425,7 @@ fn build_rabitq_artifact(
     embedding_dimension: Option<usize>,
     embedding_manifest: Option<&SearchEmbeddingManifest>,
     options: &SearchOutOfCoreGenerationBuildOptions,
-) -> Result<Option<RaBitQGenerationArtifact>> {
+) -> Result<Option<VectorGenerationArtifact>> {
     if vector_document_count == 0 {
         return Ok(None);
     }
@@ -1443,7 +1472,8 @@ fn build_rabitq_artifact(
     let projection = writer.finish().map_err(rabitq_error)?;
     let manifest = projection.manifest();
     let (artifact_bytes, artifact_checksum) = file_len_checksum(&path)?;
-    Ok(Some(RaBitQGenerationArtifact {
+    Ok(Some(VectorGenerationArtifact {
+        diskann_source_digest: None,
         file_name,
         artifact_bytes,
         artifact_checksum,
@@ -1463,7 +1493,7 @@ fn build_rabitq_artifact(
     _embedding_dimension: Option<usize>,
     _embedding_manifest: Option<&SearchEmbeddingManifest>,
     _options: &SearchOutOfCoreGenerationBuildOptions,
-) -> Result<Option<RaBitQGenerationArtifact>> {
+) -> Result<Option<VectorGenerationArtifact>> {
     Ok(None)
 }
 
@@ -1476,29 +1506,30 @@ fn validate_options(options: &SearchOutOfCoreGenerationBuildOptions) -> Result<(
     if let Some(binding) = &options.vector_index_descriptor {
         crate::compiled_capabilities::effective_runtime_capabilities(Default::default())
             .require(hawdb_core::RuntimeCapability::VectorSearch)?;
-        let hawdb_core::VectorIndexBackend::RaBitQ {
+        if let hawdb_core::VectorIndexBackend::RaBitQ {
             bit_width,
             segment_rows,
             transform_seed,
-        } = binding.backend();
-        #[cfg(feature = "vector-search")]
-        if bit_width != options.rabitq_bit_width.bits() {
-            return Err(HawDBError::Semantic(
-                "vector index bit width differs from its definition".into(),
-            ));
-        }
-        #[cfg(not(feature = "vector-search"))]
-        let _ = bit_width;
-        if segment_rows as usize != options.rabitq_segment_rows.get()
-            || transform_seed != options.rabitq_transform_seed
-            || options
-                .embedding_manifest
-                .as_ref()
-                .is_some_and(|manifest| manifest.dimension != binding.dimension().get() as usize)
+        } = binding.backend()
         {
-            return Err(HawDBError::Semantic(
-                "vector index build options differ from its definition".into(),
-            ));
+            #[cfg(feature = "vector-search")]
+            if bit_width != options.rabitq_bit_width.bits() {
+                return Err(HawDBError::Semantic(
+                    "vector index bit width differs from its definition".into(),
+                ));
+            }
+            #[cfg(not(feature = "vector-search"))]
+            let _ = bit_width;
+            if segment_rows as usize != options.rabitq_segment_rows.get()
+                || transform_seed != options.rabitq_transform_seed
+                || options.embedding_manifest.as_ref().is_some_and(|manifest| {
+                    manifest.dimension != binding.dimension().get() as usize
+                })
+            {
+                return Err(HawDBError::Semantic(
+                    "vector index build options differ from its definition".into(),
+                ));
+            }
         }
     }
     SearchLexicalSourcePolicy::new(options.lexical_max_document_source_bytes)?;

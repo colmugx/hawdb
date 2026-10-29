@@ -446,8 +446,8 @@ impl<'a> GroupAccumulator<'a> {
         }
         Binding {
             values,
-            nodes: BTreeMap::new(),
-            relationships: BTreeMap::new(),
+            nodes: BTreeMap::new().into(),
+            relationships: BTreeMap::new().into(),
         }
     }
 }
@@ -717,7 +717,7 @@ pub fn stream_aggregate_batches(
             } else {
                 groups.insertion_bytes(new_group_payload)
             };
-            if tracker.would_exceed(insertion_bytes) && !groups.is_empty() {
+            if tracker.should_spill(insertion_bytes, task_context) && !groups.is_empty() {
                 runs.push(spill_group_run(
                     &mut groups,
                     &mut spill_budget,

@@ -43,6 +43,8 @@ if [[ "${1:-}" == --list ]]; then
   echo 'api::tests::query_execution::owned: test'
   echo 'api::automatic_checkpoint::tests::headroom::pending_idle: test'
   echo 'api::automatic_checkpoint::tests::headroom::capacity_wait::deadline: test'
+  echo 'api::automatic_checkpoint::tests::delta_pressure_sustains_generations_and_preserves_all_values_after_reopen: test'
+  echo 'api::automatic_checkpoint::tests::soft_wal_pressure_sustains_multiple_generations_without_host_checkpoints: test'
   if [[ "${PARTITION_PROBE_OVERLAP:-0}" == 1 ]]; then
     echo 'analytics::overlap: test'
     echo 'api::tests::query_execution::analytics::overlap: test'
@@ -54,7 +56,7 @@ if [[ "${1:-}" == --list ]]; then
   if [[ "${PARTITION_PROBE_RSS_OVERLAP:-0}" == 1 ]]; then
     echo 'api::tests::graph_analytics::rss_child_extension: test'
   fi
-  echo '6 tests, 0 benchmarks'
+  echo '10 tests, 0 benchmarks'
   exit 0
 fi
 printf '%s\n' "$@" >"${PARTITION_PROBE_ARGS}"
@@ -82,6 +84,8 @@ owners = {
     "checkpoint_headroom": {
         "api::automatic_checkpoint::tests::headroom::pending_idle",
         "api::automatic_checkpoint::tests::headroom::capacity_wait::deadline",
+        "api::automatic_checkpoint::tests::delta_pressure_sustains_generations_and_preserves_all_values_after_reopen",
+        "api::automatic_checkpoint::tests::soft_wal_pressure_sustains_multiple_generations_without_host_checkpoints",
     },
 }
 all_names = set().union(*owners.values())
@@ -114,6 +118,8 @@ names = {
     "api::tests::query_execution::owned",
     "api::automatic_checkpoint::tests::headroom::pending_idle",
     "api::automatic_checkpoint::tests::headroom::capacity_wait::deadline",
+    "api::automatic_checkpoint::tests::delta_pressure_sustains_generations_and_preserves_all_values_after_reopen",
+    "api::automatic_checkpoint::tests::soft_wal_pressure_sustains_multiple_generations_without_host_checkpoints",
 }
 
 def selected(partition):

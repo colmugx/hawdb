@@ -433,10 +433,9 @@ fn conservative_root_bounds_fall_back_without_rejecting_a_serial_working_set() {
         },
     )
     .unwrap();
-    assert_eq!(
-        fixture.ledger.snapshot().peak_bytes,
-        row_bytes * 2 + staging_bytes
-    );
+    // Spill writes encode into the existing IO buffer, so the merge never
+    // stages a second payload copy beside both row heads.
+    assert_eq!(fixture.ledger.snapshot().peak_bytes, row_bytes * 2);
     assert_eq!(budget.run_count(), 6);
     drop(output);
     fixture.assert_released();

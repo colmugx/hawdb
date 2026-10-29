@@ -239,6 +239,7 @@ pub(super) struct VectorScoreScan {
     pub(super) candidate_scan_filtered_document_count: usize,
     pub(super) candidate_scan_scanned_block_count: usize,
     pub(super) candidate_scan_skipped_block_count: usize,
+    pub(super) candidate_scan_adaptive_exact_scan_count: usize,
     pub(super) candidate_scan_payload_bytes_read: u64,
     pub(super) candidate_scan_admitted_working_bytes: usize,
     pub(super) fallback_reason_codes: Vec<SearchFallbackReasonCode>,
@@ -265,6 +266,7 @@ impl Default for VectorScoreScan {
             candidate_scan_filtered_document_count: 0,
             candidate_scan_scanned_block_count: 0,
             candidate_scan_skipped_block_count: 0,
+            candidate_scan_adaptive_exact_scan_count: 0,
             candidate_scan_payload_bytes_read: 0,
             candidate_scan_admitted_working_bytes: 0,
             fallback_reason_codes: Vec::new(),
@@ -277,6 +279,8 @@ impl Default for VectorScoreScan {
 pub(super) struct ScanOptions<'a> {
     pub(super) compressed: CompressedVectorSearchMode,
     pub(super) execution: super::VectorSearchExecutionOptions<'a>,
+    #[cfg(feature = "vector-search")]
+    pub(super) candidate_window: Option<usize>,
     pub(super) query: Option<QueryContext<'a>>,
 }
 
@@ -368,6 +372,61 @@ impl SearchOutOfCoreReader {
         let vector_execution_options = options.execution;
         let task_context = vector_execution_options.task_context;
         checkpoint_vector_task(task_context)?;
+        if vector_execution_options.exact
+            && options.compressed != CompressedVectorSearchMode::Disabled
+        {
+            return Err(HawDBError::Semantic(
+                "exact vector search cannot require a compressed candidate projection".into(),
+            ));
+        }
+        #[cfg(feature = "vector-search")]
+        if options.compressed == CompressedVectorSearchMode::Disabled
+            && !vector_execution_options.exact
+            && self.vector_layers_use_diskann()
+        {
+            let mut nonzero = false;
+            for chunk in query_embedding.chunks(4096) {
+                checkpoint_vector_task(task_context)?;
+                if chunk.iter().any(|coordinate| *coordinate != 0.0) {
+                    nonzero = true;
+                    break;
+                }
+            }
+            if !nonzero {
+                // Ordinary Search historically treats undefined cosine scores
+                // as absent. Schema-bound vector queries validate separately.
+                return self.scan_scalar_vector_scores(
+                    query_embedding,
+                    candidate_set,
+                    retained_limit,
+                    vector_execution_options,
+                    metrics,
+                    options.query,
+                );
+            }
+            let navigation_window =
+                hawdb_vector_projection::diskann::DiskAnnSearchOptions::default()
+                    .beam_width
+                    .min(self.config.max_vector_candidates.get());
+            let candidate_limit = retained_limit
+                .unwrap_or(1)
+                .max(options.candidate_window.unwrap_or(0))
+                .max(navigation_window);
+            return self
+                .scan_rabitq_vector_scores(
+                    query_embedding,
+                    candidate_set,
+                    retained_limit,
+                    vector_execution_options,
+                    metrics,
+                    RerankPolicy {
+                        candidate_limit,
+                        distance: None,
+                        query: options.query,
+                    },
+                )
+                .map_err(RabitqScanError::into_error);
+        }
         match options.compressed {
             CompressedVectorSearchMode::Disabled => self.scan_scalar_vector_scores(
                 query_embedding,
@@ -379,11 +438,13 @@ impl SearchOutOfCoreReader {
             ),
             CompressedVectorSearchMode::Preferred => {
                 #[cfg(feature = "vector-search")]
-                if self
-                    .segments
-                    .iter()
-                    .all(|artifact| artifact.rabitq_projection.is_some())
-                {
+                if self.segments.iter().all(|artifact| {
+                    !Self::layer_has_vectors(artifact)
+                        || artifact
+                            .rabitq_projection
+                            .as_ref()
+                            .is_some_and(|value| !value.is_diskann())
+                }) {
                     match self.scan_rabitq_vector_scores(
                         query_embedding,
                         candidate_set,
@@ -440,11 +501,13 @@ impl SearchOutOfCoreReader {
             }
             CompressedVectorSearchMode::Required => {
                 #[cfg(feature = "vector-search")]
-                if self
-                    .segments
-                    .iter()
-                    .all(|artifact| artifact.rabitq_projection.is_some())
-                {
+                if self.segments.iter().all(|artifact| {
+                    !Self::layer_has_vectors(artifact)
+                        || artifact
+                            .rabitq_projection
+                            .as_ref()
+                            .is_some_and(|value| !value.is_diskann())
+                }) {
                     return self
                         .scan_rabitq_vector_scores(
                             query_embedding,
@@ -660,12 +723,16 @@ impl SearchOutOfCoreReader {
         let mut candidate_scan_filtered_document_count = 0usize;
         let mut candidate_scan_scanned_block_count = 0usize;
         let mut candidate_scan_skipped_block_count = 0usize;
+        let mut candidate_scan_adaptive_exact_scan_count = 0usize;
         let mut candidate_scan_payload_bytes_read = 0u64;
         let mut candidate_scan_admitted_working_bytes = 0usize;
         let mut candidate_scan_kernel = None;
 
         for (layer, artifact) in self.segments.iter().enumerate() {
             checkpoint_vector_task(task_context)?;
+            if !Self::layer_has_vectors(artifact) {
+                continue;
+            }
             let projection = artifact.rabitq_projection.as_ref().ok_or_else(|| {
                 HawDBError::Storage(format!(
                     "search out-of-core layer {layer} has no RaBitQ projection"
@@ -775,6 +842,8 @@ impl SearchOutOfCoreReader {
                 .saturating_add(projection_report.scanned_block_count);
             candidate_scan_skipped_block_count = candidate_scan_skipped_block_count
                 .saturating_add(projection_report.skipped_block_count);
+            candidate_scan_adaptive_exact_scan_count = candidate_scan_adaptive_exact_scan_count
+                .saturating_add(projection_report.adaptive_exact_scan_count);
             candidate_scan_payload_bytes_read = candidate_scan_payload_bytes_read
                 .saturating_add(projection_report.payload_bytes_read);
             candidate_scan_admitted_working_bytes = candidate_scan_admitted_working_bytes.max(
@@ -945,6 +1014,11 @@ impl SearchOutOfCoreReader {
             ))
             .into());
         }
+        let diskann = self
+            .segments
+            .iter()
+            .find_map(|artifact| artifact.rabitq_projection.as_ref())
+            .is_some_and(|projection| projection.manifest().algorithm == "diskann");
         let matching_count = collector.matching_count;
         let scores = collector.finish()?;
         Ok(VectorScoreScan {
@@ -953,8 +1027,18 @@ impl SearchOutOfCoreReader {
             matching_count,
             vector_document_count,
             segment_scan_count: raw_segment_scan_count,
-            backend: "hawdb_rabitq_out_of_core_candidate_projection".to_string(),
-            candidate_score_source: "quantized_projection".to_string(),
+            backend: if diskann {
+                "hawdb_diskann_out_of_core_candidate_graph"
+            } else {
+                "hawdb_rabitq_out_of_core_candidate_projection"
+            }
+            .to_string(),
+            candidate_score_source: if diskann {
+                "graph_distance"
+            } else {
+                "quantized_projection"
+            }
+            .to_string(),
             generated_candidate_count,
             reranked_candidate_count,
             candidate_scan_kernel,
@@ -965,6 +1049,7 @@ impl SearchOutOfCoreReader {
             candidate_scan_filtered_document_count,
             candidate_scan_scanned_block_count,
             candidate_scan_skipped_block_count,
+            candidate_scan_adaptive_exact_scan_count,
             candidate_scan_payload_bytes_read,
             candidate_scan_admitted_working_bytes: candidate_scan_admitted_working_bytes
                 .saturating_add(selected_candidate_bytes),
@@ -1062,25 +1147,53 @@ impl SearchOutOfCoreReader {
     }
 
     #[cfg(feature = "vector-search")]
+    fn layer_has_vectors(artifact: &super::SearchOutOfCoreSegmentReader) -> bool {
+        artifact
+            .layout
+            .segments
+            .iter()
+            .any(|segment| segment.vectors.entry_count != 0)
+    }
+
+    #[cfg(feature = "vector-search")]
+    fn vector_layers_use_diskann(&self) -> bool {
+        let mut found = false;
+        for artifact in &self.segments {
+            if Self::layer_has_vectors(artifact) {
+                if !artifact
+                    .rabitq_projection
+                    .as_ref()
+                    .is_some_and(|value| value.is_diskann())
+                {
+                    return false;
+                }
+                found = true;
+            }
+        }
+        found
+    }
+
+    #[cfg(feature = "vector-search")]
     fn require_compatible_rabitq_projections(&self) -> Result<()> {
-        let mut reference = None;
+        let mut reference: Option<&super::vector_reader::Projection> = None;
         for (layer, artifact) in self.segments.iter().enumerate() {
+            if !Self::layer_has_vectors(artifact) {
+                continue;
+            }
             let projection = artifact.rabitq_projection.as_ref().ok_or_else(|| {
                 HawDBError::Storage(format!(
                     "search out-of-core layer {layer} has no RaBitQ projection"
                 ))
             })?;
-            let manifest = projection.manifest();
-            let identity = (manifest.bit_width, manifest.transform_seed);
             if let Some(reference) = reference
-                && identity != reference
+                && !reference.compatible(projection)
             {
                 return Err(HawDBError::Storage(
-                    "search multi-segment RaBitQ projections require matching bit widths and transform seeds"
+                    "search multi-segment candidate projections require matching backend parameters"
                         .to_string(),
                 ));
             }
-            reference = Some(identity);
+            reference = Some(projection);
         }
         Ok(())
     }

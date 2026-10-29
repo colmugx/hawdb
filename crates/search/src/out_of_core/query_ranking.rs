@@ -1,7 +1,7 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
-//! Ranking stages share the query's working account and own their payloads.
+//! Ranking stages share the query's working account and borrow score IDs.
 
 use super::*;
 use crate::build_memory::{
@@ -13,46 +13,45 @@ use hawdb_executor::QueryMemoryLease;
 #[cfg(test)]
 mod tests;
 
-pub(super) struct Ranks {
-    values: BTreeMap<String, usize>,
+pub(super) struct Ranks<'a> {
+    values: BTreeMap<&'a str, usize>,
     _memory: Option<QueryMemoryLease>,
 }
-impl std::ops::Deref for Ranks {
-    type Target = BTreeMap<String, usize>;
+impl<'a> std::ops::Deref for Ranks<'a> {
+    type Target = BTreeMap<&'a str, usize>;
     fn deref(&self) -> &Self::Target {
         &self.values
     }
 }
-impl Ranks {
+impl<'a> Ranks<'a> {
     pub(super) fn new(
-        scores: &BTreeMap<String, f64>,
+        scores: &'a BTreeMap<String, f64>,
         context: Option<QueryContext<'_>>,
     ) -> Result<Self> {
-        let Some(context) = context else {
-            return Ok(Self {
-                values: ranked_scores(scores),
-                _memory: None,
-            });
-        };
-        context.checkpoint()?;
-        let bytes = scores
-            .keys()
-            .try_fold(mul(scores.len(), MAP_ENTRY_BYTES)?, |bytes, id| {
-                add(bytes, id.len())
-            })?;
+        if let Some(context) = context {
+            context.checkpoint()?;
+        }
         let mut output = Self {
             values: BTreeMap::new(),
-            _memory: Some(context.memory.reserve(bytes)?),
+            _memory: context
+                .map(|context| context.memory.reserve(mul(scores.len(), MAP_ENTRY_BYTES)?))
+                .transpose()?,
         };
-        let mut sort_memory = context.memory.reserve(0)?;
+        let mut sort_memory = context
+            .map(|context| context.memory.reserve(0))
+            .transpose()?;
         let mut sorted = Vec::new();
-        reserve_capacity(&mut sorted, scores.len(), &mut sort_memory)?;
+        if let Some(memory) = &mut sort_memory {
+            reserve_capacity(&mut sorted, scores.len(), memory)?;
+        } else {
+            sorted.reserve_exact(scores.len());
+        }
         for (id, score) in scores {
-            context.checkpoint()?;
+            if let Some(context) = context {
+                context.checkpoint()?;
+            }
             sorted.push((id.as_str(), *score));
         }
-        // IDs fully break score ties, so the in-place sort preserves ordering
-        // without allocating an unadmitted stable-sort scratch buffer.
         sorted.sort_unstable_by(|(left_id, left_score), (right_id, right_score)| {
             right_score
                 .partial_cmp(left_score)
@@ -60,10 +59,14 @@ impl Ranks {
                 .then_with(|| left_id.cmp(right_id))
         });
         for (index, (id, _)) in sorted.into_iter().enumerate() {
-            context.checkpoint()?;
-            output.values.insert(copy_id(id)?, index + 1);
+            if let Some(context) = context {
+                context.checkpoint()?;
+            }
+            output.values.insert(id, index + 1);
         }
-        context.checkpoint()?;
+        if let Some(context) = context {
+            context.checkpoint()?;
+        }
         Ok(output)
     }
     pub(super) fn window(
@@ -71,31 +74,31 @@ impl Ranks {
         limit: Option<usize>,
         context: Option<QueryContext<'_>>,
     ) -> Result<Self> {
-        let Some(context) = context else {
-            return Ok(Self {
-                values: window_ranks(&self.values, limit),
-                _memory: None,
-            });
-        };
-        context.checkpoint()?;
-        let bytes = self
+        if let Some(context) = context {
+            context.checkpoint()?;
+        }
+        let count = self
             .values
-            .iter()
-            .filter(|(_, rank)| limit.is_none_or(|limit| **rank <= limit))
-            .try_fold(0, |bytes, (id, _)| {
-                add(bytes, add(MAP_ENTRY_BYTES, id.len())?)
-            })?;
+            .values()
+            .filter(|rank| limit.is_none_or(|limit| **rank <= limit))
+            .count();
         let mut output = Self {
             values: BTreeMap::new(),
-            _memory: Some(context.memory.reserve(bytes)?),
+            _memory: context
+                .map(|context| context.memory.reserve(mul(count, MAP_ENTRY_BYTES)?))
+                .transpose()?,
         };
-        for (id, rank) in &self.values {
-            context.checkpoint()?;
+        for (&id, rank) in &self.values {
+            if let Some(context) = context {
+                context.checkpoint()?;
+            }
             if limit.is_none_or(|limit| *rank <= limit) {
-                output.values.insert(copy_id(id)?, *rank);
+                output.values.insert(id, *rank);
             }
         }
-        context.checkpoint()?;
+        if let Some(context) = context {
+            context.checkpoint()?;
+        }
         Ok(output)
     }
 }
@@ -113,10 +116,10 @@ fn copy_id(id: &str) -> Result<String> {
 pub(super) struct Inputs<'a> {
     pub(super) vector_scores: &'a BTreeMap<String, f64>,
     pub(super) text_scores: &'a BTreeMap<String, f64>,
-    pub(super) vector_ranks: &'a Ranks,
-    pub(super) text_ranks: &'a Ranks,
-    pub(super) vector_window: &'a Ranks,
-    pub(super) text_window: &'a Ranks,
+    pub(super) vector_ranks: &'a Ranks<'a>,
+    pub(super) text_ranks: &'a Ranks<'a>,
+    pub(super) vector_window: &'a Ranks<'a>,
+    pub(super) text_window: &'a Ranks<'a>,
     pub(super) mode: SearchMode,
     pub(super) weights: crate::SearchFusionWeights,
 }
@@ -150,17 +153,21 @@ impl Candidates {
             if let Some(context) = context {
                 context.checkpoint()?;
             }
-            let vector_score = inputs.vector_scores.get(&id).copied().unwrap_or(0.0);
-            let text_score = inputs.text_scores.get(&id).copied().unwrap_or(0.0);
+            let vector_score = inputs
+                .vector_scores
+                .get(id.as_str())
+                .copied()
+                .unwrap_or(0.0);
+            let text_score = inputs.text_scores.get(id.as_str()).copied().unwrap_or(0.0);
             let vector_rank = if inputs.mode == SearchMode::Hybrid {
-                inputs.vector_window.get(&id).copied()
+                inputs.vector_window.get(id.as_str()).copied()
             } else {
-                inputs.vector_ranks.get(&id).copied()
+                inputs.vector_ranks.get(id.as_str()).copied()
             };
             let text_rank = if inputs.mode == SearchMode::Hybrid {
-                inputs.text_window.get(&id).copied()
+                inputs.text_window.get(id.as_str()).copied()
             } else {
-                inputs.text_ranks.get(&id).copied()
+                inputs.text_ranks.get(id.as_str()).copied()
             };
             let vector_rrf_score = rrf_child_score(vector_rank);
             let text_rrf_score = rrf_child_score(text_rank);

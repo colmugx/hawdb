@@ -117,7 +117,7 @@ impl PublishedConcurrentRead {
 
     pub(crate) fn query_prepared_with_trace(
         &self,
-        prepared: PreparedRuntimeQuery,
+        mut prepared: PreparedRuntimeQuery,
         request: crate::QueryRequest<'_>,
         capture_trace: bool,
         external: &mut dyn crate::executor::ExternalReadOperator,
@@ -125,6 +125,7 @@ impl PublishedConcurrentRead {
         let started = hawdb_core::time::Instant::now();
         let statement_kind = prepared.statement_kind();
         let parse_nanos = prepared.parse_nanos();
+        let query_identity = prepared.take_query_identity(request.cypher);
         let result = (|| {
             if prepared.uses_borrowed_read() {
                 return self.snapshot.query_prepared_request_borrowed(
@@ -147,6 +148,7 @@ impl PublishedConcurrentRead {
             started,
             result.as_ref().map(|(output, _)| output),
             super::super::StatementExecutionContext {
+                query_identity: query_identity.as_ref(),
                 execution_profile: result
                     .as_ref()
                     .ok()

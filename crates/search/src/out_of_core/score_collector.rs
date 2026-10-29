@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Score payloads keep their query capacity through heap-to-map transfer.
 
@@ -167,6 +167,14 @@ impl BoundedScoreCollector {
             self.insert(owned, score);
         }
         Ok(())
+    }
+    pub(super) fn floor(&self) -> Option<f64> {
+        match &self.storage {
+            Storage::TopK { limit, heap } if *limit > 0 && heap.len() == *limit => {
+                heap.peek().map(|Reverse(candidate)| candidate.score)
+            }
+            _ => None,
+        }
     }
     pub(super) fn finish(mut self) -> Result<Scores> {
         if let Storage::TopK { heap, .. } = &self.storage

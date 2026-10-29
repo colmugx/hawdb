@@ -1,0 +1,41 @@
+{
+  "baseline_revision": "b6de4430e935c540ec3644ede593e4c72da27872",
+  "baseline_query_source_sha256": "29adbf0127621316a3f77979bbd8c484baae4e59a00ea72bd15ee1c644711661",
+  "candidate_source_sha256": {
+    "crates/query/src/lib.rs": "c14f503307f8f05f81cb48edd1e97783e3e974f914e52d060ad9c350999bc93d",
+    "bindings/benchmarks/native_alloc.rs": "774bab473f8c3cfde14346156afa94439d05aef99cf735483bc952b383e05435",
+    ".cargo/config.toml": "06c7ca26d39223bd90a6412acd8609c380ce2d1650a72b70c90171656ca89819",
+    "benches/host_boundary.rs": "37956d1efe222c12b87b5e791d067d6e90c154dae702ab9d3b059fc1e4f85739",
+    "benches/host_boundary_allocations.rs": "08599967b781ed156b53b0e1fdffb85bbcd606833ca376e22de609d38376e487",
+    "benches/host_boundary/workload.rs": "3722abcd4c9269662fbfa91f5e3f27f65eac40bbf90f8d0bf2c4385b5dc52761"
+  },
+  "probe_source_sha256": "ec37ecfef8a858f0680957c61cb53b9a500282884f5baee93c57ce2b2519f075",
+  "probe_lock_sha256": "efba20e520072beb8b2d09b9dda137faaed5b66a672970363551f206b5dba28c",
+  "compiler": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: aarch64-apple-darwin\nrelease: 1.97.1\nLLVM version: 22.1.6\n",
+  "component_profile": "repository release profile; baseline and candidate in one fixed host binary; five alternating pairs per case/mode",
+  "component_identity_calls_per_sample": 1000,
+  "component_timing_calls_per_sample": 10000,
+  "component_retained_calls_per_sample": 1,
+  "component_allocation_records": 270,
+  "component_timing_records": 180,
+  "admitted_host_profile": "repository dev profile, default features; seven alternating process pairs per case/mode",
+  "admitted_host_records": 84,
+  "first_dev_engine_build_seconds": 303,
+  "candidate_dev_engine_rebuild_seconds": 6.47,
+  "initial_release_probe_build_seconds": 6.97,
+  "candidate_release_vector_rebuild_seconds": 4.83,
+  "allocation_probe_rebuild_seconds": 2.39,
+  "timing_probe_rebuild_seconds": 2.04,
+  "binary_sha256": {
+    "candidate-timing": "3165627c875f40ea7ce17f224f670d9376979dd9a2ead414236ef1bcf2a71685",
+    "baseline-timing": "092a284e80658d5edb2e1c60ea640ac7b3f4e7ac3287ca81cec4a8a86796ba76",
+    "baseline-allocations": "d90cda8b8f954ab5ea920be60112fdeb2be2f773fbc8f6e60ac50ede4dbc1017",
+    "candidate-allocations": "86bc8bc5c784c2fd153412582a472cf2be52b4ac617dbe40368d8f38b2d301a3"
+  },
+  "host_job_sha256": {
+    "fill_bulk.json": "fc698d02e8b9fb4c1034f41c4bc4477b1183ef2108e33deafe85a8f8d3e4ea07",
+    "point.json": "d0cbc2ed3a1b7efef9e68bd736812292dd01366cef054fb10321258a53971467",
+    "select.json": "17fc6f4dc881a37d5905d17d1f0d884a7cf8844bb45cf1afd3f3ff18b3f67e0f"
+  },
+  "scope": "Synthetic single-threaded component allocation requests and separately instrumented admitted-host controls. No allocator-rounding, RSS, storage durability, tail-latency or remote CI performance claim."
+}

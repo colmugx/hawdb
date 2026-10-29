@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 use super::*;
 use crate::file_descriptors::ProjectFileDescriptors;
@@ -10,6 +10,223 @@ use std::path::PathBuf;
 struct Fixture {
     root: PathBuf,
     project: ProjectFileDescriptors,
+}
+
+#[test]
+fn captured_link_reuses_the_original_inode_after_both_directory_labels_move() {
+    let fixture = Fixture::new(16);
+    let context = fixture.project.io_context();
+    let source_path = fixture.root.join("source");
+    let target_path = fixture.root.join("target");
+    fs::create_dir(&source_path).unwrap();
+    fs::create_dir(&target_path).unwrap();
+    fs::write(source_path.join("graph"), b"original immutable graph").unwrap();
+    let source = fixture.capture(&source_path);
+    let target = fixture.capture(&target_path);
+    // Windows can refuse moving a directory with an open descendant. Capture
+    // the file through the retained directory after replacing both labels.
+    #[cfg(not(windows))]
+    let original = source.open_child(&context, "graph").unwrap();
+    fs::rename(&source_path, fixture.root.join("moved-source")).unwrap();
+    fs::rename(&target_path, fixture.root.join("moved-target")).unwrap();
+    fs::create_dir(&source_path).unwrap();
+    fs::create_dir(&target_path).unwrap();
+    fs::write(source_path.join("graph"), b"foreign source").unwrap();
+    fs::write(target_path.join("graph"), b"foreign target").unwrap();
+    #[cfg(windows)]
+    let original = source.open_child(&context, "graph").unwrap();
+    assert!(!original
+        .matches_native_path(source_path.join("graph"))
+        .unwrap());
+    source
+        .link_child_new(&context, "graph", &original, &target, "graph")
+        .unwrap();
+    assert!(target
+        .matches_child_file(&context, "graph", &original)
+        .unwrap());
+    assert_eq!(
+        fs::read(fixture.root.join("moved-target/graph")).unwrap(),
+        b"original immutable graph"
+    );
+    assert_eq!(
+        fs::read(source_path.join("graph")).unwrap(),
+        b"foreign source"
+    );
+    assert_eq!(
+        fs::read(target_path.join("graph")).unwrap(),
+        b"foreign target"
+    );
+    assert_eq!(
+        source
+            .link_child_new(&context, "graph", &original, &target, "graph")
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    source.remove_child(&context, "graph").unwrap();
+    assert!(target
+        .matches_child_file(&context, "graph", &original)
+        .unwrap());
+    assert_eq!(
+        fs::read(fixture.root.join("moved-target/graph")).unwrap(),
+        b"original immutable graph"
+    );
+    drop((original, target, source));
+    assert_eq!(fixture.project.metrics().open, 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn captured_link_retains_authority_when_an_open_file_prevents_ancestor_rename() {
+    let fixture = Fixture::new(16);
+    let context = fixture.project.io_context();
+    let source_path = fixture.root.join("source");
+    let moved = fixture.root.join("moved-source");
+    let target_path = fixture.root.join("target");
+    fs::create_dir(&source_path).unwrap();
+    fs::create_dir(&target_path).unwrap();
+    fs::write(source_path.join("graph"), b"original graph").unwrap();
+    let source = fixture.capture(&source_path);
+    let target = fixture.capture(&target_path);
+    let original = source.open_child(&context, "graph").unwrap();
+    let renamed = match fs::rename(&source_path, &moved) {
+        Ok(()) => {
+            assert!(!source_path.exists());
+            fs::create_dir(&source_path).unwrap();
+            fs::write(source_path.join("graph"), b"foreign source").unwrap();
+            true
+        }
+        Err(error) => {
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(source_path.is_dir());
+            assert!(!moved.exists());
+            false
+        }
+    };
+    source
+        .link_child_new(&context, "graph", &original, &target, "link")
+        .unwrap();
+    assert!(target
+        .matches_child_file(&context, "link", &original)
+        .unwrap());
+    assert_eq!(
+        fs::read(target_path.join("link")).unwrap(),
+        b"original graph"
+    );
+    source.remove_child(&context, "graph").unwrap();
+    assert!(target
+        .matches_child_file(&context, "link", &original)
+        .unwrap());
+    assert_eq!(
+        fs::read(target_path.join("link")).unwrap(),
+        b"original graph"
+    );
+    if renamed {
+        assert_eq!(
+            fs::read(source_path.join("graph")).unwrap(),
+            b"foreign source"
+        );
+        assert!(!moved.join("graph").exists());
+    } else {
+        assert!(!source_path.join("graph").exists());
+    }
+    drop((original, target, source));
+    assert_eq!(fixture.project.metrics().open, 0);
+}
+
+#[test]
+fn captured_link_refuses_changed_source_foreign_project_and_noncomponent_names() {
+    let fixture = Fixture::new(16);
+    let context = fixture.project.io_context();
+    fs::create_dir(fixture.root.join("target")).unwrap();
+    fs::write(fixture.root.join("graph"), b"same bytes").unwrap();
+    let source = fixture.capture(&fixture.root);
+    let target = fixture.capture(&fixture.root.join("target"));
+    let file = source.open_child(&context, "graph").unwrap();
+    for name in [
+        "",
+        ".",
+        "..",
+        "../escape",
+        "nested/item",
+        "stream:name",
+        "a\\b",
+    ] {
+        assert_eq!(
+            source
+                .link_child_new(&context, name, &file, &target, "link")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            source
+                .link_child_new(&context, "graph", &file, &target, name)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    let foreign = Fixture::new(8);
+    let foreign_target = foreign.capture(&foreign.root);
+    assert_eq!(
+        source
+            .link_child_new(&context, "graph", &file, &foreign_target, "link")
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert!(!foreign.root.join("link").exists());
+    fs::rename(fixture.root.join("graph"), fixture.root.join("retained")).unwrap();
+    fs::write(fixture.root.join("graph"), b"same bytes").unwrap();
+    assert_eq!(
+        source
+            .link_child_new(&context, "graph", &file, &target, "link")
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert!(!fixture.root.join("target/link").exists());
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("retained", fixture.root.join("alias")).unwrap();
+        assert_eq!(
+            source
+                .link_child_new(&context, "alias", &file, &target, "link")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(!fixture.root.join("target/link").exists());
+    }
+}
+
+#[test]
+fn captured_link_respects_platform_descriptor_admission_and_can_retry() {
+    let fixture = Fixture::new(4);
+    let context = fixture.project.io_context();
+    fs::create_dir(fixture.root.join("target")).unwrap();
+    fs::write(fixture.root.join("graph"), b"graph").unwrap();
+    let source = fixture.capture(&fixture.root);
+    let target = fixture.capture(&fixture.root.join("target"));
+    let file = source.open_child(&context, "graph").unwrap();
+    let occupied = source.open_child(&context, "graph").unwrap();
+    assert_eq!(fixture.project.metrics().open, 4);
+    let result = source.link_child_new(&context, "graph", &file, &target, "link");
+    if cfg!(windows) {
+        let error = result.unwrap_err();
+        assert!(hawdb_core::error::file_descriptor_error(&error).is_some());
+        assert!(!fixture.root.join("target/link").exists());
+        drop(occupied);
+        source
+            .link_child_new(&context, "graph", &file, &target, "link")
+            .unwrap();
+    } else {
+        result.unwrap();
+        assert_eq!(fixture.project.metrics().open, 4);
+        drop(occupied);
+    }
+    assert!(target.matches_child_file(&context, "link", &file).unwrap());
 }
 impl Fixture {
     fn new(limit: usize) -> Self {

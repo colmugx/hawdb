@@ -927,6 +927,9 @@ fn admission(message: impl Into<String>) -> RelationalIndexShadowError {
 
 pub(super) fn relational_read_error(error: RelationalError) -> RelationalIndexShadowError {
     match error {
+        RelationalError::UnsupportedFormat(error) => {
+            RelationalIndexShadowError::UnsupportedFormat(error)
+        }
         RelationalError::FileDescriptors(error) => {
             RelationalIndexShadowError::FileDescriptors(error)
         }

@@ -60,6 +60,31 @@ pub(super) struct OpenedRoot {
     _collections_memory: Option<ReaderMemory>,
 }
 impl OpenedRoot {
+    pub(super) fn write_vector_successor(
+        &self,
+        index: &SearchIndex,
+        previous: &crate::consumer::ConsumerProjection,
+        target: &SearchProjectionPublishLease,
+        task: hawdb_core::RuntimeTaskContext,
+        generation_bytes: NonZeroU64,
+        permit: Arc<hawdb_qos::RuntimePermit>,
+    ) -> Result<crate::snapshot_writer::SearchSnapshotWriteReport> {
+        if !self.stationary_immutable || !self.shares_governor_with(&permit) {
+            return Err(HawDBError::Execution(
+                "vector successor requires the original stationary baseline".into(),
+            ));
+        }
+        SearchOutOfCoreGenerationWriter::write_consumer_incremental(
+            &self.reader,
+            index,
+            previous,
+            target,
+            task,
+            generation_bytes,
+            permit,
+        )
+    }
+
     pub(super) fn prepare_consumer_update(
         &self,
         permit: Arc<hawdb_qos::RuntimePermit>,

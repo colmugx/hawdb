@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 use super::*;
 use hawdb_executor::{QueryMemoryClass, QueryMemoryLedger};
@@ -200,7 +200,7 @@ fn retained_matches_preserve_aliases_metadata_cjk_offsets_and_config_limits() {
 #[test]
 fn retained_report_ranking_and_pruning_match_ordinary_semantics() {
     with_frame(|memory, query| {
-        let ranks = BTreeMap::from([
+        let ranks: BTreeMap<String, usize> = BTreeMap::from([
             ("a".into(), 2),
             ("b".into(), 1),
             ("c".into(), 1),

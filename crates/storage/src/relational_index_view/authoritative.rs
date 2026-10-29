@@ -445,7 +445,8 @@ impl RelationalConstraintIndex for AuthoritativeRelationalConstraintIndex {
 
 pub(super) fn map_constraint_read_error(error: RelationalIndexShadowError) -> RelationalError {
     match error {
-            RelationalIndexShadowError::FileDescriptors(error) => RelationalError::FileDescriptors(error),
+            RelationalIndexShadowError::UnsupportedFormat(error) => RelationalError::UnsupportedFormat(error),
+        RelationalIndexShadowError::FileDescriptors(error) => RelationalError::FileDescriptors(error),
         RelationalIndexShadowError::Admission(message) => RelationalError::Admission(message),
         RelationalIndexShadowError::Durability(message) => RelationalError::Durability(message),
         RelationalIndexShadowError::Corrupt(message) => RelationalError::Corruption(message),

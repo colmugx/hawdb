@@ -1,0 +1,84 @@
+{
+  "source_base": "8b0744932565099dcff60c36c3034a28c1ea8ad8",
+  "source_hashes_verified": 486,
+  "local_dependency_sources_verified": 562,
+  "uniform_profile_sha256": "06c7ca26d39223bd90a6412acd8609c380ce2d1650a72b70c90171656ca89819",
+  "toolchain_sha256": "8e390d6a0838315f972690f46ef8bae8b7ecc9ee6c1ed70140ef852869c2482e",
+  "default_binary_sha256": "22a525002ad94df6b6fd39611b5b1873b422e6244cb10ab8d61a48f708fc7bf7",
+  "baseline_binary_sha256": "c0a4843cfaad8567a4fea13aeadd89c2ffd5802c225587e195a6eeadc781bd8f",
+  "qualified_timing_processes": 600,
+  "separate_diagnostic_processes": 24,
+  "timed_commit_batches": 192240,
+  "standalone_point_reads": 5529600,
+  "full_scans": 43200,
+  "matched_transaction_groups": 231,
+  "modes": {
+    "diagnostic": {
+      "processes": 24,
+      "matched_groups": 6,
+      "compiler_boundaries": 24,
+      "one_minute_load_min": 10.8671875,
+      "one_minute_load_max": 26.66064453125,
+      "child_elapsed_seconds": 186.885243501
+    },
+    "maintenance": {
+      "processes": 150,
+      "matched_groups": 75,
+      "compiler_boundaries": 54,
+      "one_minute_load_min": 4.36376953125,
+      "one_minute_load_max": 12.5830078125,
+      "child_elapsed_seconds": 405.475609206
+    },
+    "native": {
+      "processes": 300,
+      "matched_groups": 75,
+      "compiler_boundaries": 23,
+      "one_minute_load_min": 4.2666015625,
+      "one_minute_load_max": 19.10498046875,
+      "child_elapsed_seconds": 621.351065799
+    },
+    "baseline": {
+      "processes": 150,
+      "matched_groups": 75,
+      "compiler_boundaries": 142,
+      "one_minute_load_min": 8.19482421875,
+      "one_minute_load_max": 26.55810546875,
+      "child_elapsed_seconds": 359.827562543
+    }
+  },
+  "focused_tests": {
+    "default_dev": 40,
+    "default_release": 40,
+    "each_prepared_variant_dev": 40,
+    "each_prepared_variant_release": 40,
+    "variants": 8,
+    "ignored_subprocess_entry_points_per_suite": 2
+  },
+  "root_captured_range_tests": 3,
+  "bazel": {
+    "targets_pass": 98,
+    "executed": 43,
+    "cached": 55,
+    "elapsed_seconds": 2338.362
+  },
+  "mvcc_campaign": {
+    "complete_cases": 3717,
+    "elapsed_ms": 30036
+  },
+  "historical_license_debt": 624,
+  "isolation": {
+    "workspace_exclusion": true,
+    "normal_dependency_exclusion": true,
+    "archive_exclusion": true,
+    "archive_file_count": 1195,
+    "profile_sha256": "06c7ca26d39223bd90a6412acd8609c380ce2d1650a72b70c90171656ca89819",
+    "repository_head": "8b0744932565099dcff60c36c3034a28c1ea8ad8"
+  },
+  "prepared_uninstrumented_harness_matches_final_adapter_sources": true,
+  "default_native_dependency": "unmodified registry bf-tree 0.5.6; temporary native upstream copies contain disabled diagnostic hooks",
+  "manual_drivers_sha256": {
+    "experiments/bftree-mvcc/structural/build.py": "16bdd993ed3e4460eaab222f390e96983956af4f3cd585dbd4d7f5fa8b2f4b90",
+    "experiments/bftree-mvcc/structural/measure.py": "c16a18402fc7f565e712e4e6a9077b13068e81b442c63bed23e6d7b16d91a186",
+    "experiments/bftree-mvcc/structural/prepare.py": "e692df9f1a40934b8e13cba4599754577085959a91853d5f2c99c373f138d4ff"
+  }
+}

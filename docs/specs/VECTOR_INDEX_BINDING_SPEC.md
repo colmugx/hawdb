@@ -14,9 +14,10 @@ relational schema has no independent persisted column identifier. Node targets
 retain their `TableId` and `PropertyId`. Names remain diagnostic/resolution data;
 the full resolved binding must match before a source is admitted.
 
-The initial backend is RaBitQ with cosine distance. L2 remains an exact query
-expression; an L2 RaBitQ definition is refused. Only one field is indexed. NULL
-fields are omitted. Non-NULL cosine vectors must have a nonzero norm; a build
+The default schema-bound backend is DiskANN with cosine distance. DiskANN also
+supports Euclidean distance and optional Local Scaling Graph construction;
+explicit RaBitQ definitions retain their cosine-only contract. Only one field
+is indexed. NULL fields are omitted. Non-NULL cosine vectors must have a nonzero norm; a build
 must fail rather than silently exclude an invalid non-NULL value.
 
 The embedded facade resolves schema and captures data under the existing pinned
@@ -24,6 +25,29 @@ source snapshot. Index maintenance reuses registered Consumer publication and
 reopen. It does not introduce a second directory selector, recovery ledger,
 standalone ANN registry, or host graph scan. Per-operation resource policy is
 not part of the persistent algorithm definition.
+
+Registered vector Consumers keep a bounded metadata-only snapshot alongside the
+native immutable closure. They do not reload the corpus into a compatibility
+`SearchIndex`. Read counts, definitions and freshness through the Consumer's
+`document_count`, `vector_index_descriptor` and `projection_freshness` methods;
+use `bind_vector_index` for vector queries. `search_index` refuses Consumers
+without resident rows. Ordinary search Consumers retain their complete resident
+index. Direct `SearchIndex::open` and legacy `ConsumerProjection::open` cannot
+open metadata-only vector Consumers; the embedded facade's registered native
+reopen validates their selected generation and summary together.
+
+`Database::catch_up_vector_index` maintains a fixed canonical field through a
+complete pinned C..E change feed. Repeated native keys hydrate once from E;
+deleted/NULL values retract the fixed native identity. It retains unchanged
+immutable content and builds vector artifacts only for changed content. The
+passed build options must retain the original metric/backend definition and
+bound mapping/feed memory and work. A gap, schema drift or incomplete mapping
+requires explicit rebuild or retry; it cannot acknowledge a partial cursor.
+Only the facade's pre-admitted canonical projector may seal the origin marker.
+Generic host mapping cannot claim this incremental baseline and keeps its
+existing complete-source verification contract. The marker and logical summary
+are sealed with the selected native generation. Old admitted read domains keep
+their original source and graph; a new canonical epoch cannot bind an old index.
 
 ## Query semantics
 
@@ -253,12 +277,14 @@ an error, never a partial allowlist.
 
 Completed empty eligibility returns no candidates after query, binding and
 window validation. It never becomes an unrestricted search. The non-empty path
-reuses native per-layer ordinal allowlists and the existing RaBitQ scan. Only
+reuses native per-layer ordinal allowlists and the bound backend: filter-aware
+DiskANN traversal by default, or an explicitly selected RaBitQ scan. Only
 the retained global candidate window is exactly reranked, at most `candidates`
 records. Generated candidate counts may sum per-layer candidates and therefore
 exceed that retained window. Filtering is exact, while recall remains approximate.
 
-Reports identify mode `filtered_ann`, backend `rabitq`, and
+Reports identify mode `filtered_ann`, the executed backend (`diskann` or
+`rabitq`), and
 `filter_position = before_candidates`. Eligibility reports retain
 `scored_vectors = 0`; `reranked_candidate_count` reports the separate exact
 rerank work. `work_units` includes canonical collection and metadata mapping,

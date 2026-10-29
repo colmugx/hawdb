@@ -29,6 +29,11 @@ use std::collections::BTreeMap;
 #[cfg(feature = "qualification")]
 use std::collections::BTreeSet;
 
+// A single large graph needs more navigation state than its reranked output.
+// Keep the ordinary 128-candidate window independent of this search workspace.
+#[cfg(feature = "vector-search")]
+pub(crate) const DISKANN_NAVIGATION_BEAM: usize = 1024;
+
 pub(super) struct SearchVectorExecution {
     pub scores: BTreeMap<String, f64>,
     pub candidate_ids: Vec<String>,
@@ -65,6 +70,10 @@ pub(super) fn execute_search_vector_plan(
     } = request;
     let retrieval_limit = match backend {
         VectorSearchBackend::Scalar => documents.len().max(1),
+        #[cfg(feature = "vector-search")]
+        VectorSearchBackend::DiskAnn { .. } => limit
+            .max(rank_window.unwrap_or(0))
+            .max(hawdb_vector_projection::diskann::DiskAnnSearchOptions::default().beam_width),
         _ => limit.max(rank_window.unwrap_or(0)).max(1),
     };
     let logical = VectorSearchLogicalPlan {
@@ -114,11 +123,14 @@ pub(super) fn execute_search_vector_plan(
         fallback_reasons,
         raw_vector_bytes_read: 0,
         candidate_scan_metrics: None,
+        #[cfg(feature = "vector-search")]
+        candidate_memory: None,
         capture_candidate_ids,
         vector_execution_options,
     };
-    let output = execute_vector_plan(&planned.plan, &mut source).map_err(|error| {
-        HawDBError::Storage(format!("vector physical execution failed: {error}"))
+    let output = execute_vector_plan(&planned.plan, &mut source).map_err(|error| match error {
+        hawdb_executor::VectorExecutionError::Source(error) => error,
+        error => HawDBError::Storage(format!("vector physical execution failed: {error}")),
     })?;
     Ok(SearchVectorExecution {
         candidate_ids: output.candidate_ids,
@@ -140,6 +152,8 @@ struct SearchVectorSource<'a, 'b> {
     fallback_reasons: &'b mut Vec<String>,
     raw_vector_bytes_read: u64,
     candidate_scan_metrics: Option<VectorCandidateScanMetrics>,
+    #[cfg(feature = "vector-search")]
+    candidate_memory: Option<Box<dyn hawdb_core::RuntimeMemoryPermit>>,
     capture_candidate_ids: bool,
     #[cfg_attr(not(feature = "vector-search"), allow(dead_code))]
     vector_execution_options: VectorSearchExecutionOptions<'a>,
@@ -157,6 +171,22 @@ impl VectorExecutionSource for SearchVectorSource<'_, '_> {
         debug_assert_eq!(request.embedding_dimension, self.query_embedding.len());
         match self.backend {
             VectorSearchBackend::Scalar => self.raw_vector_candidates(),
+            #[cfg(feature = "vector-search")]
+            VectorSearchBackend::DiskAnn { index } => {
+                let output = index.resident_diskann.search(
+                    index,
+                    self.documents,
+                    self.query_embedding,
+                    request.candidate_limit,
+                    self.vector_execution_options,
+                )?;
+                self.raw_vector_bytes_read = self
+                    .raw_vector_bytes_read
+                    .saturating_add(output.candidate_vector_bytes);
+                self.candidate_scan_metrics = Some(output.metrics);
+                self.candidate_memory = output.memory;
+                Ok(output.batch)
+            }
             VectorSearchBackend::CompressedRequiredUnavailable => {
                 self.fallback_reason_codes
                     .push(SearchFallbackReasonCode::CompressedVectorProjectionUnavailable);
@@ -356,6 +386,7 @@ impl SearchVectorSource<'_, '_> {
             filtered_document_count: report.filtered_document_count,
             scanned_block_count: report.scanned_block_count,
             skipped_block_count: report.skipped_block_count,
+            adaptive_exact_scan_count: report.adaptive_exact_scan_count,
             payload_bytes_read: report.payload_bytes_read,
             admitted_working_bytes: report.admitted_working_bytes,
         };
@@ -380,6 +411,9 @@ impl SearchVectorSource<'_, '_> {
             existing.skipped_block_count = existing
                 .skipped_block_count
                 .saturating_add(next.skipped_block_count);
+            existing.adaptive_exact_scan_count = existing
+                .adaptive_exact_scan_count
+                .saturating_add(next.adaptive_exact_scan_count);
             existing.payload_bytes_read = existing
                 .payload_bytes_read
                 .saturating_add(next.payload_bytes_read);

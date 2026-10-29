@@ -1,0 +1,9 @@
+
+running 2 tests
+test out_of_core::query_ranking::tests::rank_id_allocation_measurement ... ranking input_id_bytes=131074 retained_peak_bytes=560
+ok
+test out_of_core::tests::bm25_windows::bm25_window_allocation_measurement ... bm25 segments=2 window=1 matches=2 retained=1 retained_id_bytes=4097 peak_bytes=15404 read_bytes=10442
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1128 filtered out; finished in 0.73s
+

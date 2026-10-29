@@ -33,7 +33,7 @@ pub use reclamation::{reclaim_generations, ConsumerCleanupOptions, ConsumerClean
 mod registered;
 pub use registered::{
     PreparedRegisteredConsumer, RegisteredConsumerError, RegisteredConsumerLimits,
-    RegisteredConsumerPreparation, RegisteredConsumerRecovery,
+    RegisteredConsumerPreparation, RegisteredConsumerProjector, RegisteredConsumerRecovery,
 };
 
 mod control;
@@ -656,6 +656,31 @@ impl ConsumerCandidateOutput<'_, '_> {
         target_name: &str,
         expected: ObjectReference,
     ) -> Result<ConsumerCandidateArtifact> {
+        self.install_artifact_inner(source, source_name, target_name, expected, false)
+    }
+
+    /// Reuse a producer artifact whose complete data barrier already finished.
+    /// Only the registered producer owns this path: it keeps source contents
+    /// immutable until this target's directory barrier and candidate sealing
+    /// finish. Arbitrary external sources retain the independent-copy API.
+    pub(crate) fn install_sealed_artifact_link(
+        &mut self,
+        source: &hawdb_storage::file_io::SourceDirectory,
+        source_name: &str,
+        target_name: &str,
+        expected: ObjectReference,
+    ) -> Result<ConsumerCandidateArtifact> {
+        self.install_artifact_inner(source, source_name, target_name, expected, true)
+    }
+
+    fn install_artifact_inner(
+        &mut self,
+        source: &hawdb_storage::file_io::SourceDirectory,
+        source_name: &str,
+        target_name: &str,
+        expected: ObjectReference,
+        sealed_link: bool,
+    ) -> Result<ConsumerCandidateArtifact> {
         use crate::build_memory::SPOOL_BUFFER_BYTES;
         use std::num::NonZeroUsize;
 
@@ -711,8 +736,12 @@ impl ConsumerCandidateOutput<'_, '_> {
                 .map_err(|error| HawDBError::StorageIntegrity(error.to_string()))?;
             // Charge before the first native target effect. A failed attempt
             // cannot reuse capacity while its partial file remains on disk.
-            self.remaining_bytes -= length;
-            let mut output = target.create_child_new(&target_context, target_name)?;
+            let mut output = if sealed_link {
+                None
+            } else {
+                self.remaining_bytes -= length;
+                Some(target.create_child_new(&target_context, target_name)?)
+            };
             let mut copied = 0u64;
             let mut buffer = [0u8; SPOOL_BUFFER_BYTES];
             loop {
@@ -726,15 +755,17 @@ impl ConsumerCandidateOutput<'_, '_> {
                     .filter(|copied| *copied <= length)
                     .ok_or_else(|| {
                         HawDBError::StorageIntegrity(
-                            "consumer candidate source grew during copy".into(),
+                            "consumer candidate source grew during installation".into(),
                         )
                     })?;
-                output.write_all(&buffer[..read])?;
+                if let Some(output) = output.as_mut() {
+                    output.write_all(&buffer[..read])?;
+                }
                 hasher.write_all(&buffer[..read])?;
             }
             if copied != length {
                 return Err(HawDBError::StorageIntegrity(
-                    "consumer candidate source shrank during copy".into(),
+                    "consumer candidate source shrank during installation".into(),
                 ));
             }
             let reference = hasher
@@ -745,12 +776,20 @@ impl ConsumerCandidateOutput<'_, '_> {
                     "consumer candidate source bytes differ from producer reference".into(),
                 ));
             }
-            if !target.matches_child_file(&target_context, target_name, &output)? {
-                return Err(HawDBError::StorageIntegrity(
-                    "consumer candidate target file identity changed".into(),
-                ));
+            if let Some(output) = output {
+                if !target.matches_child_file(&target_context, target_name, &output)? {
+                    return Err(HawDBError::StorageIntegrity(
+                        "consumer candidate target file identity changed".into(),
+                    ));
+                }
+                output.sync_all()?;
+            } else {
+                // The source was verified before any target effect. Once the
+                // native link is attempted, retain the charged bytes and born
+                // target custody even if its acknowledgement/barrier fails.
+                self.remaining_bytes -= length;
+                source.link_child_new(&target_context, source_name, &input, target, target_name)?;
             }
-            output.sync_all()?;
             target.sync(&target_context)?;
             Ok(ConsumerCandidateArtifact { length, reference })
         })
@@ -854,8 +893,20 @@ fn verify_candidate_child(
     expected: ObjectReference,
     task: &RuntimeTaskContext,
     buffer: &mut [u8; crate::build_memory::SPOOL_BUFFER_BYTES],
-    mut capture: Option<&mut Vec<u8>>,
+    capture: Option<&mut Vec<u8>>,
 ) -> Result<()> {
+    open_verified_candidate_child(target, context, name, expected, task, buffer, capture).map(drop)
+}
+
+fn open_verified_candidate_child(
+    target: &fs::SourceDirectory,
+    context: &hawdb_storage::file_descriptors::FileOpenContext,
+    name: &str,
+    expected: ObjectReference,
+    task: &RuntimeTaskContext,
+    buffer: &mut [u8; crate::build_memory::SPOOL_BUFFER_BYTES],
+    mut capture: Option<&mut Vec<u8>>,
+) -> Result<fs::File> {
     let mut file = target.open_child(context, name).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             integrity("declared Consumer generation child is missing")
@@ -901,7 +952,7 @@ fn verify_candidate_child(
             "consumer generation child differs from producer reference".into(),
         ));
     }
-    Ok(())
+    Ok(file)
 }
 
 #[derive(Debug)]
@@ -993,8 +1044,36 @@ impl ConsumerProjection {
         Ok(owner)
     }
 
-    pub fn index(&self) -> &SearchIndex {
-        &self.index
+    /// Return the complete resident compatibility index, when one exists.
+    /// Schema-bound vector Consumers serve their immutable native view instead.
+    pub fn index(&self) -> Result<&SearchIndex> {
+        if self.index.vector_document_summary.is_some() {
+            return Err(invalid(
+                "vector Consumer has no resident rows; use a pinned vector read",
+            ));
+        }
+        Ok(&self.index)
+    }
+
+    pub fn vector_index_descriptor(&self) -> Result<Option<&hawdb_core::VectorIndexDescriptor>> {
+        self.require_completed_view()?;
+        Ok(self.index.vector_index_descriptor.as_ref())
+    }
+
+    #[doc(hidden)]
+    pub fn canonical_vector_source_epoch(&self) -> Result<Option<u64>> {
+        self.require_completed_view()?;
+        Ok(self.index.canonical_vector_source_epoch)
+    }
+
+    pub fn document_count(&self) -> Result<usize> {
+        self.require_completed_view()?;
+        Ok(self.index.document_count())
+    }
+
+    pub fn projection_freshness(&self) -> Result<crate::SearchProjectionFreshness> {
+        self.require_completed_view()?;
+        Ok(self.index.projection_freshness())
     }
 
     pub fn binding(&self) -> &ConsumerBinding {
@@ -1056,6 +1135,14 @@ impl ConsumerProjection {
     }
 
     fn checkpoint_inner(&mut self, rotate: bool) -> Result<CheckpointReceipt> {
+        self.checkpoint_inner_with_task(rotate, &hawdb_core::RuntimeTaskContext::default())
+    }
+
+    fn checkpoint_inner_with_task(
+        &mut self,
+        rotate: bool,
+        task: &hawdb_core::RuntimeTaskContext,
+    ) -> Result<CheckpointReceipt> {
         if self.stationary.is_some() {
             return Err(invalid(
                 "immutable Consumer generations require candidate publication",
@@ -1082,7 +1169,7 @@ impl ConsumerProjection {
             };
             scope
                 .index
-                .checkpoint_with_lease(Some(scope.operation.publication()))?;
+                .checkpoint_with_task(Some(scope.operation.publication()), task)?;
         }
         self.pending_mutation = false;
         Ok(self.receipt())
@@ -1286,6 +1373,9 @@ impl SearchIndex {
     }
 
     pub(super) fn mark_untracked_consumer_mutation(&mut self) -> Option<MutationPermit> {
+        if self.canonical_vector_source_epoch.is_some() {
+            self.consumer_binding_valid = false;
+        }
         self.consumer_binding.as_ref()?;
         match self.borrow_consumer_mutation() {
             Ok(permit) => Some(permit),
@@ -1297,6 +1387,11 @@ impl SearchIndex {
     }
 
     pub(super) fn require_owned_mutation_or_unregistered(&self) -> Result<Option<MutationPermit>> {
+        if self.canonical_vector_source_epoch.is_some() {
+            return Err(invalid(
+                "canonical vector source builder is already complete",
+            ));
+        }
         if !self.consumer_binding_valid {
             return Err(invalid(
                 "registered projection requires its consumer mutation owner",
@@ -1323,7 +1418,14 @@ impl SearchIndex {
         }
         for (generation, name) in super::rabitq_artifacts_descending_under_publication(publication)?
         {
-            let file = publication.open_captured_child(&name)?;
+            let mut file = publication.open_captured_child(&name)?;
+            match super::resident_diskann::artifact::validate_open_file(
+                self, &mut file, generation,
+            )? {
+                super::resident_diskann::artifact::Restore::Ready => return Ok(()),
+                super::resident_diskann::artifact::Restore::Skip => continue,
+                super::resident_diskann::artifact::Restore::Other => {}
+            }
             match super::RaBitQCandidateProjection::load_from_file_classified(
                 file,
                 Path::new(&name),
@@ -1428,10 +1530,19 @@ mod tests {
     fn cleanup_reuses_consumer_authority_only_inside_owned_mutation() {
         let root = directory();
         let mut owner = ConsumerProjection::initialize(&root, binding(), 0, |_| Ok(())).unwrap();
-        assert!(!owner.index().projection_cleanup_report().retry_required);
+        assert!(
+            !owner
+                .index()
+                .unwrap()
+                .projection_cleanup_report()
+                .retry_required
+        );
         let artifact = root.join("search_rabitq.777.hawdb");
         fs::write(&artifact, b"unreferenced artifact").unwrap();
-        let deferred = owner.index().retry_projection_cleanup(Default::default());
+        let deferred = owner
+            .index()
+            .unwrap()
+            .retry_projection_cleanup(Default::default());
         assert!(deferred.retry_required);
         assert_eq!(deferred.delete_attempts, 0);
         assert!(artifact.exists());
@@ -1446,7 +1557,13 @@ mod tests {
         assert!(owner.binding_is_valid());
         drop(owner);
         let owner = ConsumerProjection::open(&root).unwrap();
-        assert!(!owner.index().projection_cleanup_report().retry_required);
+        assert!(
+            !owner
+                .index()
+                .unwrap()
+                .projection_cleanup_report()
+                .retry_required
+        );
         drop(owner);
         fs::remove_dir_all(root).unwrap();
     }
@@ -1539,11 +1656,12 @@ mod tests {
                 .unwrap(),
             owner
                 .index()
+                .unwrap()
                 .search("searchable", None, super::super::SearchMode::Text, 10)
                 .unwrap()
         );
         #[cfg(not(feature = "full-text-search"))]
-        for index in [&index, owner.index()] {
+        for index in [&index, owner.index().unwrap()] {
             assert!(matches!(
                 index.try_search_with_options(
                     "searchable",
@@ -1689,6 +1807,7 @@ mod tests {
         assert!(
             !owner
                 .index()
+                .unwrap()
                 .projection_freshness()
                 .has_uncheckpointed_changes
         );
@@ -1723,7 +1842,7 @@ mod tests {
         fs::rename(&snapshot, &previous).unwrap();
         fs::create_dir(&snapshot).unwrap();
         assert!(owner.checkpoint().is_err());
-        assert_eq!(owner.index().source_graph_commit_epoch, Some(0));
+        assert_eq!(owner.index().unwrap().source_graph_commit_epoch, Some(0));
         assert!(owner.has_pending_mutation());
         assert!(owner.reserve_preparation().is_err());
         owner.require_operation_available().unwrap();
@@ -1874,10 +1993,20 @@ mod tests {
     #[cfg(all(unix, feature = "vector-search"))]
     #[test]
     fn registered_vector_load_uses_captured_directory_after_path_replacement() {
+        for diskann in [false, true] {
+            check_registered_vector_captured_directory(diskann);
+        }
+    }
+
+    #[cfg(all(unix, feature = "vector-search"))]
+    fn check_registered_vector_captured_directory(diskann: bool) {
         let root = directory();
         let moved = root.with_extension("moved");
         let embedding = vec![1.0, 0.5, 0.25, 0.0];
         let owner = ConsumerProjection::initialize(&root, binding(), 0, |index| {
+            if !diskann {
+                index.set_rabitq_projection_build_options(Default::default());
+            }
             index.upsert(crate::SearchDocument {
                 id: "memory:original".into(),
                 title: String::new(),
@@ -1900,18 +2029,47 @@ mod tests {
         let lease = SearchProjectionPublishLease::acquire_for_consumer(&root).unwrap();
         fs::rename(&root, &moved).unwrap();
         fs::create_dir(&root).unwrap();
-        fs::write(root.join(artifact_name), b"foreign vector artifact").unwrap();
+        fs::write(root.join(&artifact_name), b"foreign vector artifact").unwrap();
 
         let index = SearchIndex::open_under_lease(&root, true, &lease).unwrap();
         assert!(lease.with_captured_directory(|directory| directory
             .shares_project_context(&index._project_files.as_ref().unwrap().io_context())));
-        let candidates = index
-            .rabitq_projection()
-            .unwrap()
-            .search(&embedding, 1, None)
-            .unwrap()
-            .candidates;
-        assert_eq!(candidates[0].id, "memory:original");
+        if diskann {
+            let result = index
+                .search_with_options(
+                    "",
+                    Some(&embedding),
+                    crate::SearchMode::Vector,
+                    crate::SearchQueryOptions {
+                        limit: 1,
+                        offset: 0,
+                        rank_window: None,
+                        fusion_weights: Default::default(),
+                        metadata_filters: Default::default(),
+                        policy_epoch: None,
+                    },
+                )
+                .unwrap();
+            assert_eq!(result.hits[0].id, "memory:original");
+            assert_eq!(
+                result.retrievers[0].backend,
+                "hawdb_diskann_candidate_projection"
+            );
+        } else {
+            let candidates = index
+                .rabitq_projection()
+                .unwrap()
+                .search(&embedding, 1, None)
+                .unwrap()
+                .candidates;
+            assert_eq!(candidates[0].id, "memory:original");
+        }
+        assert!(!index.projection_cleanup_report().retry_required);
+        assert_eq!(
+            fs::read(root.join(&artifact_name)).unwrap(),
+            b"foreign vector artifact"
+        );
+        assert!(moved.join(artifact_name).is_file());
 
         drop(index);
         drop(lease);
@@ -1954,8 +2112,8 @@ mod tests {
         let owner = ConsumerProjection::initialize(&root, binding(), 0, |_| Ok(())).unwrap();
         assert!(stale.mark_full_reindex_needed("foreign marker").is_err());
         assert!(stale.mark_metadata_repair_needed("foreign repair").is_err());
-        assert!(!owner.index().full_reindex_needed());
-        assert!(!owner.index().metadata_repair_needed());
+        assert!(!owner.index().unwrap().full_reindex_needed());
+        assert!(!owner.index().unwrap().metadata_repair_needed());
         drop(owner);
         // Even without a live native owner, the durable binding refuses stale I/O.
         assert!(stale.mark_full_reindex_needed("after owner close").is_err());
@@ -1978,15 +2136,15 @@ mod tests {
             index.mark_metadata_repair_needed("initializer")
         })
         .unwrap();
-        assert!(owner.index().metadata_repair_needed());
+        assert!(owner.index().unwrap().metadata_repair_needed());
         owner
             .apply(|index| {
                 index.clear_marker(super::super::METADATA_REPAIR_MARKER)?;
                 index.mark_full_reindex_needed("owned")
             })
             .unwrap();
-        assert!(!owner.index().metadata_repair_needed());
-        assert!(owner.index().full_reindex_needed());
+        assert!(!owner.index().unwrap().metadata_repair_needed());
+        assert!(owner.index().unwrap().full_reindex_needed());
         drop(owner);
         fs::remove_dir_all(root).unwrap();
     }
@@ -2019,7 +2177,10 @@ mod tests {
             snapshot
         );
         assert_eq!(fs::read(&foreign).unwrap(), b"unrelated namespace");
-        assert_eq!(owner.index().path.as_deref(), Some(source.as_path()));
+        assert_eq!(
+            owner.index().unwrap().path.as_deref(),
+            Some(source.as_path())
+        );
         assert_eq!(owner.receipt(), receipt);
         assert!(owner.binding_is_valid());
         drop(owner.reserve_preparation().unwrap());
@@ -2052,7 +2213,7 @@ mod tests {
             fs::read(source.join(SEARCH_SNAPSHOT_FILE)).unwrap(),
             snapshot
         );
-        assert_eq!(owner.index().path.as_deref(), Some(source));
+        assert_eq!(owner.index().unwrap().path.as_deref(), Some(source));
         assert_eq!(&owner.receipt(), receipt);
         assert!(owner.binding_is_valid());
         drop(owner.reserve_preparation().unwrap());
@@ -2099,9 +2260,12 @@ mod tests {
             attempted.is_err(),
             "uncertain directory publication must revoke mutation: {observed:?}"
         );
-        assert_eq!(owner.index().path.as_deref(), Some(destination.as_path()));
+        assert_eq!(
+            owner.index().unwrap().path.as_deref(),
+            Some(destination.as_path())
+        );
         assert!(!owner.binding_is_valid());
-        assert!(!peer.index().full_reindex_needed());
+        assert!(!peer.index().unwrap().full_reindex_needed());
         assert!(owner.checkpoint().is_err());
         assert!(owner.reserve_preparation().is_err());
         let retry_destination = parent.join("retry");
@@ -2138,7 +2302,10 @@ mod tests {
             .contains("lost directory move response"));
         assert!(destination.is_dir());
         assert!(!source.exists());
-        assert_eq!(owner.index().path.as_deref(), Some(destination.as_path()));
+        assert_eq!(
+            owner.index().unwrap().path.as_deref(),
+            Some(destination.as_path())
+        );
         assert!(!owner.binding_is_valid());
         assert_eq!(owner.receipt(), receipt);
         assert!(owner.checkpoint().is_err());
@@ -2148,7 +2315,7 @@ mod tests {
         assert!(owner
             .apply(|index| index.mark_full_reindex_needed("lost move response"))
             .is_err());
-        assert!(!peer.index().full_reindex_needed());
+        assert!(!peer.index().unwrap().full_reindex_needed());
         drop(owner);
         let reopened = ConsumerProjection::open(&destination).unwrap();
         assert_eq!(reopened.receipt(), receipt);
@@ -2179,7 +2346,7 @@ mod tests {
         });
         FAIL_DIRECTORY_MOVE_RESPONSE.with(|failure| failure.set(true));
         assert!(owner.publish_directory(&destination).is_err());
-        assert_eq!(owner.index().path, None);
+        assert_eq!(owner.index().unwrap().path, None);
         assert!(!owner.binding_is_valid());
         assert!(third.is_dir());
         assert!(ConsumerProjection::open(&third).is_err());
@@ -2221,7 +2388,7 @@ mod tests {
             foreign
         );
         assert!(!owner.binding_is_valid());
-        assert_eq!(owner.index().path, None);
+        assert_eq!(owner.index().unwrap().path, None);
         assert!(ConsumerProjection::open(&original).is_err());
         assert_eq!(owner.receipt(), receipt);
         drop(owner);
@@ -2297,7 +2464,10 @@ mod tests {
         assert!(destination.is_dir());
         assert!(!source.exists());
         assert!(!owner.binding_is_valid());
-        assert_eq!(owner.index().path.as_deref(), Some(destination.as_path()));
+        assert_eq!(
+            owner.index().unwrap().path.as_deref(),
+            Some(destination.as_path())
+        );
         assert!(ConsumerProjection::open(&destination).is_err());
         drop(owner);
         let reopened = ConsumerProjection::open(&destination).unwrap();
@@ -2328,14 +2498,14 @@ mod tests {
         owner
             .apply(|index| index.mark_full_reindex_needed("moved root"))
             .unwrap();
-        assert!(owner.index().full_reindex_needed());
-        assert!(!peer.index().full_reindex_needed());
+        assert!(owner.index().unwrap().full_reindex_needed());
+        assert!(!peer.index().unwrap().full_reindex_needed());
         let completed = owner.checkpoint().unwrap();
         drop(peer);
         drop(owner);
         let reopened = ConsumerProjection::open(&destination).unwrap();
         assert_eq!(reopened.receipt(), completed);
-        assert!(reopened.index().full_reindex_needed());
+        assert!(reopened.index().unwrap().full_reindex_needed());
         drop(reopened);
         fs::remove_dir_all(parent).unwrap();
     }

@@ -24,7 +24,9 @@ use hawdb_core::{
     IndexStatisticsSample, LabelId, PropertyType, RelTypeId, Result, RuntimeCapabilities,
     SchemaObjectState, TableKind, Value,
 };
-use hawdb_executor::{binding::map_payload_bytes, QueryOutput, Row, VectorExecutionReport};
+use hawdb_executor::{
+    binding::map_payload_bytes, QueryOutput, QueryRows, QuerySchema, Row, VectorExecutionReport,
+};
 use hawdb_plan_cache::PlanCacheStats;
 use hawdb_query::QueryIdentity;
 use hawdb_sql::{Expr, ExprKind};
@@ -227,7 +229,7 @@ pub(crate) enum SqlPhysicalPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SystemTableScan {
     table: SystemTable,
-    projection: Vec<SelectProjection>,
+    projection: Vec<(String, String)>,
     predicate: Option<SqlPredicate>,
     order_by: Vec<SqlOrderItem>,
     offset: Option<u64>,
@@ -481,12 +483,48 @@ impl StatementSummary {
             return;
         }
 
-        let digest = execution.query_digest.clone();
-        if let Some(record) = self.records.get_mut(&digest) {
+        if let Some(record) = self.records.get_mut(execution.query_digest.as_str()) {
             record.apply(execution);
             return;
         }
+        self.insert_execution(execution);
+    }
 
+    /// Updates a successful execution without owning metadata already retained
+    /// by the first sample for this digest.
+    pub fn record_completed(
+        &mut self,
+        query_language: &str,
+        query_text: &str,
+        statement_kind: &str,
+        query_identity: &QueryIdentity,
+        elapsed_micros: u128,
+        row_count: usize,
+    ) {
+        if self.capacity == 0 {
+            return;
+        }
+        if let Some(record) = self.records.get_mut(query_identity.query_digest()) {
+            record.apply_metrics(
+                saturating_i64_from_u128(elapsed_micros),
+                i64::try_from(row_count).unwrap_or(i64::MAX),
+                true,
+                None,
+            );
+            return;
+        }
+        self.insert_execution(StatementExecution::completed(
+            query_language,
+            query_text,
+            statement_kind,
+            query_identity,
+            elapsed_micros,
+            row_count,
+        ));
+    }
+
+    fn insert_execution(&mut self, execution: StatementExecution) {
+        let digest = execution.query_digest.clone();
         while self.records.len() >= self.capacity {
             let Some(evicted) = self.insertion_order.pop_front() else {
                 break;
@@ -535,22 +573,35 @@ impl StatementSummaryRecord {
     }
 
     fn apply(&mut self, execution: StatementExecution) {
+        self.apply_metrics(
+            execution.elapsed_micros,
+            execution.row_count,
+            execution.success,
+            execution.error,
+        );
+    }
+
+    fn apply_metrics(
+        &mut self,
+        elapsed_micros: i64,
+        row_count: i64,
+        success: bool,
+        error: Option<String>,
+    ) {
         self.execution_count = self.execution_count.saturating_add(1);
-        if execution.success {
+        if success {
             self.success_count = self.success_count.saturating_add(1);
         } else {
             self.error_count = self.error_count.saturating_add(1);
         }
-        self.total_elapsed_micros = self
-            .total_elapsed_micros
-            .saturating_add(execution.elapsed_micros);
-        self.max_elapsed_micros = self.max_elapsed_micros.max(execution.elapsed_micros);
-        self.total_row_count = self.total_row_count.saturating_add(execution.row_count);
+        self.total_elapsed_micros = self.total_elapsed_micros.saturating_add(elapsed_micros);
+        self.max_elapsed_micros = self.max_elapsed_micros.max(elapsed_micros);
+        self.total_row_count = self.total_row_count.saturating_add(row_count);
         self.last_seen_unix_micros = unix_now_micros();
-        self.last_elapsed_micros = execution.elapsed_micros;
-        self.last_row_count = execution.row_count;
-        self.last_success = execution.success;
-        self.last_error = execution.error;
+        self.last_elapsed_micros = elapsed_micros;
+        self.last_row_count = row_count;
+        self.last_success = success;
+        self.last_error = error;
     }
 }
 
@@ -573,6 +624,8 @@ pub fn query_sql_with_params<Store: SystemSqlStore>(
 ) -> Result<QueryOutput> {
     let logical = plan_sql(sql_text, parameters)?;
     let physical = optimize_sql(logical);
+    let SqlPhysicalPlan::SystemTableScanExec(scan) = &physical;
+    let schema = QuerySchema::try_new(scan.projection.iter().map(|(_, name)| name.clone()))?;
     let rows = execute_sql(physical, context, max_rows)?;
     let payload_bytes = rows.iter().fold(0usize, |total, row| {
         total.saturating_add(map_payload_bytes(row))
@@ -588,7 +641,9 @@ pub fn query_sql_with_params<Store: SystemSqlStore>(
             ),
         ));
     }
-    Ok(QueryOutput { rows: rows.into() })
+    Ok(QueryOutput {
+        rows: QueryRows::try_from_named_rows(schema, rows)?,
+    })
 }
 
 fn plan_sql(sql_text: &str, parameters: &[Value]) -> Result<SqlLogicalPlan> {
@@ -612,7 +667,7 @@ fn plan_sql(sql_text: &str, parameters: &[Value]) -> Result<SqlLogicalPlan> {
     validate_order_columns(table, &select.order_by)?;
     Ok(SqlLogicalPlan::SystemTableScan(SystemTableScan {
         table,
-        projection: select.projection,
+        projection: projection_columns(table, &select.projection),
         predicate: select
             .selection
             .map(|predicate| bind_predicate(predicate, parameters))
@@ -786,7 +841,7 @@ fn execute_system_table_scan<Store: SystemSqlStore>(
         ));
     }
 
-    project_rows(rows, &scan.projection)
+    Ok(project_rows(rows, &scan.projection))
 }
 
 fn effective_limit(query_limit: Option<u64>, max_rows: Option<usize>) -> Result<Option<usize>> {
@@ -804,32 +859,44 @@ fn effective_limit(query_limit: Option<u64>, max_rows: Option<usize>) -> Result<
     })
 }
 
-fn project_rows(rows: Vec<Row>, projection: &[SelectProjection]) -> Result<Vec<Row>> {
-    if projection
-        .iter()
-        .any(|projection| matches!(projection, SelectProjection::Wildcard))
-    {
-        return Ok(rows);
+fn projection_columns(
+    table: SystemTable,
+    projection: &[SelectProjection],
+) -> Vec<(String, String)> {
+    let mut columns = Vec::new();
+    for item in projection {
+        match item {
+            SelectProjection::Wildcard => columns.extend(
+                table_columns(table)
+                    .iter()
+                    .map(|name| (name.to_string(), name.to_string())),
+            ),
+            SelectProjection::Expression {
+                expression:
+                    Expr {
+                        kind: ExprKind::Column(column),
+                        ..
+                    },
+                alias,
+                ..
+            } => columns.push((
+                column.name.clone(),
+                alias.clone().unwrap_or_else(|| column.name.clone()),
+            )),
+            _ => unreachable!("catalog projections were validated during planning"),
+        }
     }
+    columns
+}
+
+fn project_rows(rows: Vec<Row>, projection: &[(String, String)]) -> Vec<Row> {
     rows.into_iter()
         .map(|row| {
             projection
                 .iter()
-                .map(|projection| {
-                    let SelectProjection::Expression {
-                        expression:
-                            Expr {
-                                kind: ExprKind::Column(name),
-                                ..
-                            },
-                        alias,
-                        ..
-                    } = projection
-                    else {
-                        unreachable!("wildcard handled above");
-                    };
-                    let value = row.get(&name.name).cloned().unwrap_or(Value::Null);
-                    Ok((alias.clone().unwrap_or_else(|| name.name.clone()), value))
+                .map(|(source, name)| {
+                    let value = row.get(source).cloned().unwrap_or(Value::Null);
+                    (name.clone(), value)
                 })
                 .collect()
         })
@@ -2657,6 +2724,9 @@ fn truncate_utf8(input: &str, max_bytes: usize) -> String {
 }
 
 mod graph_store_adapter;
+
+#[cfg(test)]
+mod statement_summary_tests;
 
 #[cfg(test)]
 mod tests {

@@ -758,6 +758,7 @@ pub enum RelationalIndexShadowError {
     Corrupt(String),
     Durability(String),
     FileDescriptors(hawdb_core::error::FileDescriptorError),
+    UnsupportedFormat(hawdb_core::error::StorageFormatError),
     MissingIndex {
         table: String,
         index: String,
@@ -776,6 +777,7 @@ impl fmt::Display for RelationalIndexShadowError {
             }
             Self::Corrupt(message) => write!(formatter, "corrupt relational index shadow: {message}"),
             Self::FileDescriptors(error) => fmt::Display::fmt(error, formatter),
+            Self::UnsupportedFormat(error) => fmt::Display::fmt(error, formatter),
             Self::Durability(message) => {
                 write!(formatter, "relational index shadow durability failed: {message}")
             }
@@ -797,6 +799,7 @@ impl std::error::Error for RelationalIndexShadowError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::FileDescriptors(error) => Some(error),
+            Self::UnsupportedFormat(error) => Some(error),
             _ => None,
         }
     }
@@ -3055,6 +3058,7 @@ fn read_u64(bytes: &[u8]) -> u64 {
 impl From<RelationalError> for RelationalIndexShadowError {
     fn from(error: RelationalError) -> Self {
         match error {
+            RelationalError::UnsupportedFormat(error) => Self::UnsupportedFormat(error),
             RelationalError::FileDescriptors(error) => Self::FileDescriptors(error),
             error => Self::Corrupt(error.to_string()),
         }

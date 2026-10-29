@@ -27,16 +27,109 @@ use hawdb_vector_projection::{
 };
 use std::path::Path;
 
+mod diskann;
+
+/// Algorithm-neutral borrowed diagnostics for the selected candidate artifact.
+pub(super) struct Manifest<'a> {
+    pub(super) identity: &'a hawdb_vector_projection::ProjectionIdentity,
+    pub(super) algorithm: &'a str,
+    pub(super) format_version: u32,
+    pub(super) dimension: usize,
+    pub(super) document_count: usize,
+    pub(super) source_digest: u64,
+    pub(super) payload_bytes: u64,
+    pub(super) payload_checksum: u32,
+    pub(super) bit_width: u8,
+    pub(super) transform_seed: u64,
+    pub(super) segment_count: usize,
+    pub(super) requested_segment_rows: usize,
+    pub(super) admitted_segment_rows: usize,
+    pub(super) configured_build_working_bytes: usize,
+    pub(super) peak_build_working_bytes: usize,
+}
+
+impl<'a> From<&'a ProjectionManifest> for Manifest<'a> {
+    fn from(value: &'a ProjectionManifest) -> Self {
+        Self {
+            identity: &value.identity,
+            algorithm: &value.algorithm,
+            format_version: value.format_version,
+            dimension: value.dimension,
+            document_count: value.document_count,
+            source_digest: value.source_digest,
+            payload_bytes: value.payload_bytes,
+            payload_checksum: value.payload_checksum,
+            bit_width: value.bit_width,
+            transform_seed: value.transform_seed,
+            segment_count: value.segments.len(),
+            requested_segment_rows: value.requested_segment_rows,
+            admitted_segment_rows: value.admitted_segment_rows,
+            configured_build_working_bytes: value.configured_build_working_bytes,
+            peak_build_working_bytes: value.peak_build_working_bytes,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) enum Projection {
     Ordinary(FileProjection),
     Admitted(FileProjection<ReaderMemory>),
+    DiskAnn(Box<diskann::GraphProjection<()>>),
+    AdmittedDiskAnn(Box<diskann::GraphProjection<ReaderMemory>>),
 }
 impl Projection {
-    pub(super) fn manifest(&self) -> &ProjectionManifest {
+    pub(super) fn is_diskann(&self) -> bool {
+        matches!(self, Self::DiskAnn(_) | Self::AdmittedDiskAnn(_))
+    }
+
+    pub(super) fn backend(&self) -> Result<hawdb_core::VectorIndexBackend> {
         match self {
-            Self::Ordinary(value) => value.manifest(),
-            Self::Admitted(value) => value.manifest(),
+            Self::DiskAnn(value) => value.backend(),
+            Self::AdmittedDiskAnn(value) => value.backend(),
+            _ => {
+                let metadata = self.manifest();
+                Ok(hawdb_core::VectorIndexBackend::RaBitQ {
+                    bit_width: metadata.bit_width,
+                    segment_rows: u32::try_from(metadata.requested_segment_rows).map_err(|_| {
+                        HawDBError::StorageIntegrity(
+                            "RaBitQ segment rows exceed canonical bounds".into(),
+                        )
+                    })?,
+                    transform_seed: metadata.transform_seed,
+                })
+            }
+        }
+    }
+
+    pub(super) fn manifest(&self) -> Manifest<'_> {
+        match self {
+            Self::Ordinary(value) => value.manifest().into(),
+            Self::Admitted(value) => value.manifest().into(),
+            Self::DiskAnn(value) => value.manifest(),
+            Self::AdmittedDiskAnn(value) => value.manifest(),
+        }
+    }
+    pub(super) fn compatible(&self, other: &Self) -> bool {
+        let left = self.manifest();
+        let right = other.manifest();
+        if left.algorithm != right.algorithm
+            || left.bit_width != right.bit_width
+            || left.transform_seed != right.transform_seed
+        {
+            return false;
+        }
+        match (self, other) {
+            (Self::DiskAnn(left), Self::DiskAnn(right)) => left.parameters() == right.parameters(),
+            (Self::DiskAnn(left), Self::AdmittedDiskAnn(right)) => {
+                left.parameters() == right.parameters()
+            }
+            (Self::AdmittedDiskAnn(left), Self::DiskAnn(right)) => {
+                left.parameters() == right.parameters()
+            }
+            (Self::AdmittedDiskAnn(left), Self::AdmittedDiskAnn(right)) => {
+                left.parameters() == right.parameters()
+            }
+            _ => true,
         }
     }
     pub(super) fn search(
@@ -48,9 +141,13 @@ impl Projection {
         match self {
             Self::Ordinary(value) => value.search(query, top_k, options),
             Self::Admitted(value) => value.search(query, top_k, options),
+            Self::DiskAnn(value) => value.search(query, top_k, options),
+            Self::AdmittedDiskAnn(value) => value.search(query, top_k, options),
         }
     }
 }
+
+pub(super) use crate::diskann_identity::embedding as embedding_identity_digest;
 
 pub(super) fn open(
     root: &Path,
@@ -61,6 +158,17 @@ pub(super) fn open(
     max_artifact_read_bytes: u64,
     captured_file: Option<hawdb_storage::file_io::File>,
 ) -> Result<Option<Projection>> {
+    if manifest.diskann_source_digest.is_some() {
+        return diskann::open(
+            root,
+            active,
+            manifest,
+            admission,
+            max_artifact_read_bytes,
+            captured_file,
+        )
+        .map(Some);
+    }
     let Some(admission) = admission else {
         return open_rabitq_projection(root, active, manifest, max_working_bytes, captured_file)
             .map(|value| value.map(Projection::Ordinary));

@@ -31,6 +31,8 @@ use hawdb_core::RuntimeTaskContext;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod primary_key_mutations;
+
 static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 struct TestDirectory(PathBuf);
@@ -72,6 +74,14 @@ impl Fixture {
     }
 
     fn with_foreign_keys(seed: u64, foreign_keys: bool) -> Self {
+        let mut table = schema();
+        if !foreign_keys {
+            table.foreign_keys.clear();
+        }
+        Self::with_table_schema(seed, table)
+    }
+
+    fn with_table_schema(seed: u64, table: RelationalTableSchema) -> Self {
         let count = 8 + (seed % 9) as i64;
         let rows = (1..=count)
             .map(|id| {
@@ -79,10 +89,6 @@ impl Fixture {
                 row(id, parent, seed)
             })
             .collect();
-        let mut table = schema();
-        if !foreign_keys {
-            table.foreign_keys.clear();
-        }
         let materialized = RelationalState::default()
             .stage_transaction(
                 RelationalTransaction {

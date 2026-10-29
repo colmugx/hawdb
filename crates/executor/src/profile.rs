@@ -1047,6 +1047,10 @@ pub struct PipelineMemoryReport {
     /// Rows projected from source property references before owned output admission.
     /// This counter does not claim source-to-host zero-copy delivery.
     pub borrowed_node_projection_rows: usize,
+    /// Query-owned string CASE dispatch tables prepared from the bound plan.
+    pub simple_case_dispatch_tables: usize,
+    /// CASE evaluations served by prepared key lookup (including misses/NULL).
+    pub simple_case_dispatch_lookups: usize,
     /// Native projected row views delivered without constructing a row map.
     /// Owned/validated consumers may still copy admitted values for retention.
     pub native_projection_rows: usize,

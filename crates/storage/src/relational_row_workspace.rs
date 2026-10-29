@@ -630,6 +630,9 @@ fn map_sparse_live_state_to_demand_error(
     error: RelationalError,
 ) -> RelationalRowPageDemandReadError {
     match error {
+        RelationalError::UnsupportedFormat(error) => {
+            RelationalRowPageDemandReadError::UnsupportedFormat(error)
+        }
         RelationalError::FileDescriptors(error) => {
             RelationalRowPageDemandReadError::FileDescriptors(error)
         }
@@ -647,6 +650,9 @@ fn map_sparse_live_state_to_demand_error(
 
 fn map_sparse_live_snapshot_error(error: RelationalRowPageSnapshotReadError) -> RelationalError {
     match error {
+        RelationalRowPageSnapshotReadError::UnsupportedFormat(error) => {
+            RelationalError::UnsupportedFormat(error)
+        }
         RelationalRowPageSnapshotReadError::FileDescriptors(error) => {
             RelationalError::FileDescriptors(error)
         }

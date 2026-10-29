@@ -36,6 +36,7 @@ pub fn query_runtime_preflight_json(
         database_path,
         DatabaseConfig {
             read_only: true,
+            recovery_mode: crate::RecoveryMode::Strict,
             ..DatabaseConfig::default()
         },
     ) {
@@ -96,11 +97,13 @@ fn database_open_blocker_codes(probe_count: usize, failed_probe_count: usize) ->
 
 fn error_class(error: &HawDBError) -> &'static str {
     match error {
+        HawDBError::UnsupportedStorageFormat(_) => "unsupported_storage_format",
         HawDBError::Parse(_) => "parse",
         HawDBError::Semantic(_) => "semantic",
         HawDBError::Storage(_)
         | HawDBError::FileDescriptors(_)
         | HawDBError::StorageIntegrity(_)
+        | HawDBError::WalRecoveryIo { .. }
         | HawDBError::ProjectionBusy
         | HawDBError::AppendSequenceExhausted { .. }
         | HawDBError::BranchBusy { .. }

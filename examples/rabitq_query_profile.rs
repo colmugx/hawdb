@@ -57,6 +57,7 @@ fn vector(id: u64) -> Vec<f32> {
 fn build(path: &Path) -> Result<(), Box<dyn Error>> {
     std::fs::create_dir(path)?;
     let options = SearchOutOfCoreGenerationBuildOptions {
+        vector_backend: None,
         source_graph_commit_epoch: Some(1),
         embedding_manifest: Some(SearchEmbeddingManifest {
             model: "hawdb-rabitq-profile-xorshift64star".into(),
@@ -93,6 +94,7 @@ fn build(path: &Path) -> Result<(), Box<dyn Error>> {
 fn query(
     reader: &SearchOutOfCoreReader,
     embedding: &[f32],
+    kernel: VectorSearchKernelPreference,
 ) -> hawdb::Result<SearchOutOfCoreOutput> {
     reader.search_with_options_compressed_vector_projection_execution_options(
         "",
@@ -107,7 +109,7 @@ fn query(
             policy_epoch: None,
         },
         CompressedVectorSearchMode::Required,
-        VectorSearchExecutionOptions::default().with_kernel(VectorSearchKernelPreference::Scalar),
+        VectorSearchExecutionOptions::default().with_kernel(kernel),
     )
 }
 
@@ -124,9 +126,9 @@ fn profile(path: &Path) -> Result<(), Box<dyn Error>> {
     let reader = SearchOutOfCoreReader::open(path)?;
     assert_eq!(reader.document_count(), DOCUMENTS);
     let embedding = vector(u64::MAX - 17);
-    let mut warm = query(&reader, &embedding)?;
+    let mut warm = query(&reader, &embedding, VectorSearchKernelPreference::Scalar)?;
     for _ in 0..2 {
-        warm = query(&reader, &embedding)?;
+        warm = query(&reader, &embedding, VectorSearchKernelPreference::Scalar)?;
     }
     let expected = hit_bits(&warm);
     assert_eq!(expected.len(), 10);
@@ -173,11 +175,82 @@ fn profile(path: &Path) -> Result<(), Box<dyn Error>> {
     let mut elapsed = Vec::with_capacity(REPETITIONS);
     for _ in 0..REPETITIONS {
         let started = Instant::now();
-        let result = query(&reader, &embedding)?;
+        let result = query(&reader, &embedding, VectorSearchKernelPreference::Scalar)?;
         elapsed.push(started.elapsed().as_nanos());
         assert_eq!(hit_bits(&result), expected);
     }
     println!("{}", json!({"phase": "complete", "elapsed_ns": elapsed}));
+    Ok(())
+}
+
+fn compare(path: &Path) -> Result<(), Box<dyn Error>> {
+    const SAMPLES: usize = 31;
+    let reader = SearchOutOfCoreReader::open(path)?;
+    assert_eq!(reader.document_count(), DOCUMENTS);
+    let (simd, kernel_name) = if cfg!(target_arch = "aarch64") {
+        (VectorSearchKernelPreference::Neon, "neon")
+    } else {
+        (VectorSearchKernelPreference::Avx2, "avx2")
+    };
+    let embeddings = [17, 29, 41].map(|offset| vector(u64::MAX - offset));
+    let mut expected = Vec::new();
+    for embedding in &embeddings {
+        let scalar = query(&reader, embedding, VectorSearchKernelPreference::Scalar)?;
+        let selected = query(&reader, embedding, simd)?;
+        assert_eq!(hit_bits(&scalar), hit_bits(&selected));
+        assert_eq!(scalar.result.hits.len(), 10);
+        let mut reports = Vec::new();
+        for (output, kernel) in [(&scalar, "scalar"), (&selected, kernel_name)] {
+            let report = output
+                .result
+                .retrievers
+                .iter()
+                .find(|r| r.name == "vector")
+                .unwrap();
+            assert_eq!(
+                report.backend,
+                "hawdb_rabitq_out_of_core_candidate_projection"
+            );
+            assert_eq!(report.candidate_scan_kernel.as_deref(), Some(kernel));
+            assert_eq!(report.candidate_scan_scored_document_count, DOCUMENTS);
+            assert!(report.reranked_candidate_count > 0);
+            assert!(report.raw_vector_bytes_read > 0);
+            assert!(report.fallback_reason_codes.is_empty());
+            reports.push(json!({
+                "scored_vectors": report.candidate_scan_scored_document_count,
+                "reranked_candidates": report.reranked_candidate_count,
+                "raw_vector_bytes_read": report.raw_vector_bytes_read,
+                "admitted_working_bytes": report.candidate_scan_admitted_working_bytes,
+                "layer_worker_count_sum": report.candidate_scan_worker_count,
+            }));
+        }
+        assert_eq!(reports[0], reports[1]);
+        println!(
+            "{}",
+            json!({"phase": "comparison_ready", "report": reports[0]})
+        );
+        expected.push(hit_bits(&scalar));
+    }
+    let mut elapsed = [Vec::new(), Vec::new()];
+    for sample in 0..SAMPLES {
+        let query_index = sample % embeddings.len();
+        for index in if sample % 2 == 0 { [0, 1] } else { [1, 0] } {
+            let kernel = [VectorSearchKernelPreference::Scalar, simd][index];
+            let started = Instant::now();
+            let result = query(&reader, &embeddings[query_index], kernel)?;
+            elapsed[index].push(started.elapsed().as_nanos());
+            assert_eq!(hit_bits(&result), expected[query_index]);
+        }
+    }
+    println!(
+        "{}",
+        json!({
+            "phase": "comparison_complete", "documents": DOCUMENTS, "dimension": DIMENSION,
+            "generator_seed": SEED, "samples_per_kernel": SAMPLES, "queries": embeddings.len(),
+            "configured_max_parallelism": 1, "simd_kernel": kernel_name,
+            "scalar_elapsed_ns": elapsed[0], "simd_elapsed_ns": elapsed[1],
+        })
+    );
     Ok(())
 }
 
@@ -187,11 +260,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     if arguments.len() != 2 {
-        return Err("usage: rabitq_query_profile <build|profile> <fixture-path>".into());
+        return Err("usage: rabitq_query_profile <build|profile|compare> <fixture-path>".into());
     }
     match arguments[0].to_str() {
         Some("build") => build(Path::new(&arguments[1])),
         Some("profile") => profile(Path::new(&arguments[1])),
-        _ => Err("mode must be build or profile".into()),
+        Some("compare") => compare(Path::new(&arguments[1])),
+        _ => Err("mode must be build, profile or compare".into()),
     }
 }

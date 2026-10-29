@@ -7,8 +7,8 @@ feature. `RaBitQ` identifies the 1-bit and 4-bit candidate encodings described
 in this contract. The implementation is native Rust and has no C++ FFI or
 third-party vector-quantization runtime dependency.
 
-The default is 1-bit standard RaBitQ, matching Faiss `IndexRaBitQ`'s default
-`nb_bits`. The 4-bit multi-bit variant is an explicit build option.
+The default is 4-bit RaBitQ. Standard 1-bit RaBitQ remains an explicit build
+option; both use the same sign/refinement layout and scan contract.
 
 The `hawdb-vector-projection` crate owns rebuildable vector encodings and scan
 kernels. The embedded `hawdb` crate remains the supported application facade.
@@ -51,8 +51,9 @@ is an explicit pre-transform selected by its manifest; Faiss expects any random
 rotation to be performed externally. Therefore HawDB artifacts are not binary
 interchangeable with Faiss artifacts even though their packed quantizer planes
 have the same bit order and code semantics. Centroid calibration, other bit
-widths, native SIMD scoring, and ANN integration require production evidence
-before adoption.
+widths and ANN integration require production evidence before adoption. SIMD
+scoring preserves the existing encoding and scalar candidate scores; local
+performance evidence does not replace production qualification.
 
 ## Candidate And Rerank Semantics
 
@@ -116,13 +117,18 @@ requested parallelism, segment count, and memory-admitted parallelism. HawDB
 MUST NOT create a Rayon pool, Tokio runtime, or other global vector-search
 executor.
 
-The portable scalar kernel is the only active kernel and the correctness
-reference. On Arm, an explicit NEON preference is accepted but dispatches to
-that scalar kernel and reports `scalar`, matching Faiss's current RaBitQ NEON
-fallback. Explicit AVX2, and NEON requests on non-Arm targets, fail closed.
-Any future accelerated kernel MUST preserve scalar candidate ordering and score
-tolerance for the same artifact, filter, query, and TopK before it can become
-eligible for automatic dispatch.
+The portable scalar kernel remains the correctness reference. On x86/x86_64,
+`Auto` selects AVX2 when runtime CPU/OS feature detection permits it; otherwise
+it selects scalar. Explicit AVX2 requests fail closed when unavailable. The
+AVX2 kernel supports both bit widths and arbitrary dimension tails, preserves
+scalar multiplication and accumulation order without FMA, and MUST return
+bit-identical finite candidate scores for the same artifact and query.
+On AArch64, an explicit NEON preference uses the NEON scorer when supported.
+It follows the same bit-identical score contract, but `Auto` retains scalar
+until native correctness and performance qualification is available. On 32-bit
+Arm, the explicit NEON preference retains its scalar fallback. NEON requests
+on non-Arm targets fail closed. Other future kernels MUST qualify scalar
+candidate ordering and score parity before automatic dispatch.
 
 ## Artifact And Recovery Contract
 
@@ -167,9 +173,9 @@ they do not satisfy production admission.
 
 Cross-platform CI MUST execute the deterministic scalar corpus natively on
 Linux x86_64, Linux AArch64, macOS AArch64, and Windows x86_64. Arm targets
-MUST also prove the explicit-NEON scalar fallback; non-Arm targets MUST prove
-that the same request fails. Adding a native SIMD kernel changes this
-requirement to include ordering-parity execution on each supported SIMD target.
+MUST prove explicit-NEON bitwise score and ordering parity on AArch64, and the
+scalar fallback on 32-bit Arm; non-Arm targets MUST prove that a NEON request
+fails. Native SIMD tests MUST execute on capable runners, not just cross-compile.
 
 The typed production evidence protocol is
 `hawdb-vector-recall-production-qualification-v1`. It wraps, but does not

@@ -146,6 +146,7 @@ mod relational_update_delete_outcomes;
 mod relationship_patterns;
 mod relationship_property_mutations;
 mod relationship_reads;
+mod result_column_order;
 mod runtime_capabilities;
 mod schema_indexes;
 mod schema_migrations;
@@ -153,6 +154,7 @@ mod search_projection_delta_facade;
 mod search_projection_graph_delta;
 mod search_projection_rebuild_facade;
 mod set_mutations;
+mod simple_case_dispatch;
 mod skill_lifecycle;
 mod skill_reads;
 mod snapshot_retention;
@@ -673,6 +675,7 @@ fn read_only_database_rejects_knowledge_property_query_update() {
             &path,
             DatabaseConfig {
                 read_only: true,
+                recovery_mode: crate::RecoveryMode::Strict,
                 ..DatabaseConfig::default()
             },
         )

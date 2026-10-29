@@ -900,6 +900,9 @@ fn map_schema_encode_error(
     error: crate::relational::RelationalError,
 ) -> RelationalRowPagePublicationError {
     match error {
+        crate::relational::RelationalError::UnsupportedFormat(error) => {
+            RelationalRowPagePublicationError::UnsupportedFormat(error)
+        }
         crate::relational::RelationalError::FileDescriptors(error) => {
             RelationalRowPagePublicationError::FileDescriptors(error)
         }
@@ -921,6 +924,9 @@ fn map_schema_decode_error(
     error: crate::relational::RelationalError,
 ) -> RelationalRowPagePublicationError {
     match error {
+        crate::relational::RelationalError::UnsupportedFormat(error) => {
+            RelationalRowPagePublicationError::UnsupportedFormat(error)
+        }
         crate::relational::RelationalError::FileDescriptors(error) => {
             RelationalRowPagePublicationError::FileDescriptors(error)
         }

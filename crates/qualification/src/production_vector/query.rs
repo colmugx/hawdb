@@ -290,9 +290,9 @@ pub(super) fn collect_recall_evidence(
     };
     let report = match &query_case.access_control {
         Some(access_control) => {
-            index.validate_sampled_vector_recall_access_control(options, access_control)
+            index.validate_sampled_compressed_vector_recall_access_control(options, access_control)
         }
-        None => index.validate_sampled_vector_recall(options),
+        None => index.validate_sampled_compressed_vector_recall(options),
     };
     Ok(ProductionVectorRecallEvidence {
         name: query_case.name.clone(),

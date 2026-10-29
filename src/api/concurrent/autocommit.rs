@@ -251,7 +251,7 @@ impl ConcurrentDatabase {
 
     pub(crate) fn query_prepared_mutation(
         &self,
-        prepared: PreparedRuntimeQuery,
+        mut prepared: PreparedRuntimeQuery,
         request: QueryRequest<'_>,
         capture_trace: bool,
         admission: Option<Arc<hawdb_qos::RuntimePermit>>,
@@ -260,6 +260,7 @@ impl ConcurrentDatabase {
         let started = Instant::now();
         let statement_kind = prepared.statement_kind();
         let parse_nanos = prepared.parse_nanos();
+        let query_identity = prepared.take_query_identity(request.cypher);
         let view = self.inner.commits.read_view()?;
         let recorder = view.recorder.clone();
         let result = (|| {
@@ -342,6 +343,7 @@ impl ConcurrentDatabase {
             started,
             result.as_ref().map(|(output, _)| output),
             StatementExecutionContext {
+                query_identity: query_identity.as_ref(),
                 execution_profile: None,
                 retained_profile: None,
                 access_control: request.access_control,

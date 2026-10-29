@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use hawdb_executor::{BlockingOperatorMemoryReport, QueryRows};
+use hawdb_executor::{BlockingOperatorMemoryReport, QueryRows, QuerySchema};
 use hawdb_optimizer::{RelationalJoinEnumerationConfig, RelationalOperatorKind};
 use hawdb_storage::relational::RelationalHydrationBudget;
 use std::collections::{BTreeMap, BTreeSet};
@@ -501,7 +501,7 @@ impl Case {
             false,
             has_profile.then_some(1),
         ));
-        nodes.into_iter().enumerate().map(|(index, (operator, id, estimated, object, info, report, profile))| {
+        let rows = nodes.into_iter().enumerate().map(|(index, (operator, id, estimated, object, info, report, profile))| {
             let prefix = if index == 0 { String::new() } else { format!("{}└─", "  ".repeat(index - 1)) };
             let mut row = BTreeMap::from([
                 ("id".into(), text(format!("{prefix}{operator}_{id}"))),
@@ -521,6 +521,27 @@ impl Case {
                 row.insert("disk".into(), if report && self.spilled { text(format!("runs=1, rows={}, bytes={}", n + 3, 70 + n)) } else { Value::Null });
             }
             row
-        }).collect::<Vec<_>>().into()
+        }).collect::<Vec<_>>();
+        // Keep the contract independent of the production schema helper.
+        let columns: &[&str] = if analyze {
+            &[
+                "id",
+                "estRows",
+                "actRows",
+                "task",
+                "access object",
+                "execution info",
+                "operator info",
+                "memory",
+                "disk",
+            ]
+        } else {
+            &["id", "estRows", "task", "access object", "operator info"]
+        };
+        QueryRows::try_from_named_rows(
+            QuerySchema::try_new(columns.iter().map(|name| (*name).to_owned())).unwrap(),
+            rows,
+        )
+        .unwrap()
     }
 }

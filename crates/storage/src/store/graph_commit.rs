@@ -3049,6 +3049,7 @@ fn record_tombstone_version(writes: &mut VersionWriteSet, key: VersionKey) -> Re
 
 fn map_relational_staging_error(error: RelationalError) -> HawDBError {
     match error {
+        RelationalError::UnsupportedFormat(error) => HawDBError::UnsupportedStorageFormat(error),
         RelationalError::FileDescriptors(error) => HawDBError::FileDescriptors(error),
         RelationalError::Corruption(_) => HawDBError::StorageIntegrity(error.to_string()),
         RelationalError::Admission(_)

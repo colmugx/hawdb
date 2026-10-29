@@ -15,6 +15,66 @@
 use super::*;
 
 #[test]
+fn block_max_inherited_floor_prunes_before_the_local_window_fills() {
+    let root = projection_root("inherited-floor");
+    fs::create_dir_all(&root).unwrap();
+    let config = pruning_config(4);
+    let reader = pruning_corpus_reader(&root, config);
+    let terms = BTreeSet::from(["rare".to_owned(), "storage".to_owned()]);
+    let statistics = reader
+        .query_statistics(&terms, config.max_term_bytes)
+        .unwrap();
+    let baseline = reader
+        .score_with_global_statistics_and_pruning(
+            &terms,
+            config.max_term_bytes,
+            Some(4),
+            &statistics,
+            false,
+            |_| Ok(true),
+        )
+        .unwrap();
+    let floor = baseline
+        .scores
+        .values()
+        .copied()
+        .min_by(f64::total_cmp)
+        .unwrap();
+    for prune in [false, true] {
+        let output = reader
+            .score_terms_with_stable_filter_and_floor(
+                &terms,
+                ScoringInputs {
+                    delta: &LexicalMiniDelta::default(),
+                    max_term_bytes: config.max_term_bytes,
+                    retained_score_limit: Some(512),
+                    complete_candidate_limit: None,
+                    global_statistics: Some(&statistics),
+                    prune_blocks: prune,
+                    context: None,
+                },
+                Some(floor),
+                |_| Ok(true),
+            )
+            .unwrap();
+        let mut scores = output.report.scores.into_iter().collect::<Vec<_>>();
+        scores.sort_unstable_by(|(a, av), (b, bv)| bv.total_cmp(av).then_with(|| a.cmp(b)));
+        assert_eq!(
+            scores.into_iter().take(4).collect::<BTreeMap<_, _>>(),
+            baseline.scores
+        );
+        if prune {
+            assert!(output.report.blocks_skipped > 0);
+            assert!(output.report.postings_visited < baseline.postings_visited);
+        } else {
+            assert_eq!(output.report.matching_document_count, 512);
+            assert_eq!(output.report.blocks_skipped, 0);
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn block_max_randomized_filtered_overlay_matches_exhaustive_and_rebuilt() {
     let vocabulary = ["graph", "memory", "index", "query", "checkpoint", "wal"];
     let queries = [
@@ -176,8 +236,10 @@ fn block_max_stream_seek_skips_intermediate_payloads() {
     fs::create_dir_all(&root).unwrap();
     let config = pruning_config(4);
     let reader = pruning_corpus_reader(&root, config);
-    let mut exhaustive = TermPostingStream::new(&reader, "storage");
-    let mut pruned = TermPostingStream::new(&reader, "storage");
+    let exhaustive_buffer = RefCell::new(PostingReadBuffer::default());
+    let pruned_buffer = RefCell::new(PostingReadBuffer::default());
+    let mut exhaustive = TermPostingStream::new(&reader, "storage", &exhaustive_buffer);
+    let mut pruned = TermPostingStream::new(&reader, "storage", &pruned_buffer);
     assert_eq!(pruned.peek_ordinal().unwrap(), Some(0));
     pruned.skip_to(400).unwrap();
     while exhaustive

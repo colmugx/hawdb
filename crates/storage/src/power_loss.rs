@@ -69,6 +69,7 @@ pub enum ObservationBoundary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservationPoint {
     pub event: IoEvent,
+    /// Normalized project-relative path; empty denotes the captured root.
     pub relative_path: PathBuf,
     pub boundary: ObservationBoundary,
     pub skip_matches: usize,
@@ -101,13 +102,35 @@ pub struct PowerLossSnapshot {
 
 impl PowerLossModel {
     pub fn attach(project: &ProjectFileDescriptors, limits: ImageLimits) -> io::Result<Self> {
+        Self::attach_with_image(project, limits, None)
+    }
+
+    /// Continue recording recovery on an exact materialization of a previous
+    /// physical crash. Its surviving bytes and names form the durable baseline;
+    /// only subsequent real IO may change them. No runtime may already be open.
+    pub fn resume_from_image(
+        project: &ProjectFileDescriptors,
+        image: &CrashImage,
+        limits: ImageLimits,
+    ) -> io::Result<Self> {
+        Self::attach_with_image(project, limits, Some(image))
+    }
+
+    fn attach_with_image(
+        project: &ProjectFileDescriptors,
+        limits: ImageLimits,
+        baseline: Option<&CrashImage>,
+    ) -> io::Result<Self> {
         if !cfg!(any(unix, windows)) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "power-loss capture requires Unix or Windows native IO",
             ));
         }
-        let engine = ImageEngine::new(limits)?;
+        let engine = match baseline {
+            Some(image) => ImageEngine::from_crash_image(image, limits)?,
+            None => ImageEngine::new(limits)?,
+        };
         let mut slot = project.state.power_loss.lock().map_err(|_| poisoned())?;
         let metrics = project.metrics();
         if slot.upgrade().is_some() || metrics.open != 0 || metrics.reserved != 0 {
@@ -117,7 +140,14 @@ impl PowerLossModel {
         }
         let root_anchor =
             crate::file_io::PowerLossRoot::capture(project.root(), &project.io_context())?;
-        root_anchor.require_empty(project.root())?;
+        if let Some(image) = baseline {
+            #[cfg(any(target_os = "linux", target_vendor = "apple", windows))]
+            verification::verify(&root_anchor, image)?;
+            #[cfg(not(any(target_os = "linux", target_vendor = "apple", windows)))]
+            verify_native_tree(project.root(), image, &project.io_context())?;
+        } else {
+            root_anchor.require_empty(project.root())?;
+        }
         let core = Arc::new(ModelCore {
             root: project.root().to_path_buf(),
             root_anchor,
@@ -129,6 +159,21 @@ impl PowerLossModel {
             core,
             project: project.clone(),
         })
+    }
+
+    // Local fault collaborator for the real post-native observer error path.
+    // No global registration, I/O callback or production API is introduced.
+    #[cfg(test)]
+    pub(crate) fn poison_observation_for_test(&self) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _observation = self
+                .core
+                .observation
+                .lock()
+                .expect("unpoisoned test observer");
+            panic!("injected post-native observer poison");
+        }));
+        assert!(result.is_err());
     }
 
     pub fn capture(&self) -> io::Result<PowerLossSnapshot> {
@@ -183,11 +228,10 @@ impl PowerLossModel {
         file_name_prefix: Option<String>,
     ) -> io::Result<()> {
         let _engine = self.core.lock()?;
-        if point.relative_path.as_os_str().is_empty()
-            || !point
-                .relative_path
-                .components()
-                .all(|component| matches!(component, std::path::Component::Normal(_)))
+        if !point
+            .relative_path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
         {
             return Err(invalid(
                 "observation path must be normalized and project-relative",

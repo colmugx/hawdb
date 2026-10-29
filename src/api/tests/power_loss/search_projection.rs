@@ -288,6 +288,8 @@ fn partitioned_initial_publication_survives_lost_torn_and_reordered_writes() {
                 SearchOutOfCoreGenerationBuildOptions {
                     max_content_documents: NonZeroUsize::new(2).unwrap(),
                     source_graph_commit_epoch: Some(21),
+                    // This fixture requires the legacy compressed projection.
+                    vector_backend: None,
                     ..Default::default()
                 },
             )
@@ -489,10 +491,23 @@ fn retry_covers_existing_unsynchronized_component_ancestry() {
     assert_eq!(project.metrics().open, baseline.open);
     assert_eq!(project.metrics().reserved, baseline.reserved);
 
-    // This standalone writer synchronizes ancestors one at a time. The same
-    // single free slot then admits its spool beside the model's root anchor.
+    // Windows audits the retained root's full native identity through a second
+    // counted handle. Refusal must refund the file-operation slot as well.
+    if cfg!(windows) {
+        with_reserved_descriptors(&project, available - 1, || {
+            let error =
+                SearchOutOfCoreGenerationWriter::create(&root, Default::default()).unwrap_err();
+            assert!(matches!(error, HawDBError::FileDescriptors(_)), "{error:?}");
+        });
+        assert_eq!(project.metrics().open, baseline.open);
+        assert_eq!(project.metrics().reserved, baseline.reserved);
+    }
+
+    // Ancestors synchronize one at a time. Windows also funds the temporary
+    // root-identity audit; the completed writer retains only its spool handle.
     // Captured, governed Consumer staging has a separate directory inventory.
-    with_reserved_descriptors(&project, available - 1, || {
+    let working_descriptors = if cfg!(windows) { 2 } else { 1 };
+    with_reserved_descriptors(&project, available - working_descriptors, || {
         let writer = SearchOutOfCoreGenerationWriter::create(&root, Default::default()).unwrap();
         assert_eq!(project.metrics().open, baseline.open + 1);
         drop(writer);
@@ -728,7 +743,7 @@ fn fault_plans(snapshot: &PowerLossSnapshot, event: IoEvent) -> Vec<CrashPlan> {
     plans
 }
 
-fn same_physical_image(
+pub(super) fn same_physical_image(
     left: &hawdb_storage::power_loss::image::CrashImage,
     right: &hawdb_storage::power_loss::image::CrashImage,
 ) -> bool {

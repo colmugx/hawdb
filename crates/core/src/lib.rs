@@ -36,12 +36,12 @@ pub use cancellation::{
     RuntimeCancellationFuture, RuntimeCancellationReason, RuntimeCancellationToken,
     RuntimeIoWaveController, RuntimeIoWaveError, RuntimeIoWavePermit, RuntimeIoWaveTryAcquire,
     RuntimeMemoryController, RuntimeMemoryError, RuntimeMemoryPermit, RuntimeMemoryReservation,
-    RuntimeTaskContext,
+    RuntimeMemoryTarget, RuntimeTaskContext,
 };
 pub use capability::{RuntimeCapabilities, RuntimeCapability};
 pub use error::{
     HawDBError, ReadBudgetError, ReadBudgetResource, ResourceBudgetError, ResourceBudgetKind,
-    ResourceBudgetScope, Result,
+    ResourceBudgetScope, Result, StorageFormatError,
 };
 pub use graph::RelationshipDirection;
 pub use graph_rag::{
@@ -70,8 +70,8 @@ pub use uuidv7::generate_uuidv7;
 pub use value::{Value, ValueRef};
 pub use vector::{Vector, VectorDistance, VectorRef};
 pub use vector_index::{
-    VectorIndexBackend, VectorIndexDescriptor, VectorIndexQueryMode, VectorIndexReadIdentity,
-    VectorIndexTarget,
+    VectorIndexBackend, VectorIndexDescriptor, VectorIndexLsg, VectorIndexQueryMode,
+    VectorIndexReadIdentity, VectorIndexTarget,
 };
 
 #[doc(hidden)]

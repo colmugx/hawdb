@@ -75,6 +75,9 @@ impl<'a> CheckpointFileInput<'a> {
 }
 
 impl DecodeInput for CheckpointFileInput<'_> {
+    fn codec_version(&self) -> Option<u16> {
+        self.inner.codec_version()
+    }
     fn checkpoint_work_context(&self) -> Option<&CheckpointWorkContext> {
         Some(self.work)
     }

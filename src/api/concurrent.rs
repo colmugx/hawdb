@@ -502,7 +502,7 @@ impl ConcurrentDatabase {
         let cypher_text = request.cypher;
         let started = Instant::now();
         let view = self.inner.commits.read_view()?;
-        let prepared = match view.prepare(request) {
+        let mut prepared = match view.prepare(request) {
             Ok(prepared) => prepared,
             Err(_) => {
                 // Failed preparation cannot prove that the statement is read-only. Re-run it
@@ -526,6 +526,7 @@ impl ConcurrentDatabase {
         }
         let statement_kind = prepared.statement_kind();
         let parse_nanos = prepared.parse_nanos();
+        let query_identity = prepared.take_query_identity(cypher_text);
         #[cfg(test)]
         self.wait_after_autocommit_read_snapshot()?;
         let result = self
@@ -539,6 +540,7 @@ impl ConcurrentDatabase {
             started,
             result.as_ref().map(|profiled| &profiled.output),
             StatementExecutionContext {
+                query_identity: query_identity.as_ref(),
                 execution_profile: result
                     .as_ref()
                     .ok()

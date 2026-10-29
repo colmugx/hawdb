@@ -45,16 +45,48 @@ impl Options {
     }
 
     pub(super) fn new(
-        value: SearchOutOfCoreGenerationBuildOptions,
+        mut value: SearchOutOfCoreGenerationBuildOptions,
         memory: &BuildMemory,
         task: &RuntimeTaskContext,
     ) -> Result<Self> {
         checkpoint(task)?;
+        Self::apply_backend_options(&mut value)?;
         let lease = memory.retained.reserve(options_bytes(&value, task)?)?;
         Ok(Self {
             value,
             _memory: lease,
         })
+    }
+
+    fn apply_backend_options(value: &mut SearchOutOfCoreGenerationBuildOptions) -> Result<()> {
+        if value.vector_index_descriptor.is_none()
+            && let Some(hawdb_core::VectorIndexBackend::RaBitQ {
+                bit_width,
+                segment_rows,
+                transform_seed,
+            }) = value.vector_backend
+        {
+            #[cfg(feature = "vector-search")]
+            {
+                value.rabitq_bit_width = match bit_width {
+                    1 => hawdb_vector_projection::RaBitQBitWidth::One,
+                    4 => hawdb_vector_projection::RaBitQBitWidth::Four,
+                    _ => {
+                        return Err(crate::HawDBError::Semantic(
+                            "RaBitQ bit width must be 1 or 4".into(),
+                        ))
+                    }
+                };
+            }
+            #[cfg(not(feature = "vector-search"))]
+            let _ = bit_width;
+            value.rabitq_segment_rows = std::num::NonZeroUsize::new(segment_rows as usize)
+                .ok_or_else(|| {
+                    crate::HawDBError::Semantic("RaBitQ segment rows must be positive".into())
+                })?;
+            value.rabitq_transform_seed = transform_seed;
+        }
+        Ok(())
     }
 
     pub(super) fn bind_delta_identity(
@@ -109,6 +141,18 @@ impl Options {
                 "search generation update analyzer does not match the active generation".into(),
             ));
         }
+        #[cfg(feature = "vector-search")]
+        if reader.manifest.vector_index_binding.is_none()
+            && let Some(projection) = reader
+                .segments
+                .iter()
+                .find_map(|artifact| artifact.rabitq_projection.as_ref())
+        {
+            // A delta inherits the pinned base's algorithm and topology settings.
+            // Changing a backend requires a full replacement, never mixed layers.
+            self.value.vector_backend = Some(projection.backend()?);
+            Self::apply_backend_options(&mut self.value)?;
+        }
         if reader.manifest.vector_index_binding.is_some()
             || self.value.vector_index_descriptor.is_some()
         {
@@ -137,12 +181,13 @@ impl Options {
             let retained_bytes = expected_binding
                 .as_ref()
                 .map_or(0, hawdb_core::VectorIndexDescriptor::retained_bytes);
-            if let Some(binding) = &expected_binding {
-                let hawdb_core::VectorIndexBackend::RaBitQ {
+            if let Some(binding) = &expected_binding
+                && let hawdb_core::VectorIndexBackend::RaBitQ {
                     bit_width,
                     segment_rows,
                     transform_seed,
-                } = binding.backend();
+                } = binding.backend()
+            {
                 #[cfg(feature = "vector-search")]
                 {
                     self.value.rabitq_bit_width = match bit_width {

@@ -75,6 +75,17 @@ default dictionary remains unchanged: 349,045 distinct words, at most seven
 nested matching prefixes, and SHA-256
 `139519822fe8ab9e10d9d07e68ea0451045380aedaf54ecc51e2a28c6b42a13f`.
 
+HawDB embeds those exact MIT-licensed bytes as a compressed resource and streams
+them through its patched Zstd dependency into Jieba's public `with_dict` loader.
+Jieba's default dictionary feature is disabled, removing include-flate and its
+older Zstd dependency from the selected graph. The analyzer fingerprint and TLS
+capacity model remain unchanged. The standalone allocator qualification imports
+the production dictionary loader as well as the production capacity formulas.
+Dictionary initialization and residency remain separate process-owner costs;
+the [fixed-resource probe](benchmarks/jieba_dictionary_loading_2026_10_27/README.md)
+records the lower retained Rust allocation and higher temporary initialization
+peak rather than treating them as operation-account or process-RSS bounds.
+
 For scalar count C, `bounds::scratch_retained` reserves geometric capacity for
 C+1 route records (three words each), at most 8C encoded DAG edges, C+1 DAG start
 offsets, C decoded character/offset pairs, 4C HMM predecessor states and C best-path

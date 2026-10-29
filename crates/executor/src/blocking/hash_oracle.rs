@@ -186,8 +186,9 @@ fn rows(seed: u64) -> Vec<Binding> {
                         labels: BTreeSet::new(),
                         properties,
                     },
-                )]),
-                relationships: BTreeMap::new(),
+                )])
+                .into(),
+                relationships: BTreeMap::new().into(),
             }
         })
         .collect()
@@ -319,9 +320,10 @@ fn partial_spill_workload_keeps_the_existing_run_budget() {
                                 ("value".into(), Value::Int(index as i64)),
                             ]),
                         },
-                    )]),
+                    )])
+                    .into(),
                     values: BTreeMap::new(),
-                    relationships: BTreeMap::new(),
+                    relationships: BTreeMap::new().into(),
                 })
                 .collect(),
             batch_rows: 1024,

@@ -115,6 +115,30 @@ pub fn format_hawdb_error(error: &HawDBError) -> PyErr {
         HawDBError::Parse(_) => ParseError::new_err(message),
         HawDBError::Semantic(_) => SemanticError::new_err(message),
         HawDBError::Storage(_) => StorageError::new_err(message),
+        HawDBError::WalRecoveryIo {
+            operation,
+            kind,
+            os_code,
+            ..
+        } => Python::attach(|py| {
+            let exception = StorageError::new_err(message);
+            let value = exception.value(py);
+            let attributes = (|| -> PyResult<()> {
+                value.setattr("kind", "wal_recovery_io")?;
+                value.setattr("operation", *operation)?;
+                value.setattr("io_kind", format!("{kind:?}"))?;
+                value.setattr("os_code", *os_code)?;
+                value.setattr("retryable", true)
+            })();
+            attributes.err().unwrap_or(exception)
+        }),
+        HawDBError::UnsupportedStorageFormat(_) => Python::attach(|py| {
+            let exception = StorageError::new_err(message);
+            let attributes = exception
+                .value(py)
+                .setattr("kind", "unsupported_storage_format");
+            attributes.err().unwrap_or(exception)
+        }),
         HawDBError::FileDescriptors(_) => DescriptorError::new_err(message),
         HawDBError::StorageIntegrity(_) => IntegrityError::new_err(message),
         HawDBError::ResourceBudgetExceeded(budget) => Python::attach(|py| {
@@ -197,6 +221,31 @@ pub fn register_exceptions(py: Python<'_>, module: &Bound<'_, PyModule>) -> PyRe
 mod tests {
     use super::*;
     use hawdb::{ResourceBudgetKind, ResourceBudgetScope};
+
+    #[test]
+    fn unsupported_storage_format_is_not_a_python_integrity_error() {
+        Python::initialize();
+        Python::attach(|py| {
+            let error = format_hawdb_error(&HawDBError::UnsupportedStorageFormat(
+                hawdb::StorageFormatError::UnsupportedVersion {
+                    format: "append WAL",
+                    found: 4,
+                    supported: 3,
+                },
+            ));
+            assert!(error.is_instance_of::<StorageError>(py));
+            assert!(!error.is_instance_of::<IntegrityError>(py));
+            assert_eq!(
+                error
+                    .value(py)
+                    .getattr("kind")
+                    .unwrap()
+                    .extract::<String>()
+                    .unwrap(),
+                "unsupported_storage_format"
+            );
+        });
+    }
 
     #[test]
     fn embedded_resource_errors_keep_python_type_message_and_fields() {

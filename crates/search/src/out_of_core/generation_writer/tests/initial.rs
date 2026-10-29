@@ -214,7 +214,11 @@ fn initial_prefixes_never_replace_the_active_selector_on_injected_publication_fa
 fn initial_total_publication_budget_keeps_the_previous_complete_dataset() {
     let root = test_dir("initial_complete_budget");
     let previous = document(99);
-    let mut writer = SearchOutOfCoreGenerationWriter::create(&root, Default::default()).unwrap();
+    let legacy = SearchOutOfCoreGenerationBuildOptions {
+        vector_backend: None,
+        ..Default::default()
+    };
+    let mut writer = SearchOutOfCoreGenerationWriter::create(&root, legacy.clone()).unwrap();
     writer.push(previous.clone()).unwrap();
     let reference = writer.finish().unwrap();
     let before = fs::read(root.join(OUT_OF_CORE_MANIFEST_FILE)).unwrap();
@@ -223,7 +227,7 @@ fn initial_total_publication_budget_keeps_the_previous_complete_dataset() {
         SearchOutOfCoreGenerationBuildOptions {
             max_content_documents: NonZeroUsize::new(1).unwrap(),
             max_generation_bytes: NonZeroU64::new(2 * reference.generation_bytes).unwrap(),
-            ..Default::default()
+            ..legacy
         },
     )
     .unwrap();
@@ -351,6 +355,7 @@ fn initial_partition_queries_and_sparse_metadata_match_one_content_segment() {
             SearchOutOfCoreGenerationBuildOptions {
                 max_content_documents: NonZeroUsize::new(if index == 0 { 2 } else { 8192 })
                     .unwrap(),
+                vector_backend: None,
                 ..Default::default()
             },
         )

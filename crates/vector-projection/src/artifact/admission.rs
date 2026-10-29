@@ -30,7 +30,7 @@ pub trait ProjectionReadAdmission {
     fn checkpoint(&self) -> Result<()>;
 }
 
-pub(super) struct Unaccounted;
+pub(crate) struct Unaccounted;
 impl ProjectionReadAdmission for Unaccounted {
     type Retained = ();
     type Scratch = ();

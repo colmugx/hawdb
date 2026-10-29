@@ -44,6 +44,7 @@ impl Fixture {
         let task = RuntimeTaskContext::default()
             .with_memory_reservation(RuntimeMemoryReservation::new(budget as u64, 0));
         let options = super::super::SearchOutOfCoreGenerationBuildOptions {
+            vector_backend: None,
             rabitq_bit_width: bits,
             rabitq_segment_rows: NonZeroUsize::new(rows).unwrap(),
             ..Default::default()
@@ -80,7 +81,7 @@ fn native_vector_state_is_admitted_before_core_creation() {
     let fixture = Fixture::new(1024 * 1024, 4096, RaBitQBitWidth::Four, 1024);
     let baseline = fixture.used();
     evidence::take();
-    let error = RaBitQArtifactBuilder::new(&fixture.input, 1).err().unwrap();
+    let error = VectorArtifactBuilder::new(&fixture.input, 1).err().unwrap();
     assert!(error.to_string().contains("query memory"), "{error}");
     assert_eq!(evidence::take(), (0, 0, 0));
     assert_eq!(fixture.used(), baseline);
@@ -98,7 +99,7 @@ fn vector_push_shares_other_stage_capacity_and_poisoning_prevents_retry() {
         let fixture = Fixture::new(32 * 1024 * 1024, 64, bits, 4);
         let baseline = fixture.used();
         evidence::take();
-        let mut builder = RaBitQArtifactBuilder::new(&fixture.input, 1).unwrap();
+        let mut builder = VectorArtifactBuilder::new(&fixture.input, 1).unwrap();
         let held = fixture.occupy_remaining();
         let error = builder.push(&fixture.document).unwrap_err();
         assert!(error.to_string().contains("query memory"), "{error}");
@@ -119,7 +120,7 @@ fn vector_push_shares_other_stage_capacity_and_poisoning_prevents_retry() {
 fn vector_finalization_admission_precedes_core_finish_and_reopen() {
     let fixture = Fixture::new(32 * 1024 * 1024, 64, RaBitQBitWidth::Four, 1);
     let baseline = fixture.used();
-    let mut builder = RaBitQArtifactBuilder::new(&fixture.input, 1).unwrap();
+    let mut builder = VectorArtifactBuilder::new(&fixture.input, 1).unwrap();
     builder.push(&fixture.document).unwrap();
     evidence::take();
     let held = fixture.occupy_remaining();
@@ -146,7 +147,7 @@ fn vector_directory_growth_is_admitted_before_flushing_another_segment() {
         fixture.input.push(next).unwrap();
     }
     let baseline = fixture.used();
-    let mut builder = RaBitQArtifactBuilder::new(&fixture.input, 1).unwrap();
+    let mut builder = VectorArtifactBuilder::new(&fixture.input, 1).unwrap();
     for _ in 0..4 {
         builder.push(&fixture.document).unwrap();
     }
@@ -168,7 +169,7 @@ fn reopened_vector_state_and_returned_name_keep_their_owning_leases() {
         let memory = fixture.memory.clone();
         evidence::take();
         evidence::take_reopened_bytes();
-        let mut builder = RaBitQArtifactBuilder::new(&fixture.input, u64::MAX).unwrap();
+        let mut builder = VectorArtifactBuilder::new(&fixture.input, u64::MAX).unwrap();
         builder.push(&fixture.document).unwrap();
         let before_finish = fixture.used();
         let output = builder.finish().unwrap().unwrap();

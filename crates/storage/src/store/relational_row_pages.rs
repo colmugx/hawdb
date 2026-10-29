@@ -1461,7 +1461,8 @@ impl GraphStore {
                     schema.name
                 );
                 match error {
-                    hawdb_storage::relational::RelationalRowPageSnapshotReadError::FileDescriptors(error) => crate::error::HawDBError::FileDescriptors(error),
+                    hawdb_storage::relational::RelationalRowPageSnapshotReadError::UnsupportedFormat(error) => crate::error::HawDBError::UnsupportedStorageFormat(error),
+        hawdb_storage::relational::RelationalRowPageSnapshotReadError::FileDescriptors(error) => crate::error::HawDBError::FileDescriptors(error),
                     hawdb_storage::relational::RelationalRowPageSnapshotReadError::Corrupt(_)
                     | hawdb_storage::relational::RelationalRowPageSnapshotReadError::MissingTable(
                         _,
@@ -1596,16 +1597,22 @@ impl GraphStore {
             Arc::clone(&resources.cache),
             resources.store_id,
         )
-        .map_err(|error| {
-            crate::error::HawDBError::StorageIntegrity(format!(
+        .map_err(|error| match error {
+            RelationalRowPageSnapshotReadError::UnsupportedFormat(error) => {
+                crate::error::HawDBError::UnsupportedStorageFormat(error)
+            }
+            error => crate::error::HawDBError::StorageIntegrity(format!(
                 "canonical relational row reader could not open: {error}"
-            ))
+            )),
         })
     }
 }
 
 fn map_sparse_row_delta_error(error: RelationalRowDeltaError) -> RelationalError {
     match error {
+        RelationalRowDeltaError::UnsupportedFormat(error) => {
+            RelationalError::UnsupportedFormat(error)
+        }
         RelationalRowDeltaError::FileDescriptors(error) => RelationalError::FileDescriptors(error),
         RelationalRowDeltaError::Admission(message)
         | RelationalRowDeltaError::Invalidated(message) => RelationalError::Admission(message),
@@ -1617,6 +1624,9 @@ fn map_sparse_row_delta_error(error: RelationalRowDeltaError) -> RelationalError
         }
         RelationalRowDeltaError::Corrupt(message)
         | RelationalRowDeltaError::Durability(message) => RelationalError::Corruption(message),
+        RelationalRowDeltaError::Publication(
+            hawdb_storage::relational::RelationalRowPagePublicationError::UnsupportedFormat(error),
+        ) => RelationalError::UnsupportedFormat(error),
         error @ (RelationalRowDeltaError::Publication(_)
         | RelationalRowDeltaError::Row(_)
         | RelationalRowDeltaError::StaleGeneration { .. }
@@ -1660,6 +1670,9 @@ fn clone_sparse_recovery_key_with_work_context(
 
 fn map_sparse_snapshot_read_error(error: RelationalRowPageSnapshotReadError) -> RelationalError {
     match error {
+        RelationalRowPageSnapshotReadError::UnsupportedFormat(error) => {
+            RelationalError::UnsupportedFormat(error)
+        }
         RelationalRowPageSnapshotReadError::FileDescriptors(error) => {
             RelationalError::FileDescriptors(error)
         }
@@ -2680,6 +2693,7 @@ mod tests {
             &mut read_only_catalog,
             DurabilityPolicy::default(),
             WalReplayConfig {
+                recovery_mode: crate::config::RecoveryMode::Strict,
                 residency_mode: StorageResidencyMode::OutOfCore,
                 relational_index_mode: RelationalIndexMode::Shadow,
                 ..WalReplayConfig::default()
@@ -2749,6 +2763,7 @@ mod tests {
             &mut read_only_catalog,
             DurabilityPolicy::default(),
             WalReplayConfig {
+                recovery_mode: crate::config::RecoveryMode::Strict,
                 residency_mode: StorageResidencyMode::OutOfCore,
                 relational_index_mode: RelationalIndexMode::Authoritative,
                 ..WalReplayConfig::default()
@@ -2815,6 +2830,7 @@ mod tests {
             &mut missing_index_catalog,
             DurabilityPolicy::default(),
             WalReplayConfig {
+                recovery_mode: crate::config::RecoveryMode::Strict,
                 residency_mode: StorageResidencyMode::OutOfCore,
                 relational_index_mode: RelationalIndexMode::Authoritative,
                 ..WalReplayConfig::default()
@@ -2868,6 +2884,7 @@ mod tests {
             &mut catalog,
             DurabilityPolicy::default(),
             WalReplayConfig {
+                recovery_mode: crate::config::RecoveryMode::Strict,
                 residency_mode: StorageResidencyMode::OutOfCore,
                 relational_index_mode: RelationalIndexMode::Authoritative,
                 ..WalReplayConfig::default()

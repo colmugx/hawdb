@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Joint source/mapping/stage custody. This does not certify a baseline or permit activation.
 use super::*;
@@ -63,6 +63,8 @@ pub struct ProjectionStagingSessionConfig {
 /// Every input remains owned by the session until the mapper acknowledges Done.
 #[derive(Debug, Clone, Copy)]
 pub enum ProjectionMappingInput<'a> {
+    /// A native changed key; a missing end-epoch node denotes deletion for the
+    /// fixed projector, even when there is no built-in Search document ID.
     GraphNode {
         epoch: u64,
         node_id: u64,

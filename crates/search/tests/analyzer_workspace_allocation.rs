@@ -18,13 +18,13 @@
 mod allocation;
 #[path = "../src/analyzer_workspace/bounds.rs"]
 mod bounds;
-
-use jieba_rs::Jieba;
+#[path = "../src/cjk_dictionary.rs"]
+mod cjk_dictionary;
 
 #[test]
 fn opaque_workspace_capacity_covers_construction_growth_and_tls_destruction() {
     // Dictionary residency is a shared process owner, outside the operation.
-    let jieba = Jieba::new();
+    let jieba = cjk_dictionary::load();
     let (regex, peak) = allocation::measure(|| regex::Regex::new(bounds::REGEX_PATTERN).unwrap());
     assert!(peak <= bounds::regex_retained().unwrap() + bounds::regex_construction().unwrap());
     assert!(allocation::live() <= bounds::regex_retained().unwrap());

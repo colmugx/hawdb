@@ -258,12 +258,14 @@ streaming, EXPLAIN ANALYZE, and system SQL results; callers may further tighten
 the limits, while unbounded results require explicitly setting both fields to
 `None`. `max_optimizer_groups` caps cascades memo search groups with
 the existing deterministic direct physical fallback warning. `recovery_mode`
-defaults to strict WAL replay. A torn tail or checksum mismatch rejects every
-database open. Torn-tail repair is a separate typed `DatabaseDoctor` operation:
-first produce a generation-bound dry-run plan, then explicitly acknowledge that
-exact plan before an original-WAL quarantine copy, repair audit, and truncation
-can be published. `DoctorRepairTornTail` remains a report-compatibility value
-and is rejected by the database-open path.
+defaults to `AutoRepairTornTail` for writable opens. Read-only opens explicitly
+select `Strict`. Automatic recovery preserves a bounded discarded suffix and
+identity-bound audit before truncating a physical torn tail or an unsynchronized
+suffix authorized by its durable fence. Protected-prefix corruption fails
+closed. Explicit repair uses the separate typed `DatabaseDoctor` dry-run plan
+and exact acknowledgement. `DoctorRepairTornTail` remains a report-compatibility
+value rejected by database open. See [the recovery protocol](STORAGE.md#wal-recovery)
+for classification, typed reports and retry barriers.
 `max_wal_replay_entries` caps startup WAL replay after valid record decode and
 before applying the next record; it counts top-level WAL records rather than
 child operations inside a batch, preserving batch replay atomicity. Mutation

@@ -1,8 +1,60 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 use super::*;
 use hawdb_executor::{QueryMemoryClass, QueryMemoryLedger};
+
+#[test]
+#[ignore = "manual allocation measurement; excludes input construction"]
+fn rank_id_allocation_measurement() {
+    let _serial = crate::test_allocation::serial();
+    let scores = BTreeMap::from([
+        (format!("a{}", "x".repeat(65536)), 2.0),
+        (format!("b{}", "x".repeat(65536)), 1.0),
+    ]);
+    let before = crate::test_allocation::live();
+    let ((ranks, window), peak) = crate::test_allocation::measure(|| {
+        let ranks = Ranks::new(&scores, None).unwrap();
+        let window = ranks.window(Some(2), None).unwrap();
+        (ranks, window)
+    });
+    assert_eq!(window.len(), 2);
+    eprintln!(
+        "ranking input_id_bytes={} retained_peak_bytes={}",
+        scores.keys().map(String::len).sum::<usize>(),
+        peak.saturating_sub(before)
+    );
+    drop(window);
+    drop(ranks);
+    assert_eq!(crate::test_allocation::live(), before);
+}
+
+#[test]
+fn ranks_and_windows_borrow_wide_ids_with_a_small_working_budget() {
+    let budget = NonZeroUsize::new(32 << 10).unwrap();
+    let ledger = QueryMemoryLedger::new(budget);
+    let memory = ledger.account(QueryMemoryClass::BlockingState, "borrowed ranks", budget);
+    let task = crate::RuntimeTaskContext::default();
+    let context = Some(QueryContext {
+        memory: &memory,
+        task: &task,
+        execution: None,
+        io_scope: None,
+    });
+    let scores = BTreeMap::from([
+        (format!("a{}", "x".repeat(65536)), 1.0),
+        (format!("b{}", "x".repeat(65536)), 1.0),
+    ]);
+    let ranks = Ranks::new(&scores, context).unwrap();
+    let window = ranks.window(Some(1), context).unwrap();
+    assert_eq!(window.len(), 1);
+    let (&id, &rank) = window.first_key_value().unwrap();
+    assert_eq!(rank, 1);
+    assert_eq!(id.as_ptr(), scores.first_key_value().unwrap().0.as_ptr());
+    drop(window);
+    drop(ranks);
+    assert_eq!(ledger.snapshot().used_bytes, 0);
+}
 
 #[test]
 fn admitted_ranking_preserves_ties_windows_offsets_and_payload_lifetime() {
@@ -22,7 +74,13 @@ fn admitted_ranking_preserves_ties_windows_offsets_and_payload_lifetime() {
         for window in [None, Some(0), Some(1), Some(2)] {
             let text_ranks = Ranks::new(&text, context).unwrap();
             let vector_ranks = Ranks::new(&vector, context).unwrap();
-            assert_eq!(text_ranks.values, ranked_scores(&text));
+            assert_eq!(
+                text_ranks.values,
+                crate::ranked_scores(&text)
+                    .iter()
+                    .map(|(id, rank)| (id.as_str(), *rank))
+                    .collect()
+            );
             let text_window = text_ranks.window(window, context).unwrap();
             let vector_window = vector_ranks.window(window, context).unwrap();
             let expected = match (mode, window) {

@@ -360,8 +360,8 @@ fn shortest_path_binding(
     }
     Ok(Binding {
         values,
-        nodes: BTreeMap::new(),
-        relationships: BTreeMap::new(),
+        nodes: BTreeMap::new().into(),
+        relationships: BTreeMap::new().into(),
     })
 }
 
@@ -1126,8 +1126,8 @@ pub fn thread_repair_stats_rows(
                     ),
                     ("COUNT(m)".to_string(), Value::Int(compacted_memories as i64)),
                 ]),
-            nodes: BTreeMap::new(),
-            relationships: BTreeMap::new(),
+            nodes: BTreeMap::new().into(),
+            relationships: BTreeMap::new().into(),
         };
         push_bounded_operator_binding("ThreadRepairStatsExec", &mut rows, binding, &mut tracker)?;
         tracker.release(thread_bytes);

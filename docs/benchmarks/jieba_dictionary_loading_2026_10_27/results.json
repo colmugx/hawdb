@@ -1,0 +1,525 @@
+{
+  "baseline_main": "75b87bac8",
+  "rust": "1.97.1",
+  "profile": "repository dev profile, opt-level=1, checked, unstripped",
+  "platform": "macOS arm64",
+  "metric": "requested Rust allocation sizes including conservative realloc overlap; excludes native allocations and RSS",
+  "source_files_sha256": {
+    "crates/search/src/cjk_dictionary.rs": "dd922e75911fdd9c2d95d59923a49f0d5e50dc83a57c27a9315fb8178129c7b6",
+    "crates/search/src/data/jieba-0.11.0.dict.txt.zst": "e7f58aba802185562a9314461a2a15fcb10df750f3f1470cb3c98eac677ce0df",
+    "docs/benchmarks/jieba_dictionary_loading_2026_10_27/probe.rs": "39f1bb5bbaf094e47659a55ab9894190ae25c88f052a2efb2fec73b5270710ff"
+  },
+  "initialization_samples": [
+    {
+      "elapsed_micros": 48492,
+      "mode": "default",
+      "rust_after_drop_bytes": 8388608,
+      "rust_peak_bytes": 34083600,
+      "rust_retained_bytes": 34070024,
+      "state": "Jieba { records_len: 349045, total_freq: 60101964 }"
+    },
+    {
+      "elapsed_micros": 67014,
+      "mode": "streamed",
+      "rust_after_drop_bytes": 0,
+      "rust_peak_bytes": 38415185,
+      "rust_retained_bytes": 29887224,
+      "state": "Jieba { records_len: 349045, total_freq: 60101964 }"
+    },
+    {
+      "elapsed_micros": 48509,
+      "mode": "default",
+      "rust_after_drop_bytes": 8388608,
+      "rust_peak_bytes": 34083600,
+      "rust_retained_bytes": 34070024,
+      "state": "Jieba { records_len: 349045, total_freq: 60101964 }"
+    },
+    {
+      "elapsed_micros": 65095,
+      "mode": "streamed",
+      "rust_after_drop_bytes": 0,
+      "rust_peak_bytes": 38415185,
+      "rust_retained_bytes": 29887224,
+      "state": "Jieba { records_len: 349045, total_freq: 60101964 }"
+    },
+    {
+      "elapsed_micros": 48459,
+      "mode": "default",
+      "rust_after_drop_bytes": 8388608,
+      "rust_peak_bytes": 34083600,
+      "rust_retained_bytes": 34070024,
+      "state": "Jieba { records_len: 349045, total_freq: 60101964 }"
+    },
+    {
+      "elapsed_micros": 64141,
+      "mode": "streamed",
+      "rust_after_drop_bytes": 0,
+      "rust_peak_bytes": 38415185,
+      "rust_retained_bytes": 29887224,
+      "state": "Jieba { records_len: 349045, total_freq: 60101964 }"
+    }
+  ],
+  "parity": {
+    "phrase_cases": 7198,
+    "state": "Jieba { records_len: 349045, total_freq: 60101964 }",
+    "token_fingerprint": "98656a1aec1b07c37baf1db9cbe652af896417f3f07debe59d6cad15d359a653",
+    "word_cases": 698090
+  },
+  "golden_cases": 48,
+  "lock_audit": [
+    {
+      "file": "Cargo.lock",
+      "added": [],
+      "removed": [
+        [
+          "adler32",
+          "1.2.0"
+        ],
+        [
+          "allocator-api2",
+          "0.2.21"
+        ],
+        [
+          "dary_heap",
+          "0.3.9"
+        ],
+        [
+          "equivalent",
+          "1.0.2"
+        ],
+        [
+          "foldhash",
+          "0.2.0"
+        ],
+        [
+          "hashbrown",
+          "0.16.1"
+        ],
+        [
+          "include-flate",
+          "0.3.4"
+        ],
+        [
+          "include-flate-codegen",
+          "0.3.4"
+        ],
+        [
+          "include-flate-compress",
+          "0.3.4"
+        ],
+        [
+          "libflate",
+          "2.3.1"
+        ],
+        [
+          "libflate_lz77",
+          "2.3.0"
+        ],
+        [
+          "no_std_io2",
+          "0.9.4"
+        ],
+        [
+          "proc-macro-error-attr3",
+          "3.1.0"
+        ],
+        [
+          "proc-macro-error3",
+          "3.1.0"
+        ],
+        [
+          "rle-decode-fast",
+          "1.0.3"
+        ],
+        [
+          "zstd",
+          "0.13.3"
+        ],
+        [
+          "zstd-safe",
+          "7.2.4"
+        ]
+      ],
+      "remaining_packages_unchanged": 178
+    },
+    {
+      "file": "bindings/ffi/Cargo.lock",
+      "added": [
+        [
+          "zstd",
+          "0.14.3"
+        ],
+        [
+          "zstd-safe",
+          "8.2.0"
+        ],
+        [
+          "zstd-sys",
+          "2.1.2+zstd.1.5.7"
+        ]
+      ],
+      "removed": [
+        [
+          "adler32",
+          "1.2.0"
+        ],
+        [
+          "allocator-api2",
+          "0.2.21"
+        ],
+        [
+          "dary_heap",
+          "0.3.9"
+        ],
+        [
+          "foldhash",
+          "0.2.0"
+        ],
+        [
+          "hashbrown",
+          "0.16.1"
+        ],
+        [
+          "include-flate",
+          "0.3.4"
+        ],
+        [
+          "include-flate-codegen",
+          "0.3.4"
+        ],
+        [
+          "include-flate-compress",
+          "0.3.4"
+        ],
+        [
+          "libflate",
+          "2.3.2"
+        ],
+        [
+          "libflate_lz77",
+          "2.3.0"
+        ],
+        [
+          "no_std_io2",
+          "0.9.4"
+        ],
+        [
+          "proc-macro-error-attr3",
+          "3.1.1"
+        ],
+        [
+          "proc-macro-error3",
+          "3.1.1"
+        ],
+        [
+          "rle-decode-fast",
+          "1.0.3"
+        ],
+        [
+          "zstd",
+          "0.13.3"
+        ],
+        [
+          "zstd",
+          "0.14.2"
+        ],
+        [
+          "zstd-safe",
+          "7.3.0"
+        ],
+        [
+          "zstd-safe",
+          "8.1.0"
+        ],
+        [
+          "zstd-sys",
+          "2.1.1+zstd.1.5.7"
+        ]
+      ],
+      "remaining_packages_unchanged": 177
+    },
+    {
+      "file": "tests/pg-regress/Cargo.lock",
+      "added": [],
+      "removed": [
+        [
+          "adler32",
+          "1.2.0"
+        ],
+        [
+          "allocator-api2",
+          "0.2.21"
+        ],
+        [
+          "crc32fast",
+          "1.5.3"
+        ],
+        [
+          "dary_heap",
+          "0.3.9"
+        ],
+        [
+          "equivalent",
+          "1.0.3"
+        ],
+        [
+          "foldhash",
+          "0.2.0"
+        ],
+        [
+          "hashbrown",
+          "0.16.1"
+        ],
+        [
+          "include-flate",
+          "0.3.4"
+        ],
+        [
+          "include-flate-codegen",
+          "0.3.4"
+        ],
+        [
+          "include-flate-compress",
+          "0.3.4"
+        ],
+        [
+          "libflate",
+          "2.3.2"
+        ],
+        [
+          "libflate_lz77",
+          "2.3.0"
+        ],
+        [
+          "no_std_io2",
+          "0.9.4"
+        ],
+        [
+          "proc-macro-error-attr3",
+          "3.1.1"
+        ],
+        [
+          "proc-macro-error3",
+          "3.1.1"
+        ],
+        [
+          "rle-decode-fast",
+          "1.0.3"
+        ],
+        [
+          "zstd",
+          "0.13.3"
+        ],
+        [
+          "zstd-safe",
+          "7.3.0"
+        ]
+      ],
+      "remaining_packages_unchanged": 185
+    },
+    {
+      "file": "tools/mvcc-fuzz/Cargo.lock",
+      "added": [
+        [
+          "zstd",
+          "0.14.3"
+        ],
+        [
+          "zstd-safe",
+          "8.2.0"
+        ],
+        [
+          "zstd-sys",
+          "2.1.2+zstd.1.5.7"
+        ]
+      ],
+      "removed": [
+        [
+          "adler32",
+          "1.2.0"
+        ],
+        [
+          "allocator-api2",
+          "0.2.21"
+        ],
+        [
+          "crc32fast",
+          "1.5.2"
+        ],
+        [
+          "dary_heap",
+          "0.3.9"
+        ],
+        [
+          "equivalent",
+          "1.0.2"
+        ],
+        [
+          "foldhash",
+          "0.2.0"
+        ],
+        [
+          "hashbrown",
+          "0.16.1"
+        ],
+        [
+          "include-flate",
+          "0.3.4"
+        ],
+        [
+          "include-flate-codegen",
+          "0.3.4"
+        ],
+        [
+          "include-flate-compress",
+          "0.3.4"
+        ],
+        [
+          "libflate",
+          "2.3.1"
+        ],
+        [
+          "libflate_lz77",
+          "2.3.0"
+        ],
+        [
+          "no_std_io2",
+          "0.9.4"
+        ],
+        [
+          "proc-macro-error-attr3",
+          "3.1.0"
+        ],
+        [
+          "proc-macro-error3",
+          "3.1.0"
+        ],
+        [
+          "rle-decode-fast",
+          "1.0.3"
+        ],
+        [
+          "zstd",
+          "0.13.3"
+        ],
+        [
+          "zstd",
+          "0.14.2"
+        ],
+        [
+          "zstd-safe",
+          "7.2.4"
+        ],
+        [
+          "zstd-safe",
+          "8.1.0"
+        ],
+        [
+          "zstd-sys",
+          "2.1.1+zstd.1.5.7"
+        ]
+      ],
+      "remaining_packages_unchanged": 142
+    },
+    {
+      "file": "tools/shiro/Cargo.lock",
+      "added": [
+        [
+          "zstd",
+          "0.14.3"
+        ],
+        [
+          "zstd-safe",
+          "8.2.0"
+        ],
+        [
+          "zstd-sys",
+          "2.1.2+zstd.1.5.7"
+        ]
+      ],
+      "removed": [
+        [
+          "adler32",
+          "1.2.0"
+        ],
+        [
+          "allocator-api2",
+          "0.2.21"
+        ],
+        [
+          "dary_heap",
+          "0.3.9"
+        ],
+        [
+          "equivalent",
+          "1.0.2"
+        ],
+        [
+          "foldhash",
+          "0.2.0"
+        ],
+        [
+          "hashbrown",
+          "0.16.1"
+        ],
+        [
+          "include-flate",
+          "0.3.4"
+        ],
+        [
+          "include-flate-codegen",
+          "0.3.4"
+        ],
+        [
+          "include-flate-compress",
+          "0.3.4"
+        ],
+        [
+          "libflate",
+          "2.3.1"
+        ],
+        [
+          "libflate_lz77",
+          "2.3.0"
+        ],
+        [
+          "no_std_io2",
+          "0.9.4"
+        ],
+        [
+          "proc-macro-error-attr3",
+          "3.1.0"
+        ],
+        [
+          "proc-macro-error3",
+          "3.1.0"
+        ],
+        [
+          "rle-decode-fast",
+          "1.0.3"
+        ],
+        [
+          "zstd",
+          "0.13.3"
+        ],
+        [
+          "zstd",
+          "0.14.2"
+        ],
+        [
+          "zstd-safe",
+          "7.2.4"
+        ],
+        [
+          "zstd-safe",
+          "8.1.0"
+        ],
+        [
+          "zstd-sys",
+          "2.1.1+zstd.1.5.7"
+        ]
+      ],
+      "remaining_packages_unchanged": 145
+    }
+  ]
+}

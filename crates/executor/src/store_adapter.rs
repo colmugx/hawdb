@@ -134,6 +134,27 @@ impl GraphExecutionRead for GraphStore {
         GraphStore::node_count_for_label(self, label_id)
     }
 
+    fn visit_indexed_projected_nodes_by_property_admitted(
+        &self,
+        label_id: LabelId,
+        property: &str,
+        values: &[hawdb_core::Value],
+        properties: &BTreeSet<String>,
+        admit: &mut hawdb_storage::read_view::GraphReadAllocator<'_>,
+        consumer: &mut dyn FnMut(ProjectedNodeRecord) -> Result<ScanControl>,
+    ) -> Result<Option<ScanControl>> {
+        GraphStore::visit_indexed_projected_nodes_by_property_admitted(
+            self,
+            label_id,
+            property,
+            values,
+            properties,
+            admit,
+            &mut |node| consumer(node).map(to_store_control),
+        )
+        .map(|control| control.map(to_execution_control))
+    }
+
     fn relationship_count_for_type(&self, rel_type: Option<RelTypeId>) -> usize {
         GraphStore::relationship_count_for_type(self, rel_type)
     }

@@ -15,12 +15,16 @@
 //! Borrowed immutable metadata for the ordinary reader refresh path.
 //! Production cleanup requires captured retention rather than pathname evidence.
 
-use super::{SearchOutOfCoreManifestBody, SearchOutOfCoreReader, SearchOutOfCoreSegmentReader};
+use super::{
+    mutation_run::MutationVisibility, SearchOutOfCoreManifestBody, SearchOutOfCoreReader,
+    SearchOutOfCoreSegmentReader,
+};
 
 #[derive(Clone, Copy)]
 pub(super) struct View<'a> {
     pub(super) manifest: &'a SearchOutOfCoreManifestBody,
     pub(super) segments: &'a [SearchOutOfCoreSegmentReader],
+    pub(super) visibility: &'a MutationVisibility,
 }
 
 impl<'a> View<'a> {
@@ -28,6 +32,7 @@ impl<'a> View<'a> {
         Self {
             manifest: &reader.manifest,
             segments: &reader.segments,
+            visibility: &reader.visibility,
         }
     }
 }

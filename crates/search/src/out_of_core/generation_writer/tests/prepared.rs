@@ -482,19 +482,55 @@ fn cleanup_defers_without_touching_artifacts_while_publication_owns_the_root() {
 #[cfg(feature = "vector-search")]
 #[test]
 fn stale_cleanup_preserves_a_peers_standalone_resident_vectors() {
+    for diskann in [false, true] {
+        check_stale_cleanup_resident_vectors(diskann);
+    }
+}
+
+#[cfg(feature = "vector-search")]
+fn check_stale_cleanup_resident_vectors(diskann: bool) {
     let root = test_dir("stale_cleanup_resident_vectors");
     let stale = crate::SearchIndex::open(&root).unwrap();
     stale.checkpoint().unwrap();
     let mut peer = crate::SearchIndex::open(&root).unwrap();
+    if !diskann {
+        peer.set_rabitq_projection_build_options(Default::default());
+    }
     peer.upsert(document(0)).unwrap();
     peer.checkpoint().unwrap();
     let artifact = crate::latest_rabitq_artifact(&root).unwrap().unwrap().1;
     assert!(artifact.exists());
+    let bytes = fs::read(&artifact).unwrap();
     stale.retry_projection_cleanup(Default::default());
     assert!(artifact.exists());
+    assert_eq!(fs::read(&artifact).unwrap(), bytes);
     drop(peer);
     let reopened = crate::SearchIndex::open(&root).unwrap();
-    assert!(reopened.rabitq_projection().is_some());
+    if diskann {
+        assert!(bytes.starts_with(b"HDANN002"));
+        let result = reopened
+            .search_with_options(
+                "",
+                Some(&[1.0, 0.0]),
+                crate::SearchMode::Vector,
+                crate::SearchQueryOptions {
+                    limit: 1,
+                    offset: 0,
+                    rank_window: None,
+                    fusion_weights: Default::default(),
+                    metadata_filters: Default::default(),
+                    policy_epoch: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(result.hits[0].id, document(0).id);
+        assert_eq!(
+            result.retrievers[0].backend,
+            "hawdb_diskann_candidate_projection"
+        );
+    } else {
+        assert!(reopened.rabitq_projection().is_some());
+    }
     drop(reopened);
     drop(stale);
     fs::remove_dir_all(root).unwrap();

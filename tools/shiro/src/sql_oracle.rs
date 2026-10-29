@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 
 mod extended;
 mod generator;
+pub(crate) mod stateful;
 
 pub(crate) fn extended_coverage(cases: &[JsonValue]) -> JsonValue {
     extended::coverage(cases)
@@ -455,6 +456,7 @@ pub struct SqlCaseReport {
     pub predicate_rewrite_failure: Option<SqlPredicateRewriteFailureReport>,
     pub join_rewrite_failure: Option<SqlJoinRewriteFailureReport>,
     pub extended: JsonValue,
+    pub maintenance: JsonValue,
 }
 
 pub(crate) fn sql_capability_profile_json(aggregate: bool) -> JsonValue {
@@ -507,6 +509,7 @@ impl SqlCaseReport {
     pub(crate) fn json(&self) -> JsonValue {
         json!({
             "extended": self.extended,
+            "maintenance": self.maintenance,
             "shape": self.shape,
             "predicate_rewrite_shape": self.predicate_rewrite_shape,
             "join_rewrite_shape": self.join_rewrite_shape,
@@ -624,8 +627,10 @@ pub(crate) fn evaluate_sql_case(seed: u64, index: usize, index_enabled: bool) ->
     let join_rewrite_planning = join_rewrite_evidence.optimized.join_planning.clone();
 
     let extended = extended::evaluate(&case);
+    let maintenance = stateful::evaluate(seed, index);
     SqlCaseReport {
         extended: extended.clone(),
+        maintenance: maintenance.clone(),
         shape: case.shape.clone(),
         predicate_rewrite_shape: case.predicate_rewrite.name.clone(),
         join_rewrite_shape: case.join_rewrite.name.clone(),
@@ -634,7 +639,8 @@ pub(crate) fn evaluate_sql_case(seed: u64, index: usize, index_enabled: bool) ->
             && aggregate_tlp_success
             && predicate_rewrite_success
             && join_rewrite_success
-            && extended["success"] == true,
+            && extended["success"] == true
+            && maintenance["success"] == true,
         row_tlp_success,
         aggregate_tlp_success,
         predicate_rewrite_success,

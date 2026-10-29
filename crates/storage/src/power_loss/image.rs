@@ -166,6 +166,65 @@ impl ImageEngine {
         })
     }
 
+    /// A previous crash has already selected its physical bytes and names.
+    /// Start a new history from that stable image, preserving file aliases.
+    pub(super) fn from_crash_image(image: &CrashImage, limits: ImageLimits) -> io::Result<Self> {
+        let mut engine = Self::new(limits)?;
+        engine.next_inode = image
+            .files
+            .values()
+            .map(|(inode, _)| *inode)
+            .max()
+            .unwrap_or(1)
+            .checked_add(1)
+            .ok_or_else(|| invalid("crash image inode sequence overflow"))?;
+        for (inode, bytes) in image.files.values() {
+            if engine.inodes.contains_key(inode) {
+                if !matches!(engine.inodes.get(inode), Some(Inode::File { current, .. }) if current == bytes)
+                {
+                    return Err(invalid("crash image aliases differ"));
+                }
+                continue;
+            }
+            engine.admit_new_inode()?;
+            engine.admit_operations(0, bytes.len())?;
+            engine.inodes.insert(
+                *inode,
+                Inode::File {
+                    current: Arc::clone(bytes),
+                    durable: Arc::clone(bytes),
+                },
+            );
+        }
+        for path in &image.directories {
+            if path.as_os_str().is_empty() {
+                continue;
+            }
+            let inode = engine.allocate_inode(Inode::Directory {
+                current: BTreeMap::new(),
+                durable: BTreeMap::new(),
+            })?;
+            engine.install_baseline_entry(path, inode)?;
+        }
+        for (path, (inode, _)) in &image.files {
+            engine.install_baseline_entry(path, *inode)?;
+        }
+        engine.completed_file_barriers = image.file_barriers;
+        engine.completed_directory_barriers = image.directory_barriers;
+        Ok(engine)
+    }
+
+    fn install_baseline_entry(&mut self, path: &Path, inode: InodeId) -> io::Result<()> {
+        let (parent, name) = self.parent(path)?;
+        self.require_absent(parent, &name)?;
+        let Some(Inode::Directory { current, durable }) = self.inodes.get_mut(&parent) else {
+            return Err(invalid("crash image parent is not a directory"));
+        };
+        current.insert(name.clone(), inode);
+        durable.insert(name, inode);
+        Ok(())
+    }
+
     pub fn inode(&self, path: &Path) -> io::Result<InodeId> {
         let components = relative_components(path)?;
         let mut inode = 1;
@@ -200,6 +259,19 @@ impl ImageEngine {
             .get(child_name(name)?)
             .copied()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "image child is absent"))
+    }
+
+    /// Borrow bounded modeled direct entries; never enumerate a native path or
+    /// allocate a second namespace image merely to resolve a native spelling.
+    #[cfg(target_vendor = "apple")]
+    pub(super) fn directory_entries(
+        &self,
+        directory: InodeId,
+    ) -> io::Result<impl Iterator<Item = (&OsStr, InodeId)> + '_> {
+        Ok(self
+            .current_directory(directory)?
+            .iter()
+            .map(|(name, inode)| (name.as_os_str(), *inode)))
     }
 
     pub fn create_file(&mut self, path: &Path) -> io::Result<InodeId> {
@@ -261,10 +333,27 @@ impl ImageEngine {
 
     pub fn hard_link(&mut self, source: &Path, destination: &Path) -> io::Result<()> {
         let inode = self.inode(source)?;
+        let (parent, name) = self.parent(destination)?;
+        self.link_inode(inode, parent, name)
+    }
+
+    /// Create an exclusive link between captured directory inodes. Neither
+    /// directory's former pathname participates in namespace resolution.
+    pub fn hard_link_at(
+        &mut self,
+        source: InodeId,
+        source_name: &Path,
+        target: InodeId,
+        target_name: &Path,
+    ) -> io::Result<()> {
+        let inode = self.child_inode(source, source_name)?;
+        self.link_inode(inode, target, child_name(target_name)?.to_os_string())
+    }
+
+    fn link_inode(&mut self, inode: InodeId, parent: InodeId, name: OsString) -> io::Result<()> {
         if self.is_directory(inode) {
             return Err(invalid("hard links to directories are not modeled"));
         }
-        let (parent, name) = self.parent(destination)?;
         self.require_absent(parent, &name)?;
         self.admit_operation(0)?;
         self.namespace(vec![EntryChange {
@@ -745,7 +834,7 @@ fn child_name(path: &Path) -> io::Result<&OsStr> {
         Some(Component::Normal(name))
             if components.next().is_none()
                 && path.as_os_str() == name
-                && name.as_encoded_bytes().len() <= 255 =>
+                && crate::file_io::native_component_within_input_bound(name) =>
         {
             Ok(name)
         }
@@ -759,7 +848,9 @@ fn relative_components(path: &Path) -> io::Result<Vec<OsString>> {
     }
     path.components()
         .map(|component| match component {
-            Component::Normal(name) if name.as_encoded_bytes().len() <= 255 => {
+            Component::Normal(name)
+                if crate::file_io::native_component_within_input_bound(name) =>
+            {
                 Ok(name.to_os_string())
             }
             _ => Err(invalid("power-loss paths must be normalized and relative")),
@@ -1059,6 +1150,14 @@ mod tests {
         assert!(engine.pending_operations().is_empty());
     }
 
+    fn oversized_native_component() -> String {
+        #[cfg(target_vendor = "apple")]
+        let bytes = libc::PATH_MAX as usize;
+        #[cfg(not(target_vendor = "apple"))]
+        let bytes = 256;
+        "x".repeat(bytes)
+    }
+
     #[test]
     fn relative_children_reject_traversal_and_non_directory_or_directory_targets() {
         let mut fixture = ReplacedDirectory::new(true);
@@ -1093,7 +1192,7 @@ mod tests {
             );
         }
         assert!(engine
-            .create_file_at(fixture.captured, Path::new(&"x".repeat(256)))
+            .create_file_at(fixture.captured, Path::new(&oversized_native_component()))
             .is_err());
         assert!(engine
             .child_inode(fixture.original_file, Path::new("payload"))
@@ -1161,7 +1260,9 @@ mod tests {
         assert!(engine.write(inode, u64::MAX, &[]).is_err());
         assert_eq!(engine.current_bytes(inode).unwrap(), b"durable");
         assert_eq!(engine.persist_all_plan(), after_rename);
-        assert!(engine.create_file(Path::new(&"x".repeat(256))).is_err());
+        assert!(engine
+            .create_file(Path::new(&oversized_native_component()))
+            .is_err());
     }
 
     #[test]

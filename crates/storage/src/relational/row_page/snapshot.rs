@@ -132,6 +132,7 @@ pub(crate) struct ProjectedPointReadRequest<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelationalRowPageSnapshotReadError {
+    UnsupportedFormat(hawdb_core::error::StorageFormatError),
     Admission(String),
     Corrupt(String),
     Durability(String),
@@ -143,6 +144,7 @@ pub enum RelationalRowPageSnapshotReadError {
 impl fmt::Display for RelationalRowPageSnapshotReadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnsupportedFormat(error) => fmt::Display::fmt(error, formatter),
             Self::Admission(message) => {
                 write!(
                     formatter,
@@ -170,6 +172,7 @@ impl fmt::Display for RelationalRowPageSnapshotReadError {
 impl std::error::Error for RelationalRowPageSnapshotReadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::UnsupportedFormat(error) => Some(error),
             Self::FileDescriptors(error) => Some(error),
             Self::Stopped(reason) => Some(reason),
             _ => None,
@@ -1479,6 +1482,9 @@ impl<'a> StreamingOverlayCursor<'a> {
     ) -> RelationalRowPageDemandReadError {
         self.owner.poison_if_needed(&error);
         match error {
+            RelationalRowPageSnapshotReadError::UnsupportedFormat(error) => {
+                RelationalRowPageDemandReadError::UnsupportedFormat(error)
+            }
             RelationalRowPageSnapshotReadError::FileDescriptors(error) => {
                 RelationalRowPageDemandReadError::FileDescriptors(error)
             }
@@ -1715,6 +1721,9 @@ fn overlay_key_resident_bytes(
 
 fn map_delta_error(error: RelationalRowDeltaError) -> RelationalRowPageSnapshotReadError {
     match error {
+        RelationalRowDeltaError::UnsupportedFormat(error) => {
+            RelationalRowPageSnapshotReadError::UnsupportedFormat(error)
+        }
         RelationalRowDeltaError::FileDescriptors(error) => {
             RelationalRowPageSnapshotReadError::FileDescriptors(error)
         }
@@ -1738,6 +1747,9 @@ fn map_delta_error(error: RelationalRowDeltaError) -> RelationalRowPageSnapshotR
 
 fn map_demand_error(error: RelationalRowPageDemandReadError) -> RelationalRowPageSnapshotReadError {
     match error {
+        RelationalRowPageDemandReadError::UnsupportedFormat(error) => {
+            RelationalRowPageSnapshotReadError::UnsupportedFormat(error)
+        }
         RelationalRowPageDemandReadError::FileDescriptors(error) => {
             RelationalRowPageSnapshotReadError::FileDescriptors(error)
         }
@@ -1774,6 +1786,9 @@ fn map_row_publication_error(
     error: RelationalRowPagePublicationError,
 ) -> RelationalRowPageSnapshotReadError {
     match error {
+        RelationalRowPagePublicationError::UnsupportedFormat(error) => {
+            RelationalRowPageSnapshotReadError::UnsupportedFormat(error)
+        }
         RelationalRowPagePublicationError::FileDescriptors(error) => {
             RelationalRowPageSnapshotReadError::FileDescriptors(error)
         }

@@ -18,14 +18,14 @@ use super::*;
 
 #[derive(Clone, Copy, Debug)]
 enum Wrapper {
-    Scalar,
+    Default,
     Preferred,
     Compressed,
     Adaptive,
 }
 
 const WRAPPERS: [Wrapper; 4] = [
-    Wrapper::Scalar,
+    Wrapper::Default,
     Wrapper::Preferred,
     Wrapper::Compressed,
     Wrapper::Adaptive,
@@ -48,7 +48,7 @@ fn public_wrapper(
     wrapper: Wrapper,
 ) -> Result<SearchResultSet> {
     match wrapper {
-        Wrapper::Scalar => index.search_with_options("graph", Some(&[1.0, 0.0]), mode, options()),
+        Wrapper::Default => index.search_with_options("graph", Some(&[1.0, 0.0]), mode, options()),
         Wrapper::Preferred => index.search_with_options_prefer_compressed_vector_projection(
             "graph",
             Some(&[1.0, 0.0]),
@@ -75,12 +75,12 @@ fn public_wrapper(
 #[cfg(all(feature = "full-text-search", feature = "vector-search"))]
 fn checked(index: &SearchIndex, mode: SearchMode, wrapper: Wrapper) -> Result<SearchResultSet> {
     match wrapper {
-        Wrapper::Scalar => index.try_search_with_options_using_vector_backend(
+        Wrapper::Default => index.try_search_with_options_using_vector_backend(
             "graph",
             Some(&[1.0, 0.0]),
             mode,
             options(),
-            SearchExecutionStrategy::fixed(VectorSearchBackend::Scalar, None, false),
+            SearchExecutionStrategy::default_vector(false, VectorSearchExecutionOptions::default()),
             None,
         ),
         _ => index.try_search_with_options_compressed_vector_projection_mode_internal(
@@ -208,7 +208,7 @@ fn existing_try_api_is_not_a_drop_in_replacement_for_in_memory_access() {
     index.checkpoint().unwrap();
     drop(index);
     let index = SearchIndex::open(&root.0).unwrap();
-    let before = public_wrapper(&index, SearchMode::Text, Wrapper::Scalar).unwrap();
+    let before = public_wrapper(&index, SearchMode::Text, Wrapper::Default).unwrap();
     assert_eq!(before.total_hits, 2);
     let before_hits = index.search("graph", None, SearchMode::Text, 5).unwrap();
     fs::write(root.0.join(SEARCH_SEGMENT_PAYLOAD_FILE), b"torn payload").unwrap();

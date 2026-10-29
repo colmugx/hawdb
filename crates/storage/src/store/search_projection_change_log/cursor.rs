@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Borrowed input enumeration. Exhaustion is not projection coverage authority.
 
@@ -60,6 +60,8 @@ impl std::error::Error for ProjectionFeedError {}
 /// boundary; it does not authorize any output or visible watermark.
 #[derive(Debug, Clone, Copy)]
 pub enum ProjectionFeedItem<'a> {
+    /// A changed native key, including deletion. Hydrate the pinned end epoch;
+    /// absence requires retracting the fixed projector's own document identity.
     GraphNode {
         epoch: u64,
         node_id: u64,

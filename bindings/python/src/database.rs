@@ -73,6 +73,7 @@ impl Database {
         let inner = if read_only {
             let config = with_read_limits(DatabaseConfig {
                 read_only: true,
+                recovery_mode: hawdb::RecoveryMode::Strict,
                 ..Default::default()
             });
             HawDBEmbedded::open_with_options(HawDBEmbeddedOpenOptions {

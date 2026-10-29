@@ -17,7 +17,7 @@ use super::super::{
     MAX_OUT_OF_CORE_MANIFEST_BYTES, OUT_OF_CORE_FORMAT, OUT_OF_CORE_MANIFEST_FILE,
 };
 use super::{
-    artifact_name::Name, RaBitQGenerationArtifact, STAGE_METADATA_FILE, STAGE_VECTOR_FILE,
+    artifact_name::Name, VectorGenerationArtifact, STAGE_METADATA_FILE, STAGE_VECTOR_FILE,
 };
 use crate::build_control::json;
 use crate::build_memory::BuildMemory;
@@ -75,7 +75,7 @@ pub(super) struct PublishGenerationInput<'a> {
     pub(super) embedding_dimension: Option<usize>,
     pub(super) layout: &'a SearchOutOfCoreLayoutBody,
     pub(super) lexical_artifact_name: &'a str,
-    pub(super) rabitq: Option<&'a RaBitQGenerationArtifact>,
+    pub(super) rabitq: Option<&'a VectorGenerationArtifact>,
     pub(super) payload_bytes: u64,
     pub(super) metadata_payload_bytes: u64,
     pub(super) vector_payload_bytes: u64,
@@ -535,6 +535,9 @@ pub(super) fn install_generation(
         rabitq_artifact_len: input.rabitq.map(|artifact| artifact.artifact_bytes),
         rabitq_artifact_checksum: input.rabitq.map(|artifact| artifact.artifact_checksum),
         rabitq_source_digest: input.rabitq.map(|artifact| artifact.source_digest),
+        diskann_source_digest: input
+            .rabitq
+            .and_then(|artifact| artifact.diskann_source_digest),
         rabitq_vector_document_count: input.rabitq.map(|artifact| artifact.document_count),
         rabitq_payload_checksum: input.rabitq.map(|artifact| artifact.payload_checksum),
         rabitq_peak_build_working_bytes: input

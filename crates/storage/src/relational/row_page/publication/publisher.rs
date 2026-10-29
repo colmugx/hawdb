@@ -812,6 +812,9 @@ fn overflow_dependency_error(
     error: RelationalOverflowPublicationError,
 ) -> RelationalRowPagePublicationError {
     match error {
+        RelationalOverflowPublicationError::UnsupportedFormat(error) => {
+            RelationalRowPagePublicationError::UnsupportedFormat(error)
+        }
         RelationalOverflowPublicationError::FileDescriptors(error) => {
             RelationalRowPagePublicationError::FileDescriptors(error)
         }

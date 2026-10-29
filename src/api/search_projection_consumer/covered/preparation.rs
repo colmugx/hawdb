@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Owned construction and short fenced publication of registered generations.
 
@@ -63,6 +63,7 @@ impl<'consumer> ProjectionConsumerPreparation<'consumer> {
                     limits: work.limits,
                     recovery_memory: work.recovery_memory,
                     previous: Some(consumer.projection()),
+                    projector: hawdb_search::consumer::RegisteredConsumerProjector::HostMapping,
                 },
             )
         });

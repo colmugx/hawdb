@@ -361,6 +361,10 @@ impl<'a> Collector<'a> {
                     }
                 }
                 WalOp::DeleteNode { id } => {
+                    // Fixed projections need the native key even when this
+                    // label has no built-in Search document identity. Hydration
+                    // at the captured end epoch observes absence as a deletion.
+                    self.upsert(*id)?;
                     if let Some(meta) = self.node(*id, true)?
                         && let Some(old) = meta.document_id
                     {

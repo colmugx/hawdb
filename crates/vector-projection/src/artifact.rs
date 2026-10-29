@@ -42,6 +42,7 @@ mod stream_verify;
 
 #[doc(hidden)]
 pub use admission::ProjectionReadAdmission;
+pub(crate) use admission::Unaccounted;
 
 const FOOTER_MAGIC: &[u8; 8] = b"SKRQBF01";
 const FOOTER_BYTES: u64 = 8 + 4 + FOOTER_MAGIC.len() as u64;

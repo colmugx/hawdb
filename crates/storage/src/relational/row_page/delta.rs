@@ -251,6 +251,7 @@ pub struct RelationalRowDeltaReadReport {
 
 #[derive(Debug)]
 pub enum RelationalRowDeltaError {
+    UnsupportedFormat(hawdb_core::error::StorageFormatError),
     Admission(String),
     Corrupt(String),
     Durability(String),
@@ -274,6 +275,7 @@ pub enum RelationalRowDeltaError {
 impl fmt::Display for RelationalRowDeltaError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnsupportedFormat(error) => fmt::Display::fmt(error, formatter),
             Self::Admission(message) => write!(formatter, "relational row delta admission failed: {message}"),
             Self::Corrupt(message) => write!(formatter, "corrupt relational row delta: {message}"),
             Self::FileDescriptors(error) => fmt::Display::fmt(error, formatter),
@@ -304,6 +306,7 @@ impl fmt::Display for RelationalRowDeltaError {
 impl std::error::Error for RelationalRowDeltaError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::UnsupportedFormat(error) => Some(error),
             Self::FileDescriptors(error) => Some(error),
             Self::Publication(error) => Some(error),
             Self::Row(error) => Some(error),

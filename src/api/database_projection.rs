@@ -293,15 +293,12 @@ impl Database {
         source_commit_epoch: u64,
         max_operations: Option<usize>,
     ) -> Result<Option<SearchProjectionChangeBatch>> {
-        let current_epoch = self.runtime.get()?.store.commit_epoch();
+        let runtime = self.runtime.get()?;
+        let current_epoch = runtime.store.commit_epoch();
         if source_commit_epoch >= current_epoch {
             return Ok(None);
         }
-        let change_log_start_epoch = self
-            .runtime
-            .get()?
-            .store
-            .search_projection_change_log_start_epoch();
+        let change_log_start_epoch = runtime.store.search_projection_change_log_start_epoch();
         if source_commit_epoch < change_log_start_epoch {
             return Err(HawDBError::Storage(format!(
                 "search projection change log starts at commit epoch {change_log_start_epoch}; requested source commit epoch {source_commit_epoch}; full search projection rebuild required"
@@ -314,9 +311,7 @@ impl Database {
             BTreeMap::<String, BTreeSet<hawdb_storage::relational::RelationalKey>>::new();
         let mut complete_through_commit_epoch = source_commit_epoch;
         let mut truncated_by_budget = false;
-        for change in self
-            .runtime
-            .get()?
+        for change in runtime
             .store
             .search_projection_changes_after(source_commit_epoch)
         {
@@ -334,11 +329,18 @@ impl Database {
                     )));
                 }
             };
-            let additional_operation_count = change
-                .upsert_node_ids
-                .iter()
-                .filter(|node_id| !upsert_node_ids.contains(*node_id))
-                .count()
+            // The raw native feed retains deleted keys for fixed projectors.
+            // This compatibility batch promises live upsert candidates and
+            // separately retains every legacy document tombstone.
+            let mut additional_live_nodes = 0usize;
+            for node_id in &change.upsert_node_ids {
+                if !upsert_node_ids.contains(node_id)
+                    && runtime.store.contains_node(NodeId(*node_id))?
+                {
+                    additional_live_nodes += 1;
+                }
+            }
+            let additional_operation_count = additional_live_nodes
                 .saturating_add(
                     change
                         .delete_document_ids
@@ -381,7 +383,11 @@ impl Database {
                 truncated_by_budget = true;
                 break;
             }
-            upsert_node_ids.extend(change.upsert_node_ids);
+            for node_id in change.upsert_node_ids {
+                if runtime.store.contains_node(NodeId(node_id))? {
+                    upsert_node_ids.insert(node_id);
+                }
+            }
             delete_document_ids.extend(change.delete_document_ids);
             for table in tables {
                 relational_primary_keys

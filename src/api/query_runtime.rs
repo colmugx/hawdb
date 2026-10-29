@@ -237,6 +237,18 @@ impl PreparedRuntimeQuery {
         self.parse_metrics.elapsed_nanos
     }
 
+    pub(super) fn take_query_identity(
+        &mut self,
+        cypher_text: &str,
+    ) -> Option<hawdb_query::QueryIdentity> {
+        // An incompatible request must not inherit the prepared text's hash,
+        // even when execution is refused before the ordinary request guards.
+        if self.cypher_text != cypher_text {
+            return None;
+        }
+        self.optimized.as_mut()?.query_identity.take()
+    }
+
     pub(crate) fn uses_external_seed(&self) -> bool {
         let mut required = false;
         if let Some(optimized) = &self.optimized {
@@ -892,10 +904,11 @@ impl Database {
                 QueryExecutionTrace::uncached(statement),
             ));
         }
+        let mut query_identity = None;
         let query_result = (|| {
             query_runtime_checkpoint(task_context)?;
             query_work_request_for_statement(&self.system_variables, &statement)?;
-            let optimized = match prepared_optimized {
+            let mut optimized = match prepared_optimized {
                 Some(optimized) => optimized,
                 _ => self.optimized_query_plan_for_request(
                     cypher_text,
@@ -906,6 +919,7 @@ impl Database {
                     scoring,
                 )?,
             };
+            query_identity = optimized.query_identity.take();
             let is_mutation = executor::is_mutation_plan(&optimized.physical_plan)?;
             if is_mutation {
                 self.ensure_writable()?;
@@ -1015,6 +1029,7 @@ impl Database {
             started,
             statement_result,
             StatementExecutionContext {
+                query_identity: query_identity.as_ref(),
                 execution_profile,
                 retained_profile: None,
                 access_control,
@@ -1295,6 +1310,62 @@ mod tests {
                 .contains("prepare and admit again"));
             assert_eq!(db.commit_epoch().unwrap(), epoch);
         }
+    }
+
+    #[test]
+    fn prepared_query_identity_rejects_mismatched_transfer_and_records_current_text() {
+        let db = Database::new_with_config(DatabaseConfig {
+            slow_query_log_threshold_micros: 0,
+            slow_query_log_capacity: 8,
+            statement_summary_capacity: 8,
+            ..DatabaseConfig::default()
+        });
+        let original = "MATCH (n:Memory) RETURN 1 AS value";
+        let current = " match (n:Memory) return 2 as value; ";
+        let original_identity = hawdb_query::QueryIdentity::new("cypher", original);
+        let current_identity = hawdb_query::QueryIdentity::new("cypher", current);
+        assert_eq!(
+            original_identity.query_digest(),
+            current_identity.query_digest()
+        );
+        assert_ne!(
+            original_identity.query_text_hash(),
+            current_identity.query_text_hash()
+        );
+        let mut prepared = db
+            .prepare_runtime_request(QueryRequest::new(original))
+            .unwrap();
+        let error = db
+            .validate_prepared_request(&prepared, QueryRequest::new(current))
+            .unwrap_err();
+        let identity = prepared.take_query_identity(current);
+        assert!(identity.is_none());
+        db.record_statement_execution(
+            "cypher",
+            current,
+            prepared.statement_kind(),
+            hawdb_core::time::Instant::now(),
+            Err(&error),
+            StatementExecutionContext {
+                query_identity: identity.as_ref(),
+                ..Default::default()
+            },
+        );
+        let summary = db.statement_summary.borrow().snapshot();
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].digest, current_identity.query_digest());
+        assert_eq!(
+            summary[0].sample_query_text_hash,
+            current_identity.query_text_hash()
+        );
+        assert_eq!(summary[0].error_count, 1);
+        assert_eq!(summary[0].success_count, 0);
+        assert!(db.slow_query_log_snapshot().is_empty());
+        assert_eq!(
+            prepared.take_query_identity(original),
+            Some(original_identity)
+        );
+        assert!(prepared.take_query_identity(original).is_none());
     }
 
     #[test]

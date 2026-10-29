@@ -1,5 +1,6 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
+
 use hawdb::*;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -486,7 +487,9 @@ fn staging_session_reduces_whole_interval_instead_of_publishing_a_prefix() {
             .unwrap();
         db.checkpoint().unwrap();
         complete(&mut session);
-        assert_eq!(session.feed_usage().items, 5);
+        // The deleted native node key and legacy document tombstone both remain
+        // in the covered source interval before final-output reduction.
+        assert_eq!(session.feed_usage().items, 6);
         let staged = session.finish_staging().unwrap();
         assert_eq!(staged.source_epoch(), e);
         assert_eq!(staged.sorting_report().input_operations, 3);

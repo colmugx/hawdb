@@ -1435,6 +1435,9 @@ fn map_projection_read_error(error: ProjectionGenerationError) -> HawDBError {
 
 fn map_state_to_demand_error(error: RelationalError) -> RelationalRowPageDemandReadError {
     match error {
+        RelationalError::UnsupportedFormat(error) => {
+            RelationalRowPageDemandReadError::UnsupportedFormat(error)
+        }
         RelationalError::FileDescriptors(error) => {
             RelationalRowPageDemandReadError::FileDescriptors(error)
         }
@@ -1452,6 +1455,7 @@ fn map_state_to_demand_error(error: RelationalError) -> RelationalRowPageDemandR
 
 fn map_state_error(error: RelationalError) -> HawDBError {
     match error {
+        RelationalError::UnsupportedFormat(error) => HawDBError::UnsupportedStorageFormat(error),
         RelationalError::FileDescriptors(error) => HawDBError::FileDescriptors(error),
         RelationalError::Admission(message) => HawDBError::Execution(message),
         RelationalError::Durability(message)
@@ -1463,6 +1467,9 @@ fn map_state_error(error: RelationalError) -> HawDBError {
 
 pub(crate) fn map_snapshot_error(error: RelationalRowPageSnapshotReadError) -> HawDBError {
     match error {
+        RelationalRowPageSnapshotReadError::UnsupportedFormat(error) => {
+            HawDBError::UnsupportedStorageFormat(error)
+        }
         RelationalRowPageSnapshotReadError::FileDescriptors(error) => {
             HawDBError::FileDescriptors(error)
         }

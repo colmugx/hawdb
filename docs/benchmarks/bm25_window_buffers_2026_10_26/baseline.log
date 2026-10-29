@@ -1,0 +1,12 @@
+   Compiling hawdb-search v0.16.0 (/private/tmp/hawdb-bm25-baseline-20261026/crates/search)
+    Finished `test` profile [optimized] target(s) in 8m 22s
+     Running unittests src/lib.rs (/private/tmp/hawdb-bm25-20261026/target/debug/deps/hawdb_search-d2b82170359907ef)
+
+running 2 tests
+test out_of_core::query_ranking::tests::rank_id_allocation_measurement ... ranking input_id_bytes=131074 retained_peak_bytes=263012
+ok
+test out_of_core::tests::bm25_windows::bm25_window_allocation_measurement ... bm25 segments=2 window=1 matches=2 retained=2 retained_id_bytes=8194 peak_bytes=15548 read_bytes=10442
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 1125 filtered out; finished in 0.46s
+

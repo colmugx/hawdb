@@ -53,6 +53,7 @@ pub(super) fn sql_statement_kind(statement: &SqlStatement) -> &'static str {
 
 pub(super) fn admit_append_explain(
     rows: Vec<executor::Row>,
+    analyze: bool,
     config: &super::DatabaseConfig,
     options: QueryStreamOptions,
     task_context: Option<&hawdb_core::RuntimeTaskContext>,
@@ -67,9 +68,21 @@ pub(super) fn admit_append_explain(
         hawdb_executor::QueryMemoryLedger::for_query(&config.execution_memory, task_context)?;
     let (result_budget, budget_option) =
         enforced_result_memory_budget_with_option(&config.execution_memory, task_context)?;
-    let mut output = hawdb_executor::QueryRowsBuilder::with_row_capacity(rows.len());
+    let schema = hawdb_relational::explain::sql_explain_schema(analyze);
+    let mut output = hawdb_executor::QueryRowsBuilder::with_schema(schema.clone(), 0);
     {
-        let mut consumer = |row| output.push_named_row(row);
+        let mut consumer = |mut row: executor::Row| {
+            if row.len() != schema.len() {
+                return Err(HawDBError::Execution(
+                    "SQL EXPLAIN row does not match its declared schema".into(),
+                ));
+            }
+            output.try_push_values(schema.columns().iter().map(|name| {
+                row.remove(name).ok_or_else(|| {
+                    HawDBError::Execution(format!("SQL EXPLAIN row has no column {name}"))
+                })
+            }))
+        };
         let mut accumulator = QueryOutputAccumulator::new_with_budget_option(
             OutputLimits {
                 max_rows: options.max_rows,
@@ -151,25 +164,24 @@ impl StatementRecordingTarget<'_> {
         context: StatementExecutionContext<'_>,
     ) {
         let elapsed_micros = started.elapsed().as_micros();
-        let query_identity = hawdb_query::QueryIdentity::new(query_language, query_text);
-        let execution = match result {
-            Ok(row_count) => system_sql::StatementExecution::completed(
+        let fallback_identity;
+        let query_identity = match context.query_identity {
+            Some(identity) => identity,
+            None => {
+                fallback_identity = hawdb_query::QueryIdentity::new(query_language, query_text);
+                &fallback_identity
+            }
+        };
+        let summary_execution = result.map_err(|error| {
+            system_sql::StatementExecution::failed(
                 query_language,
                 query_text,
                 statement_kind,
-                &query_identity,
-                elapsed_micros,
-                row_count,
-            ),
-            Err(error) => system_sql::StatementExecution::failed(
-                query_language,
-                query_text,
-                statement_kind,
-                &query_identity,
+                query_identity,
                 elapsed_micros,
                 error.to_string(),
-            ),
-        };
+            )
+        });
         if let Some(telemetry) = self.telemetry {
             let pipeline = context
                 .execution_profile
@@ -200,7 +212,17 @@ impl StatementRecordingTarget<'_> {
                 major_page_faults: pipeline.and_then(|report| report.major_page_faults),
             });
         }
-        self.statement_summary.borrow_mut().record(execution);
+        match summary_execution {
+            Ok(row_count) => self.statement_summary.borrow_mut().record_completed(
+                query_language,
+                query_text,
+                statement_kind,
+                query_identity,
+                elapsed_micros,
+                row_count,
+            ),
+            Err(execution) => self.statement_summary.borrow_mut().record(execution),
+        }
 
         let Ok(row_count) = result else {
             return;
@@ -216,7 +238,7 @@ impl StatementRecordingTarget<'_> {
                     query_language,
                     statement_kind,
                     query_text,
-                    query_identity: &query_identity,
+                    query_identity,
                     elapsed_micros,
                     row_count,
                     success: true,
@@ -677,6 +699,7 @@ impl Database {
                 };
                 return admit_append_explain(
                     format_append_explain(&plan, report.as_ref()),
+                    plan.analyze,
                     &self.config,
                     QueryStreamOptions {
                         max_rows,

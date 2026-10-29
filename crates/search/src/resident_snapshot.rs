@@ -84,9 +84,12 @@ impl SearchIndex {
         let index = SearchIndex {
             documents: self.documents.clone(),
             vector_index_descriptor: self.vector_index_descriptor.clone(),
+            vector_document_summary: self.vector_document_summary,
+            canonical_vector_source_epoch: self.canonical_vector_source_epoch,
             path: self.path.clone(),
             _project_files: self._project_files.clone(),
             embedding_dimension: self.embedding_dimension,
+            rabitq_checkpoint: self.rabitq_checkpoint,
             embedding_manifest: self.embedding_manifest.clone(),
             import_source_graph_commit_epoch: self.import_source_graph_commit_epoch,
             source_graph_commit_epoch: self.source_graph_commit_epoch,
@@ -103,6 +106,8 @@ impl SearchIndex {
             rabitq_projection: Mutex::new(self.rabitq_projection()),
             #[cfg(feature = "vector-search")]
             rabitq_build_options: self.rabitq_build_options,
+            #[cfg(feature = "vector-search")]
+            resident_diskann: self.resident_diskann.capture(),
             segment_descriptor: self.segment_descriptor.clone(),
             segment_payload_reader: self.segment_payload_reader.clone(),
             range_read_config: self.range_read_config,
@@ -131,6 +136,9 @@ impl ReadGeneration {
         let captured = &self.index;
         if !captured.documents.shares_storage_with(&live.documents)
             || captured.vector_index_descriptor != live.vector_index_descriptor
+            || captured.vector_document_summary != live.vector_document_summary
+            || captured.canonical_vector_source_epoch != live.canonical_vector_source_epoch
+            || captured.rabitq_checkpoint != live.rabitq_checkpoint
             || captured.path != live.path
             || captured.embedding_dimension != live.embedding_dimension
             || captured.embedding_manifest != live.embedding_manifest
@@ -452,6 +460,83 @@ mod tests {
         );
         drop(next);
         assert_eq!(governor.snapshot().admitted_memory_bytes, 0);
+    }
+
+    #[cfg(feature = "vector-search")]
+    #[test]
+    fn default_graph_read_generations_preserve_results_across_crud() {
+        for prewarm in [false, true] {
+            let mut index = SearchIndex::in_memory();
+            for id in 0..32 {
+                let mut value = document(&format!("vector-{id:02}"), "body", "space");
+                value.embedding = Some(vec![1.0, id as f32 / 32.0]);
+                index.upsert(value).unwrap();
+            }
+            let options = SearchQueryOptions {
+                limit: 3,
+                offset: 0,
+                rank_window: None,
+                fusion_weights: Default::default(),
+                metadata_filters: BTreeMap::new(),
+                policy_epoch: None,
+            };
+            let search = |index: &SearchIndex, exact: bool| {
+                let result = if exact {
+                    index.search_with_options_exact(
+                        "",
+                        Some(&[1.0, 0.0]),
+                        SearchMode::Vector,
+                        options.clone(),
+                    )
+                } else {
+                    index.search_with_options(
+                        "",
+                        Some(&[1.0, 0.0]),
+                        SearchMode::Vector,
+                        options.clone(),
+                    )
+                }
+                .unwrap();
+                assert_eq!(
+                    result.retrievers[0].backend,
+                    if exact {
+                        "scalar_vector_scan"
+                    } else {
+                        "hawdb_diskann_candidate_projection"
+                    }
+                );
+                result
+                    .hits
+                    .into_iter()
+                    .map(|hit| (hit.id, hit.vector_score))
+                    .collect::<Vec<_>>()
+            };
+            if prewarm {
+                search(&index, false);
+            }
+            let old = index.read_snapshot();
+            let expected = search(&old.generation.index, true);
+            assert_eq!(search(&old.generation.index, false), expected);
+            index.delete("vector-00");
+            let mut replacement = document("vector-01", "updated", "space");
+            replacement.embedding = Some(vec![0.0, 1.0]);
+            index.upsert(replacement).unwrap();
+            index
+                .upsert(document("vector-02", "null", "space"))
+                .unwrap();
+            let mut inserted = document("new", "inserted", "space");
+            inserted.embedding = Some(vec![1.0, 0.0]);
+            index.upsert(inserted).unwrap();
+            let current = index.read_snapshot();
+            assert!(!Arc::ptr_eq(&old.generation, &current.generation));
+            assert_eq!(search(&old.generation.index, false), expected);
+            assert_eq!(
+                search(&current.generation.index, false),
+                search(&index, true)
+            );
+            assert_eq!(search(&index, false), search(&index, true));
+            assert_eq!(search(&old.generation.index, false), expected);
+        }
     }
 
     #[cfg(feature = "vector-search")]

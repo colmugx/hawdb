@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Failed preparation keeps original native custody, not a pathname to adopt.
 
@@ -101,7 +101,12 @@ impl ProducerScratch {
             Some(directory) => directory,
             None => parent.open_created_directory(&context, &self.candidate)?,
         };
-        remove_producer(parent, directory, &mut self.candidate)
+        remove_producer(parent, directory, &mut self.candidate)?;
+        // Do not forget the original scratch owner while its removed entry can
+        // still reappear after power loss. If the barrier fails, the completed
+        // removal state above retries this same parent without reopening a name.
+        parent.sync(&context)?;
+        Ok(())
     }
 }
 

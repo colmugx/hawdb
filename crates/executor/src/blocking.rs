@@ -317,9 +317,9 @@ fn merge_cartesian_bindings(left: &Binding, right: &Binding) -> Binding {
     let mut values = left.values.clone();
     values.extend(right.values.clone());
     let mut nodes = left.nodes.clone();
-    nodes.extend(right.nodes.clone());
+    nodes.extend_shared(&right.nodes);
     let mut relationships = left.relationships.clone();
-    relationships.extend(right.relationships.clone());
+    relationships.extend_shared(&right.relationships);
     Binding {
         values,
         nodes,
@@ -387,8 +387,8 @@ mod tests {
     fn value_binding(value: i64) -> Binding {
         Binding {
             values: BTreeMap::from([("value".to_string(), Value::Int(value))]),
-            nodes: BTreeMap::new(),
-            relationships: BTreeMap::new(),
+            nodes: BTreeMap::new().into(),
+            relationships: BTreeMap::new().into(),
         }
     }
 

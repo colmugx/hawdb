@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
@@ -28,7 +29,12 @@ pub struct QueryIdentity {
 
 impl QueryIdentity {
     pub fn new(query_language: &str, query_text: &str) -> Self {
-        let query_language = query_language.trim().to_ascii_lowercase();
+        let query_language = query_language.trim();
+        let query_language = if query_language.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            Cow::Owned(query_language.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(query_language)
+        };
         let normalized_query = normalize_query(&query_language, query_text);
         let query_digest = versioned_hash(
             "hawdb-query-digest",
@@ -80,10 +86,14 @@ fn versioned_hash(domain: &str, version: u16, prefix: &str, fields: &[&[u8]]) ->
         hash_field(&mut hasher, field);
     }
     let digest = hasher.finalize();
-    let mut output = format!("{prefix}{version}:");
+    let mut output = String::with_capacity(
+        prefix.len() + decimal_len(usize::from(version)) + 1 + digest.len() * 2,
+    );
+    write!(output, "{prefix}{version}:").expect("writing to a String cannot fail");
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     for byte in digest {
-        use std::fmt::Write;
-        write!(output, "{byte:02x}").expect("writing to a String cannot fail");
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     output
 }
@@ -484,6 +494,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn versioned_hash_preserves_framing_and_lowercase_hex_vectors() {
+        // SHA-256 vectors independently generated from length-prefixed UTF-8
+        // fields and a little-endian u16 version, including NUL boundaries.
+        for (domain, version, prefix, fields, expected) in [
+            (
+                "hawdb-query-digest",
+                1_u16,
+                "q",
+                ["cypher", ""],
+                "q1:89601b19dd789b0119adac19f1f1ab94bdb42e9be6825447e2800b9699526396",
+            ),
+            (
+                "hawdb-query-text",
+                1,
+                "t",
+                ["sql", "SELECT 'it''s private'"],
+                "t1:bdfd08955ffda9b649b2a41201faaf7bab5bcf5cd53e3cdccf38d154cd022458",
+            ),
+            (
+                "",
+                0,
+                "",
+                ["", ""],
+                "0:659d36ca563ba4622daabb36a71dafaf6060cdcbf89bb12e75426198496d272c",
+            ),
+            (
+                "domain\0boundary",
+                u16::MAX,
+                "\u{03c0}",
+                ["a\0b", "\u{03a9}"],
+                "\u{03c0}65535:4cbddd3a3978d0a559d9f269127cf5bc18945380cf688addc6ca2fdb30486a41",
+            ),
+        ] {
+            assert_eq!(
+                versioned_hash(domain, version, prefix, &fields.map(str::as_bytes)),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn identity_preserves_published_protocol_vectors() {
+        for (language, text, digest, text_hash) in [
+            (
+                "cypher",
+                "",
+                "q1:89601b19dd789b0119adac19f1f1ab94bdb42e9be6825447e2800b9699526396",
+                "t1:d084d9e727251ad31b8cdb5d6389d5812986e45fc16d16f6709b7e1fb3c25782",
+            ),
+            (
+                "cypher",
+                "MATCH (n:Boundary) WHERE n.id = $id RETURN n.id AS id, n.score AS score, n.title AS title",
+                "q1:2c82c0a53fcd28c7a81749ec4101a3efd2f54dcb4fc1f8f33aa1eb03cebbc15c",
+                "t1:aee76710fc4272963bce14a5341905eb56a2e354139d6da5ed47fb0b4bd26981",
+            ),
+            (
+                "sql",
+                "SELECT id, title FROM memories WHERE id = $1",
+                "q1:c67b1e7293af9ae38b0b4477c17e560dac54b64543b8ba8f2e7d56a1e05b42f8",
+                "t1:9bcab90876769e1e44528ef99d873f978f6e856ec7f6fd7a79d72022389c4cb7",
+            ),
+        ] {
+            let identity = QueryIdentity::new(language, text);
+            assert_eq!(identity.query_digest(), digest);
+            assert_eq!(identity.query_text_hash(), text_hash);
+        }
+    }
+
+    #[test]
     fn digest_ignores_keyword_case_whitespace_and_literals() {
         let first = QueryIdentity::new(
             "cypher",
@@ -531,13 +610,33 @@ mod tests {
     #[test]
     fn digest_is_domain_separated_by_query_language() {
         let cypher = QueryIdentity::new("cypher", "MATCH (m) RETURN m");
-        let case_variant = QueryIdentity::new(" CYPHER ", "MATCH (m) RETURN m");
+        for language in [
+            "cypher",
+            " cypher ",
+            "\u{00a0}cypher\u{2003}",
+            " CYPHER ",
+            "cYpHeR",
+        ] {
+            assert_eq!(cypher, QueryIdentity::new(language, "MATCH (m) RETURN m"));
+        }
         let sql = QueryIdentity::new("sql", "MATCH (m) RETURN m");
 
-        assert_eq!(cypher.query_digest(), case_variant.query_digest());
         assert_ne!(cypher.query_digest(), sql.query_digest());
         assert!(cypher.query_digest().starts_with("q1:"));
         assert!(cypher.query_text_hash().starts_with("t1:"));
+    }
+
+    #[test]
+    fn language_canonicalization_preserves_non_ascii_case() {
+        let query = "SELECT 1";
+        let upper = QueryIdentity::new("\u{03a9}", query);
+        let lower = QueryIdentity::new("\u{03c9}", query);
+        assert_ne!(upper.query_digest(), lower.query_digest());
+        assert_ne!(upper.query_text_hash(), lower.query_text_hash());
+        assert_eq!(
+            QueryIdentity::new("\u{03a9}SQL", query),
+            QueryIdentity::new("\u{03a9}sql", query)
+        );
     }
 
     #[test]

@@ -690,6 +690,7 @@ fn seed_search_metadata_workload_fixture(graph: &mut NowledgeMemGraph) -> Result
 
 fn error_class(error: &crate::HawDBError) -> String {
     match error {
+        crate::HawDBError::UnsupportedStorageFormat(_) => "unsupported_storage_format",
         crate::HawDBError::Parse(_) => "parse",
         crate::HawDBError::Semantic(_) => "semantic",
         crate::HawDBError::Execution(_)
@@ -704,6 +705,7 @@ fn error_class(error: &crate::HawDBError) -> String {
         crate::HawDBError::Storage(_)
         | crate::HawDBError::FileDescriptors(_)
         | crate::HawDBError::StorageIntegrity(_)
+        | crate::HawDBError::WalRecoveryIo { .. }
         | crate::HawDBError::ProjectionBusy
         | crate::HawDBError::AppendSequenceExhausted { .. }
         | crate::HawDBError::BranchBusy { .. }

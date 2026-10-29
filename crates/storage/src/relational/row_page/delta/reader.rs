@@ -878,7 +878,8 @@ pub(super) fn validate_candidate_overflow_closure(
                 }
                 Err(error) => {
                     closure_error = Some(match error {
-                        crate::relational::RelationalOverflowPublicationError::FileDescriptors(error) => RelationalRowDeltaError::FileDescriptors(error),
+                        crate::relational::RelationalOverflowPublicationError::UnsupportedFormat(error) => RelationalRowDeltaError::UnsupportedFormat(error),
+        crate::relational::RelationalOverflowPublicationError::FileDescriptors(error) => RelationalRowDeltaError::FileDescriptors(error),
                         crate::relational::RelationalOverflowPublicationError::Admission(
                             message,
                         ) => RelationalRowDeltaError::Admission(message),

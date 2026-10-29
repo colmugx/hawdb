@@ -195,6 +195,7 @@ fn lifecycle_rejects_source_path_alias_for_destructive_corruption_probe() {
 
 fn build_projection(path: &Path) {
     let mut index = SearchIndex::open(path).unwrap();
+    index.set_rabitq_projection_build_options(Default::default());
     index
         .apply_embedding_manifest(SearchEmbeddingManifest {
             model: "test-embedding".to_string(),
@@ -227,6 +228,7 @@ fn build_serving_projection(path: &Path) {
     let mut writer = SearchOutOfCoreGenerationWriter::create(
         path,
         SearchOutOfCoreGenerationBuildOptions {
+            vector_backend: None,
             source_graph_commit_epoch: Some(42),
             embedding_manifest: Some(embedding_manifest),
             ..SearchOutOfCoreGenerationBuildOptions::default()

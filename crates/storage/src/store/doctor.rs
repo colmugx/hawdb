@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::format_admission::{validate_checkpoint_formats, validate_sealed_formats};
+
 use super::{
-    file_checksum, sync_parent_dir, DurableManifest, WalCursorEvent, WalOpenOutcome,
-    WalRecordCursor, MANIFEST_FILE,
+    file_checksum, DurableManifest, WalCursorEvent, WalOpenOutcome, WalRecordCursor, MANIFEST_FILE,
 };
 use crate::error::{HawDBError, Result};
 use crate::file_io::{self as fs, File, OpenOptions};
@@ -27,7 +28,7 @@ pub use hawdb_storage::{
     ownership::DatabaseDirectoryLease,
 };
 use serde::{Deserialize, Serialize};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const DOCTOR_DIRECTORY: &str = "doctor";
@@ -42,6 +43,7 @@ struct WalRepairBoundary {
     wal_generation: u64,
     wal_replay_start_lsn: u64,
     published_prefix_len: u64,
+    commit_epoch: u64,
 }
 
 /// Missing selectors still belong to their project's branch namespace. Never
@@ -60,18 +62,27 @@ fn is_branch_directory(path: &Path) -> Result<bool> {
 }
 
 impl WalRepairBoundary {
-    fn load(path: &Path, max_wal_bytes: Option<u64>) -> Result<Self> {
+    fn load(path: &Path, options: WalDoctorOptions) -> Result<Self> {
+        let mut format_limits = crate::config::WalReplayConfig {
+            max_bytes: options.max_wal_bytes,
+            max_record_bytes: options.max_record_bytes,
+            max_batch_operations: options.max_batch_operations,
+            max_entries: None,
+            ..Default::default()
+        };
         let head_path = path.join("branch.head");
         if !is_branch_directory(path)? {
             let manifest_path = path.join(MANIFEST_FILE);
             let manifest = DurableManifest::load(&manifest_path)?;
             manifest.validate()?;
             validate_checkpoint_boundary(path, manifest)?;
+            validate_checkpoint_formats(manifest, format_limits, |name| Ok(path.join(name)))?;
             return Ok(Self {
                 selector_path: manifest_path,
                 wal_generation: manifest.wal_generation,
                 wal_replay_start_lsn: manifest.wal_replay_start_lsn,
                 published_prefix_len: 0,
+                commit_epoch: manifest.checkpoint_commit_epoch,
             });
         }
         let head =
@@ -155,13 +166,14 @@ impl WalRepairBoundary {
                 .read(reference)
                 .map_err(HawDBError::from_storage_error)?;
         }
+        validate_sealed_formats(&objects, &root, manifest, &mut format_limits)?;
         let wal_path = path.join(crate::artifact_files::wal_generation_file(
             head.active_wal.generation,
         ));
         crate::branch_head::validate_active_wal_prefix_from_file(
             &wal_path,
             head.active_wal,
-            max_wal_bytes.unwrap_or(u64::MAX),
+            options.max_wal_bytes.unwrap_or(u64::MAX),
         )
         .map_err(HawDBError::from_storage_error)?;
         Ok(Self {
@@ -169,6 +181,7 @@ impl WalRepairBoundary {
             wal_generation: head.active_wal.generation,
             wal_replay_start_lsn: head.active_wal.replay_start_lsn,
             published_prefix_len: head.active_wal.byte_length,
+            commit_epoch: root.commit_epoch,
         })
     }
 
@@ -308,8 +321,16 @@ pub(super) fn automatic_wal_tail_repair_locked(
     let mut retained_bytes = 0u64;
     if directory.exists() {
         for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            if entry.path()
+                == directory
+                    .join(quarantine_file_name(&plan))
+                    .with_extension("tail.tmp")
+            {
+                continue;
+            }
             retained_bytes = retained_bytes
-                .checked_add(entry?.metadata()?.len())
+                .checked_add(entry.metadata()?.len())
                 .ok_or_else(|| {
                     HawDBError::Storage("doctor quarantine size overflow".to_string())
                 })?;
@@ -317,7 +338,7 @@ pub(super) fn automatic_wal_tail_repair_locked(
     }
     if !directory.join(quarantine_file_name(&plan)).exists() {
         retained_bytes = retained_bytes
-            .checked_add(plan.original_wal_len)
+            .checked_add(plan.discarded_wal_tail_bytes)
             .ok_or_else(|| HawDBError::Storage("doctor quarantine size overflow".to_string()))?;
     }
     // Automatic recovery must preserve prior audit evidence, even when the
@@ -361,7 +382,7 @@ fn validate_acknowledgement(
 }
 
 fn inspect_wal_tail_locked(path: &Path, options: WalDoctorOptions) -> Result<WalTailRepairPlan> {
-    let boundary = WalRepairBoundary::load(path, options.max_wal_bytes)?;
+    let boundary = WalRepairBoundary::load(path, options)?;
     let wal_path = boundary.wal_path(path);
     let wal_len = fs::metadata(&wal_path)
         .map_err(|error| {
@@ -408,36 +429,77 @@ fn inspect_wal_tail_locked(path: &Path, options: WalDoctorOptions) -> Result<Wal
             boundary.wal_replay_start_lsn
         )));
     }
+    let fence = super::wal_fence::WalRecoveryFence::load(
+        &wal_path,
+        boundary.wal_generation,
+        boundary.wal_replay_start_lsn,
+    )?;
+    let mut valid_end = super::WAL_BINARY_FILE_HEADER_BYTES as u64;
     let mut expected_lsn = boundary.wal_replay_start_lsn;
+    let mut epoch = boundary.commit_epoch;
     loop {
-        let (entry, record_start) = match cursor.next()? {
-            WalCursorEvent::Eof => break,
+        let event = cursor.next()?;
+        let event = match event {
+            WalCursorEvent::Entry {
+                ref entry,
+                start_offset,
+                ..
+            } if entry.lsn != expected_lsn => WalCursorEvent::Corrupt {
+                offset: start_offset,
+                reason: format!(
+                    "WAL LSN sequence mismatch: expected {expected_lsn}, got {}",
+                    entry.lsn
+                ),
+            },
+            event => event,
+        };
+        let damage = match &event {
             WalCursorEvent::TornTail {
                 valid_prefix_len, ..
-            } => {
-                if valid_prefix_len < boundary.published_prefix_len {
-                    return Err(HawDBError::StorageIntegrity(
-                        "WAL repair would discard a published branch prefix".into(),
-                    ));
-                }
-                let plan = build_plan(
-                    &boundary.selector_path,
-                    &wal_path,
-                    &boundary,
-                    expected_lsn,
-                    valid_prefix_len,
-                    wal_len,
-                )?;
-                if let Some(pending) = load_matching_pending_record(path, &plan.plan_id)?
-                    && pending.plan != plan
-                {
-                    return Err(HawDBError::Storage(
-                        "pending WAL doctor repair record does not match the current repair plan"
-                            .to_string(),
-                    ));
-                }
-                return Ok(plan);
+            } => Some((
+                *valid_prefix_len,
+                WalTailRepairReason::IncompleteFinalRecord,
+            )),
+            WalCursorEvent::Corrupt { .. }
+                if fence.is_some_and(|fence| {
+                    fence.validate_retained(valid_end, expected_lsn).is_ok()
+                }) =>
+            {
+                Some((valid_end, WalTailRepairReason::UnsynchronizedSuffix))
             }
+            _ => None,
+        };
+        if let Some((retained, reason)) = damage {
+            if retained < boundary.published_prefix_len {
+                return Err(HawDBError::StorageIntegrity(
+                    "WAL repair would discard a published branch prefix".into(),
+                ));
+            }
+            if let Some(fence) = fence {
+                fence.validate_retained(retained, expected_lsn)?;
+            }
+            let mut plan = build_plan(
+                &boundary.selector_path,
+                &wal_path,
+                &boundary,
+                expected_lsn,
+                retained,
+                wal_len,
+            )?;
+            plan.reason = reason;
+            plan.plan_id = plan_identity(&plan);
+            if let Some(pending) = load_matching_pending_record(path, &plan.plan_id)?
+                && pending.plan != plan
+            {
+                return Err(HawDBError::StorageIntegrity(
+                    "pending WAL repair differs from current plan".into(),
+                ));
+            }
+            return Ok(plan);
+        }
+        let (entry, record_end) = match event {
+            WalCursorEvent::Eof => break,
+            WalCursorEvent::TornTail { .. } => unreachable!("torn tail handled above"),
             WalCursorEvent::Corrupt { offset, reason } => {
                 return Err(HawDBError::Storage(format!(
                     "WAL doctor rejected corruption at byte offset {offset}: {reason}"
@@ -446,30 +508,27 @@ fn inspect_wal_tail_locked(path: &Path, options: WalDoctorOptions) -> Result<Wal
             WalCursorEvent::Entry {
                 entry,
                 start_offset,
+                encoded_len,
                 ..
-            } => (entry, start_offset),
+            } => (entry, start_offset + encoded_len),
         };
-        if entry.lsn != expected_lsn {
-            return Err(HawDBError::Storage(format!(
-                "WAL doctor rejected LSN sequence mismatch at byte offset {record_start}: expected {expected_lsn}, got {}",
-                entry.lsn
-            )));
-        }
-        if let super::WalOp::Batch(operations) = &entry.op
-            && options
-                .max_batch_operations
-                .is_some_and(|limit| operations.len() > limit)
-        {
-            return Err(HawDBError::Storage(format!(
-                "WAL doctor batch operation limit exceeded: max_batch_operations={}",
-                options.max_batch_operations.unwrap_or_default()
-            )));
-        }
+        epoch = epoch.checked_add(1).ok_or_else(|| {
+            HawDBError::StorageIntegrity("WAL transaction epoch overflow during doctor scan".into())
+        })?;
+        super::immutable_root::validate_source_wal_op(
+            &entry.op,
+            epoch,
+            options.max_batch_operations,
+        )?;
+        valid_end = record_end;
         expected_lsn = expected_lsn.checked_add(1).ok_or_else(|| {
             HawDBError::Storage("WAL LSN overflow during doctor scan".to_string())
         })?;
     }
 
+    if let Some(fence) = fence {
+        fence.validate_retained(wal_len, expected_lsn)?;
+    }
     if let Some(record) = load_single_pending_record(path)? {
         validate_pending_truncated_wal(path, &record)?;
         return Ok(record.plan);
@@ -559,7 +618,7 @@ fn apply_wal_tail_repair_locked(
         ));
     }
 
-    let boundary = WalRepairBoundary::load(path, options.max_wal_bytes)?;
+    let boundary = WalRepairBoundary::load(path, options)?;
     if boundary.wal_generation != requested_plan.wal_generation
         || boundary.wal_replay_start_lsn != requested_plan.wal_replay_start_lsn
     {
@@ -595,6 +654,9 @@ fn apply_wal_tail_repair_locked(
                 "pending WAL doctor repair record does not match the requested plan".to_string(),
             ));
         }
+        // The retained prefix may have been prepared by a different reader.
+        // Revalidate its capabilities before publishing a resumed repair.
+        inspect_wal_tail_locked(path, options)?;
         return finalize_repair(path, pending, true);
     }
     if !original_matches {
@@ -621,13 +683,16 @@ fn apply_wal_tail_repair_locked(
                 ));
             }
             validate_quarantine(path, &record)?;
-            record
+            // A previous audit rename can be visible even if its directory
+            // barrier failed. Re-establish evidence and audit durability.
+            prepare_repair(path, &wal_path, requested_plan)?
         }
         None => prepare_repair(path, &wal_path, requested_plan)?,
     };
     validate_quarantine(path, &prepared)?;
     super::process_crash_failpoint("after_wal_repair_prepare");
 
+    protect_repaired_prefix(path, requested_plan)?;
     validate_manifest_identity(path, requested_plan)?;
     let before_truncate = file_checksum(&wal_path)?;
     if !file_identity_matches(
@@ -641,10 +706,17 @@ fn apply_wal_tail_repair_locked(
                 .to_string(),
         ));
     }
-    let wal = OpenOptions::new().read(true).write(true).open(&wal_path)?;
-    wal.set_len(requested_plan.retained_wal_len)?;
-    wal.sync_all()?;
-    sync_parent_dir(&wal_path)?;
+    let wal = repair_io(
+        "open WAL for repair",
+        OpenOptions::new().read(true).write(true).open(&wal_path),
+    )?;
+    repair_io("truncate WAL", wal.set_len(requested_plan.retained_wal_len))?;
+    super::process_crash_failpoint("after_wal_repair_set_len");
+    repair_io("synchronize repaired WAL", wal.sync_all())?;
+    repair_io(
+        "synchronize WAL directory",
+        crate::durability::sync_parent_directory(&wal_path),
+    )?;
     super::process_crash_failpoint("after_wal_repair_truncate");
     let after_truncate = file_checksum(&wal_path)?;
     if !file_identity_matches(
@@ -669,33 +741,67 @@ pub fn prepare_repair(
 ) -> Result<WalRepairAuditRecord> {
     let doctor_dir = doctor_directory(path);
     let quarantine_dir = doctor_dir.join(DOCTOR_QUARANTINE_DIRECTORY);
-    fs::create_dir_all(&quarantine_dir)?;
-    sync_parent_dir(&doctor_dir)?;
-    sync_parent_dir(&quarantine_dir)?;
+    repair_io(
+        "create evidence directory",
+        fs::create_dir_all(&quarantine_dir),
+    )?;
+    repair_io(
+        "synchronize doctor directory",
+        crate::durability::sync_parent_directory(&doctor_dir),
+    )?;
+    repair_io(
+        "synchronize quarantine directory",
+        crate::durability::sync_parent_directory(&quarantine_dir),
+    )?;
     let quarantine_file = quarantine_file_name(plan);
     let quarantine_path = quarantine_dir.join(&quarantine_file);
-    if quarantine_path.exists() {
-        let identity = file_checksum(&quarantine_path)?;
-        if !file_identity_matches(
-            identity,
-            plan.original_wal_len,
-            plan.original_wal_crc32c,
-            &plan.original_wal_sha256,
-        ) {
-            return Err(HawDBError::Storage(
-                "existing WAL doctor quarantine file has the wrong identity".to_string(),
-            ));
+    if !quarantine_path.exists() {
+        let temporary = quarantine_path.with_extension("tail.tmp");
+        let mut source = repair_io("open WAL suffix", File::open(wal_path))?;
+        repair_io(
+            "seek WAL suffix",
+            source.seek(SeekFrom::Start(plan.retained_wal_len)),
+        )?;
+        {
+            let mut output = repair_io("create suffix evidence", File::create(&temporary))?;
+            let copied = repair_io("write suffix evidence", io::copy(&mut source, &mut output))?;
+            if copied != plan.discarded_wal_tail_bytes {
+                return Err(HawDBError::StorageIntegrity(
+                    "WAL changed while preserving the discarded suffix".into(),
+                ));
+            }
+            repair_io("flush suffix evidence", output.flush())?;
+            repair_io("synchronize suffix evidence", output.sync_all())?;
         }
-    } else {
-        super::copy_file_with_checksum(wal_path, &quarantine_path)?;
-        sync_parent_dir(&quarantine_path)?;
+        super::process_crash_failpoint("after_wal_repair_evidence_sync");
+        repair_io(
+            "publish suffix evidence",
+            hawdb_storage::durability::durable_replace_file(&temporary, &quarantine_path),
+        )?;
+        super::process_crash_failpoint("after_wal_repair_evidence_publish");
     }
+    // A visible suffix may come from an interrupted rename. Its data and
+    // namespace must be durable even when this retry did not create it.
+    let evidence = repair_io(
+        "reopen suffix evidence",
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&quarantine_path),
+    )?;
+    repair_io("finish suffix evidence barrier", evidence.sync_all())?;
+    repair_io(
+        "synchronize suffix directory",
+        crate::durability::sync_parent_directory(&quarantine_path),
+    )?;
+    drop(evidence);
     let record = WalRepairAuditRecord {
         protocol: WAL_DOCTOR_REPAIR_PROTOCOL.to_string(),
         state: WalRepairAuditState::Prepared,
         plan: plan.clone(),
         quarantine_file,
     };
+    validate_quarantine(path, &record)?;
     write_audit_record(&pending_record_path(path, plan), &record)?;
     Ok(record)
 }
@@ -706,13 +812,30 @@ fn finalize_repair(
     resumed_interrupted_repair: bool,
 ) -> Result<WalTailRepairReport> {
     validate_quarantine(path, &record)?;
+    protect_repaired_prefix(path, &record.plan)?;
+    let wal_path = path.join(crate::artifact_files::wal_generation_file(
+        record.plan.wal_generation,
+    ));
+    let wal = repair_io(
+        "reopen repaired WAL",
+        OpenOptions::new().read(true).write(true).open(&wal_path),
+    )?;
+    repair_io("finish repaired WAL barrier", wal.sync_all())?;
+    repair_io(
+        "synchronize WAL directory",
+        crate::durability::sync_parent_directory(&wal_path),
+    )?;
     record.state = WalRepairAuditState::Applied;
     let applied_path = applied_record_path(path, &record.plan);
     write_audit_record(&applied_path, &record)?;
+    super::process_crash_failpoint("after_wal_repair_applied");
     let pending_path = pending_record_path(path, &record.plan);
     if pending_path.exists() {
-        fs::remove_file(&pending_path)?;
-        sync_parent_dir(&pending_path)?;
+        repair_io("retire pending audit", fs::remove_file(&pending_path))?;
+        repair_io(
+            "synchronize retired audit",
+            crate::durability::sync_parent_directory(&pending_path),
+        )?;
     }
     Ok(WalTailRepairReport {
         protocol: WAL_DOCTOR_REPAIR_PROTOCOL.to_string(),
@@ -724,11 +847,13 @@ fn finalize_repair(
         quarantine_file: record.quarantine_file,
         repair_record_file: file_name(&applied_path)?,
         resumed_interrupted_repair,
+        reason: record.plan.reason,
+        evidence_directory: doctor_directory(path),
     })
 }
 
 fn validate_manifest_identity(path: &Path, plan: &WalTailRepairPlan) -> Result<()> {
-    let boundary = WalRepairBoundary::load(path, None)?;
+    let boundary = WalRepairBoundary::load(path, WalDoctorOptions::default())?;
     let identity = file_checksum(&boundary.selector_path)?;
     if file_identity_matches(
         identity,
@@ -774,7 +899,7 @@ fn validate_pending_truncated_wal(path: &Path, record: &WalRepairAuditRecord) ->
         ));
     }
     validate_manifest_identity(path, &record.plan)?;
-    let boundary = WalRepairBoundary::load(path, None)?;
+    let boundary = WalRepairBoundary::load(path, WalDoctorOptions::default())?;
     let identity = file_checksum(&boundary.wal_path(path))?;
     if !file_identity_matches(
         identity,
@@ -790,11 +915,51 @@ fn validate_pending_truncated_wal(path: &Path, record: &WalRepairAuditRecord) ->
 }
 
 fn validate_quarantine(path: &Path, record: &WalRepairAuditRecord) -> Result<()> {
-    let identity = file_checksum(
-        &doctor_directory(path)
-            .join(DOCTOR_QUARANTINE_DIRECTORY)
-            .join(&record.quarantine_file),
-    )?;
+    let wal_path = path.join(crate::artifact_files::wal_generation_file(
+        record.plan.wal_generation,
+    ));
+    let mut prefix = repair_io("open retained prefix", File::open(&wal_path))?
+        .take(record.plan.retained_wal_len);
+    let evidence = doctor_directory(path)
+        .join(DOCTOR_QUARANTINE_DIRECTORY)
+        .join(&record.quarantine_file);
+    let tail = repair_io("open suffix for validation", File::open(evidence))?;
+    if repair_io("inspect suffix evidence", tail.metadata())?.len()
+        != record.plan.discarded_wal_tail_bytes
+    {
+        return Err(HawDBError::StorageIntegrity(
+            "WAL repair suffix has the wrong length".into(),
+        ));
+    }
+    // Reconstruct the original identity without retaining a second copy of
+    // the valid prefix. This works before and after the WAL truncation.
+    let mut hasher = IntegrityHasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total = 0;
+    loop {
+        let read = repair_io("read retained prefix", prefix.read(&mut buffer))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        total += read as u64;
+    }
+    if total != record.plan.retained_wal_len {
+        return Err(HawDBError::StorageIntegrity(
+            "WAL repair lost its retained prefix".into(),
+        ));
+    }
+    let mut tail = tail;
+    loop {
+        let read = repair_io("read suffix evidence", tail.read(&mut buffer))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        total += read as u64;
+    }
+    let digest = hasher.finish();
+    let identity = (total, digest.crc32c.as_u64(), digest.sha256);
     if file_identity_matches(
         identity,
         record.plan.original_wal_len,
@@ -851,22 +1016,27 @@ fn write_audit_record(path: &Path, record: &WalRepairAuditRecord) -> Result<()> 
     let parent = path.parent().ok_or_else(|| {
         HawDBError::Storage("WAL doctor audit path has no parent directory".to_string())
     })?;
-    fs::create_dir_all(parent)?;
+    repair_io("create audit directory", fs::create_dir_all(parent))?;
     let encoded = serde_json::to_vec_pretty(record).map_err(|error| {
         HawDBError::Storage(format!("failed to encode WAL doctor audit record: {error}"))
     })?;
     let temp_path = path.with_extension("json.tmp");
     {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp_path)?;
-        std::io::Write::write_all(&mut file, &encoded)?;
-        file.sync_all()?;
+        let mut file = repair_io(
+            "create audit",
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&temp_path),
+        )?;
+        repair_io("write audit", file.write_all(&encoded))?;
+        repair_io("synchronize audit", file.sync_all())?;
     }
-    hawdb_storage::durability::durable_replace_file(&temp_path, path)
-        .map_err(HawDBError::from_storage_error)
+    repair_io(
+        "publish audit",
+        hawdb_storage::durability::durable_replace_file(&temp_path, path),
+    )
 }
 
 #[doc(hidden)]
@@ -963,7 +1133,7 @@ pub fn applied_record_path(path: &Path, plan: &WalTailRepairPlan) -> PathBuf {
 
 fn quarantine_file_name(plan: &WalTailRepairPlan) -> String {
     format!(
-        "wal.{}.{}.before-repair.hawdb",
+        "wal.{}.{}.discarded-tail.hawdb",
         plan.wal_generation, plan.plan_id
     )
 }
@@ -973,4 +1143,70 @@ fn file_name(path: &Path) -> Result<String> {
         .and_then(|name| name.to_str())
         .map(str::to_string)
         .ok_or_else(|| HawDBError::Storage("WAL doctor path has no valid file name".to_string()))
+}
+
+#[cfg(test)]
+#[path = "doctor/format_tests.rs"]
+mod format_tests;
+
+fn repair_io<T>(operation: &'static str, result: io::Result<T>) -> Result<T> {
+    #[cfg(test)]
+    let result = result.and_then(|value| {
+        REPAIR_FAILURE.with(|failure| {
+            if failure
+                .borrow()
+                .as_ref()
+                .is_some_and(|(stage, _)| *stage == operation)
+            {
+                return Err(io::Error::from(
+                    failure.borrow_mut().take().expect("matching failure").1,
+                ));
+            }
+            Ok(())
+        })?;
+        Ok(value)
+    });
+    result.map_err(|error| {
+        if let Some(resource) = hawdb_core::error::file_descriptor_error(&error) {
+            HawDBError::FileDescriptors(resource)
+        } else {
+            HawDBError::WalRecoveryIo {
+                operation,
+                kind: error.kind(),
+                os_code: error.raw_os_error(),
+                message: error.to_string(),
+            }
+        }
+    })
+}
+
+fn protect_repaired_prefix(path: &Path, plan: &WalTailRepairPlan) -> Result<()> {
+    let wal = path.join(crate::artifact_files::wal_generation_file(
+        plan.wal_generation,
+    ));
+    if let Some(mut fence) = super::wal_fence::WalRecoveryFence::load(
+        &wal,
+        plan.wal_generation,
+        plan.wal_replay_start_lsn,
+    )? {
+        fence.validate_retained(plan.retained_wal_len, plan.next_lsn_after_repair)?;
+        if fence.protected_bytes != plan.retained_wal_len
+            || fence.next_lsn != plan.next_lsn_after_repair
+        {
+            fence.protected_bytes = plan.retained_wal_len;
+            fence.next_lsn = plan.next_lsn_after_repair;
+            let directory = crate::file_io::SourceDirectory::capture_for_path(path)?;
+            fence.publish(&wal, &directory)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "doctor/recovery_tests.rs"]
+mod recovery_tests;
+
+#[cfg(test)]
+thread_local! {
+    static REPAIR_FAILURE: std::cell::RefCell<Option<(&'static str, io::ErrorKind)>> = const { std::cell::RefCell::new(None) };
 }

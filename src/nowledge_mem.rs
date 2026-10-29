@@ -220,6 +220,11 @@ pub fn nowledge_mem_graph_config_with_search_mode(
 ) -> DatabaseConfig {
     DatabaseConfig {
         read_only: matches!(mode, NowledgeMemGraphMode::ShadowReadOnly),
+        recovery_mode: if matches!(mode, NowledgeMemGraphMode::ShadowReadOnly) {
+            crate::RecoveryMode::Strict
+        } else {
+            crate::RecoveryMode::default()
+        },
         compressed_vector_search_mode,
         ..DatabaseConfig::default()
     }
@@ -370,6 +375,9 @@ impl NowledgeMemOpenOptions {
 
     /// Overrides resource and storage policy while retaining facade-owned mode
     /// and vector-backend settings.
+    /// An explicit namespace durability anchor also applies to the search
+    /// projection and must contain both paths. The host must already guarantee
+    /// the anchor's namespace durability.
     pub fn with_database_config(mut self, config: DatabaseConfig) -> Self {
         self.database_config = Some(config);
         self
@@ -413,6 +421,9 @@ impl NowledgeMemOpenOptions {
     fn effective_database_config(&self) -> DatabaseConfig {
         let mut config = self.database_config.clone().unwrap_or_default();
         config.read_only = matches!(self.mode, NowledgeMemGraphMode::ShadowReadOnly);
+        if config.read_only {
+            config.recovery_mode = crate::RecoveryMode::Strict;
+        }
         config.compressed_vector_search_mode = self.effective_compressed_vector_search_mode();
         config.adaptive_vector_backend_policy = self.adaptive_vector_backend_policy;
         config
@@ -2369,6 +2380,8 @@ impl crate::executor::ExternalReadOperator for SearchProjectionExternalReadOpera
                         filtered_document_count: retriever.candidate_scan_filtered_document_count,
                         scanned_block_count: retriever.candidate_scan_scanned_block_count,
                         skipped_block_count: retriever.candidate_scan_skipped_block_count,
+                        adaptive_exact_scan_count: retriever
+                            .candidate_scan_adaptive_exact_scan_count,
                         payload_bytes_read: retriever.candidate_scan_payload_bytes_read,
                         admitted_working_bytes: retriever.candidate_scan_admitted_working_bytes,
                     }
@@ -2426,8 +2439,12 @@ fn vector_score_source(value: &str) -> Result<hawdb_executor::VectorScoreSource>
     match value {
         "unavailable" | "none" => Ok(hawdb_executor::VectorScoreSource::Unavailable),
         "raw_vector" => Ok(hawdb_executor::VectorScoreSource::RawVector),
-        "ann_approximate" => Ok(hawdb_executor::VectorScoreSource::AnnApproximate),
-        "quantized_approximate" => Ok(hawdb_executor::VectorScoreSource::QuantizedApproximate),
+        "ann_approximate" | "graph_distance" => {
+            Ok(hawdb_executor::VectorScoreSource::AnnApproximate)
+        }
+        "quantized_approximate" | "quantized_projection" => {
+            Ok(hawdb_executor::VectorScoreSource::QuantizedApproximate)
+        }
         _ => Err(HawDBError::Execution(
             "vector search returned an unsupported score source".to_string(),
         )),
@@ -2478,6 +2495,9 @@ fn vector_fallback_reason_code(
         }
         SearchFallbackReasonCode::CompressedVectorBudgetExceeded => {
             Some(hawdb_executor::VectorFallbackReasonCode::CompressedVectorBudgetExceeded)
+        }
+        SearchFallbackReasonCode::DiskAnnCacheBudgetExceeded => {
+            Some(hawdb_executor::VectorFallbackReasonCode::DiskAnnCacheBudgetExceeded)
         }
         SearchFallbackReasonCode::QueryEmbeddingMissing => {
             Some(hawdb_executor::VectorFallbackReasonCode::QueryEmbeddingMissing)
@@ -2567,11 +2587,15 @@ impl NowledgeMemEmbeddedStore {
         options.validate()?;
         let mut report = options.sanitized_report();
         let graph_config = options.effective_database_config();
+        let namespace_anchor = graph_config.namespace_durability_anchor.clone();
         let mut graph = NowledgeMemGraph::open_with_config_and_runtime_governor(
             &options.graph_path,
             graph_config,
             runtime_governor,
         )?;
+        // Project metadata can open without recovering main's data runtime.
+        // Readiness requires data admission before any host schema mutation.
+        graph.database().commit_epoch()?;
         for registry in &options.system_schema_registries {
             report.system_schema_upgrades.push(
                 graph
@@ -2587,6 +2611,24 @@ impl NowledgeMemEmbeddedStore {
         let Some(path) = options.search_projection_path.as_ref() else {
             return Ok((Self::new(graph, None), report));
         };
+        // A sibling search projection is a separate descriptor domain. Admit
+        // the same explicit host boundary before its internal component opens;
+        // the returned index/reader retains that domain after this guard drops.
+        // Reader modes must not create or synchronize an absent projection.
+        let create_search = matches!(
+            &options.search_projection_open_mode,
+            NowledgeMemSearchProjectionOpenMode::FullResidencyMaintenance
+        );
+        let _search_namespace = namespace_anchor
+            .as_deref()
+            .map(|anchor| {
+                hawdb_storage::file_descriptors::ProjectFileDescriptors::acquire_component_with_namespace_anchor(
+                    path,
+                    create_search,
+                    anchor,
+                )
+            })
+            .transpose()?;
         match &options.search_projection_open_mode {
             NowledgeMemSearchProjectionOpenMode::FullResidencyMaintenance => {
                 let mut projection = NowledgeMemSearchProjection::open(path)?;

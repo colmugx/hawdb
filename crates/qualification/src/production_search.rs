@@ -1370,6 +1370,11 @@ mod tests {
     fn build_out_of_core_projection(path: &Path) {
         let options = SearchOutOfCoreGenerationBuildOptions {
             source_graph_commit_epoch: Some(42),
+            vector_backend: Some(hawdb::VectorIndexBackend::RaBitQ {
+                bit_width: 4,
+                segment_rows: 8192,
+                transform_seed: 0,
+            }),
             embedding_manifest: Some(SearchEmbeddingManifest {
                 model: "test-embedding".to_string(),
                 version: Some("v1".to_string()),

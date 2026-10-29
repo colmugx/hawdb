@@ -38,6 +38,10 @@ on:
         description: "Run the manual RaBitQ baseline instead of binding checks"
         type: boolean
         default: false
+      canonical_vector_lifecycle:
+        description: "Run only the fixed 100k canonical DiskANN CRUD/MVCC matrix"
+        type: boolean
+        default: false
       windows_power_loss_test_threads:
         description: "Parallel Windows GC fault groups (repository uses its variable or 4)"
         type: choice
@@ -53,6 +57,10 @@ on:
       - "scripts/cargo-test-required.sh"
       - "scripts/run-windows-native-bazel.sh"
       - "scripts/run-windows-native-bazel.test.sh"
+      - "scripts/vector_recovery_cases.py"
+      - "scripts/automatic_checkpoint_cases.py"
+      - "scripts/branch-power-loss-shard.py"
+      - "scripts/branch-power-loss-shard.test.py"
       - "scripts/check-windows-native-features.py"
       - "windows_native_features.bzl"
       - ".github/actions/windows-bazel/**"
@@ -77,6 +85,10 @@ on:
       - "scripts/cargo-test-required.sh"
       - "scripts/run-windows-native-bazel.sh"
       - "scripts/run-windows-native-bazel.test.sh"
+      - "scripts/vector_recovery_cases.py"
+      - "scripts/automatic_checkpoint_cases.py"
+      - "scripts/branch-power-loss-shard.py"
+      - "scripts/branch-power-loss-shard.test.py"
       - "scripts/check-windows-native-features.py"
       - "windows_native_features.bzl"
       - ".github/actions/windows-bazel/**"
@@ -92,7 +104,7 @@ on:
       - ".github/workflows/native-bindings.yml"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.windows_abandonment_qualification }}-${{ inputs.boundary_comparison }}-${{ inputs.benchmark_sizes }}-${{ inputs.benchmark_cases }}-${{ inputs.benchmark_layers }}-${{ inputs.benchmark_backends }}-${{ inputs.benchmark_samples }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.windows_abandonment_qualification }}-${{ inputs.boundary_comparison }}-${{ inputs.benchmark_sizes }}-${{ inputs.benchmark_cases }}-${{ inputs.benchmark_layers }}-${{ inputs.benchmark_backends }}-${{ inputs.benchmark_samples }}-${{ inputs.canonical_vector_lifecycle }}
   cancel-in-progress: true
 
 jobs:
@@ -100,7 +112,7 @@ jobs:
     if: >-
       github.event_name != 'schedule' &&
       (github.event_name != 'workflow_dispatch' ||
-       (!inputs.windows_abandonment_qualification && !inputs.boundary_comparison && !inputs.rabitq_baseline))
+       (!inputs.windows_abandonment_qualification && !inputs.boundary_comparison && !inputs.rabitq_baseline && !inputs.canonical_vector_lifecycle))
     name: Bazel native bindings (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
@@ -175,14 +187,17 @@ jobs:
     if: >-
       github.event_name != 'schedule' &&
       (github.event_name != 'workflow_dispatch' ||
-       (!inputs.windows_abandonment_qualification && !inputs.boundary_comparison && !inputs.rabitq_baseline))
+       (!inputs.windows_abandonment_qualification && !inputs.boundary_comparison && !inputs.rabitq_baseline && !inputs.canonical_vector_lifecycle))
     name: Windows Bazel (${{ matrix.shard }})
     runs-on: windows-2025
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        shard: [transactions, storage, search, consumers, identities, snapshots, bindings]
+        shard: [transactions, storage, search, consumers, identities, snapshots, bindings,
+                consumers-recovery-births, consumers-recovery-unselected,
+                consumers-recovery-selected, consumers-recovery-lost-sql,
+                consumers-recovery-lost-nodes]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -224,7 +239,7 @@ jobs:
     if: >-
       github.event_name != 'schedule' &&
       (github.event_name != 'workflow_dispatch' ||
-       (!inputs.windows_abandonment_qualification && !inputs.boundary_comparison && !inputs.rabitq_baseline))
+       (!inputs.windows_abandonment_qualification && !inputs.boundary_comparison && !inputs.rabitq_baseline && !inputs.canonical_vector_lifecycle))
     name: Windows native Clippy
     runs-on: windows-2025
     timeout-minutes: 120
@@ -256,6 +271,7 @@ jobs:
           set -euo pipefail
           python scripts/check-windows-native-features.py
           bash scripts/run-windows-native-bazel.test.sh
+          python scripts/branch-power-loss-shard.test.py
       - name: Run unchanged strict native Windows Clippy
         shell: bash
         run: |
@@ -277,7 +293,7 @@ jobs:
     if: >-
       always() && github.event_name != 'schedule' &&
       (github.event_name != 'workflow_dispatch' ||
-       (!inputs.windows_abandonment_qualification && !inputs.boundary_comparison && !inputs.rabitq_baseline))
+       (!inputs.windows_abandonment_qualification && !inputs.boundary_comparison && !inputs.rabitq_baseline && !inputs.canonical_vector_lifecycle))
     name: Windows native contracts
     runs-on: ubuntu-24.04
     needs: [windows-bazel-contracts, windows-native-clippy]
@@ -350,7 +366,7 @@ jobs:
           key: ${{ steps.bazel.outputs.disk-cache-key }}
 
   boundary-comparison:
-    if: github.event_name == 'workflow_dispatch' && !inputs.windows_abandonment_qualification && inputs.boundary_comparison
+    if: github.event_name == 'workflow_dispatch' && !inputs.windows_abandonment_qualification && !inputs.canonical_vector_lifecycle && inputs.boundary_comparison
     name: Manual ordinary-boundary comparison (Linux)
     runs-on: ubuntu-24.04
     timeout-minutes: 360
@@ -398,7 +414,7 @@ jobs:
           if-no-files-found: error
 
   rabitq-baseline:
-    if: github.event_name == 'workflow_dispatch' && !inputs.windows_abandonment_qualification && inputs.rabitq_baseline
+    if: github.event_name == 'workflow_dispatch' && !inputs.windows_abandonment_qualification && !inputs.canonical_vector_lifecycle && inputs.rabitq_baseline
     name: Manual RaBitQ baseline (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
@@ -464,4 +480,69 @@ jobs:
           path: ${{ runner.temp }}/rabitq-baseline
           if-no-files-found: error
           compression-level: 0
+          retention-days: 14
+
+  canonical-vector-lifecycle:
+    if: github.event_name == 'workflow_dispatch' && !inputs.windows_abandonment_qualification && inputs.canonical_vector_lifecycle
+    name: Manual canonical vector lifecycle (Linux, ${{ matrix.mode }}, rate${{ matrix.rate }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [plain, lsg]
+        rate: [10, 100]
+    env:
+      CARGO_TARGET_DIR: target/canonical-vector-lifecycle
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+
+      - name: Record exact source and compile with the repository profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/canonical-vector-lifecycle"
+          mkdir -p "$evidence"
+          git log -1 --format='%H%n%T%n%P' > "$evidence/source.txt"
+          rustc --version --verbose > "$evidence/toolchain.txt"
+          cp .cargo/config.toml "$evidence/cargo-config.toml"
+          lscpu > "$evidence/cpu.txt"
+          cat /proc/meminfo > "$evidence/memory.txt"
+          /usr/bin/time -v -o "$evidence/compilation.time.txt" \
+            cargo build --locked --all-features --example filtered_diskann_qualification \
+            > "$evidence/compilation.log" 2>&1
+          sha256sum "$CARGO_TARGET_DIR/debug/examples/filtered_diskann_qualification" \
+            > "$evidence/binary.sha256"
+
+      - name: Qualify the complete canonical lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/canonical-vector-lifecycle"
+          mode="${{ matrix.mode }}"
+          rate="${{ matrix.rate }}"
+          status=0
+          name="canonical-100000-128-$mode-rate$rate"
+          if /usr/bin/time -v -o "$evidence/$name.time.txt" \
+            "$CARGO_TARGET_DIR/debug/examples/filtered_diskann_qualification" canonical \
+            "$RUNNER_TEMP/$name" 100000 128 320 "$mode" "$rate" 16 \
+            > "$evidence/$name.jsonl" 2> "$evidence/$name.stderr.txt"; then
+            printf '%s PASS\n' "$name" | tee -a "$evidence/status.txt"
+          else
+            printf '%s FAIL\n' "$name" | tee -a "$evidence/status.txt"
+            status=1
+          fi
+          exit "$status"
+
+      - name: Preserve complete or partial source-bound measurements
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: canonical-vector-lifecycle-${{ github.sha }}-${{ matrix.mode }}-rate${{ matrix.rate }}
+          path: ${{ runner.temp }}/canonical-vector-lifecycle
+          if-no-files-found: error
           retention-days: 14

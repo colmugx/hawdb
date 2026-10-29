@@ -12,8 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Rebuildable RaBitQ candidate projections. Applications integrate through
+//! Rebuildable vector candidate projections. Applications integrate through
 //! the embedded `hawdb` facade, not through experimental index primitives.
+//!
+//! [`diskann`] supplies immutable Vamana graph and file-provider primitives for
+//! Filtered DiskANN integration. It does not independently grant source custody,
+//! database CRUD/MVCC authority or default-engine readiness. The remaining gates
+//! are recorded in `docs/specs/FILTERED_DISKANN_SPEC.md` in the repository.
 //!
 //! # Experimental APIs
 //!
@@ -39,6 +44,7 @@ mod artifact;
 mod build;
 mod codec;
 mod delta;
+pub mod diskann;
 mod error;
 mod hnsw;
 mod kernel;
@@ -59,6 +65,10 @@ pub use delta::{search_with_delta, DeltaBuffer, DeltaMergedSearchOutput};
 pub use error::{ProjectionError, Result};
 pub use hnsw::{HnswBuildConfig, HnswIndex};
 pub use kernel::{KernelPreference, ScanKernel};
+#[doc(hidden)]
+pub fn select_scan_kernel(preference: KernelPreference) -> Result<ScanKernel> {
+    kernel::select_kernel(preference)
+}
 pub use model::{
     InMemoryProjection, ProjectionBuildAdmission, ProjectionBuildConfig, ProjectionBuildReport,
     ProjectionIdentity, ProjectionManifest, ProjectionMetric, RaBitQBitWidth, SegmentDescriptor,

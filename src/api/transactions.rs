@@ -842,6 +842,7 @@ pub(super) fn execute_database_transaction_prepared_sql(
         };
         return observability::admit_append_explain(
             crate::relational_sql::format_append_explain(&plan, report.as_ref()),
+            plan.analyze,
             &runtime.config,
             QueryStreamOptions {
                 max_rows,
@@ -1216,6 +1217,9 @@ pub(super) fn map_transaction_append_error(
     error: hawdb_storage::append_table::AppendTableError,
 ) -> HawDBError {
     match error {
+        hawdb_storage::append_table::AppendTableError::UnsupportedFormat(error) => {
+            HawDBError::UnsupportedStorageFormat(error)
+        }
         hawdb_storage::append_table::AppendTableError::FileDescriptors(error) => {
             HawDBError::FileDescriptors(error)
         }
@@ -1244,6 +1248,9 @@ pub(super) fn map_transaction_relational_error(
     error: hawdb_storage::relational::RelationalError,
 ) -> HawDBError {
     match error {
+        hawdb_storage::relational::RelationalError::UnsupportedFormat(error) => {
+            HawDBError::UnsupportedStorageFormat(error)
+        }
         hawdb_storage::relational::RelationalError::FileDescriptors(error) => {
             HawDBError::FileDescriptors(error)
         }

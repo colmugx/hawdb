@@ -201,6 +201,58 @@ def test_description_type_codes_come_from_python_values(connection):
     assert dbapi.Binary(bytearray(b"x")) == b"x"
 
 
+@pytest.mark.parametrize("autocommit", [False, True])
+def test_catalog_description_and_tuple_order(connection, autocommit):
+    connection.autocommit = autocommit
+    cursor = connection.cursor()
+    cursor.execute(CREATE)
+    for statement, columns, expected in [
+        (
+            "SELECT data_type, column_name FROM information_schema.columns"
+            " WHERE table_name = $1 ORDER BY ordinal_position",
+            ["data_type", "column_name"],
+            [("bigint", "id"), ("text", "name")],
+        ),
+        (
+            "SELECT tablename, schemaname FROM pg_catalog.pg_tables"
+            " WHERE tablename = $1",
+            ["tablename", "schemaname"],
+            [("items", "public")],
+        ),
+    ]:
+        for name, rows in [("items", expected), ("missing", [])]:
+            cursor.execute(statement, (name,))
+            assert [column[0] for column in cursor.description] == columns
+            assert cursor.fetchall() == rows
+    cursor.execute("SELECT * FROM information_schema.tables WHERE table_name = 'items'")
+    assert [column[0] for column in cursor.description] == [
+        "table_catalog", "table_schema", "table_name", "table_type",
+        "self_referencing_column_name", "reference_generation",
+        "user_defined_type_catalog", "user_defined_type_schema", "user_defined_type_name",
+        "is_insertable_into", "is_typed", "commit_action",
+    ]
+    assert cursor.fetchone()[1:4] == ("public", "items", "BASE TABLE")
+
+
+@pytest.mark.parametrize("analyze", [False, True])
+def test_sql_explain_description_and_tuple_order(connection, analyze):
+    cursor = connection.cursor()
+    cursor.execute(CREATE)
+    cursor.execute(INSERT, (1, "one"))
+    keyword = "EXPLAIN ANALYZE" if analyze else "EXPLAIN"
+    cursor.execute(f"{keyword} SELECT name, id FROM items WHERE id = 1")
+    columns = (
+        ["id", "estRows", "actRows", "task", "access object",
+         "execution info", "operator info", "memory", "disk"]
+        if analyze else ["id", "estRows", "task", "access object", "operator info"]
+    )
+    assert [column[0] for column in cursor.description] == columns
+    rows = cursor.fetchall()
+    assert rows
+    assert all(isinstance(row[0], str) for row in rows)
+    assert all(row[columns.index("task")] == "root" for row in rows)
+
+
 def test_type_objects_hash_by_identity():
     assert {dbapi.NUMBER: "number", dbapi.STRING: "string"}[dbapi.NUMBER] == "number"
     assert hash(dbapi.ROWID) == hash(dbapi.ROWID)

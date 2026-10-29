@@ -201,6 +201,7 @@ fn active_manifest_admission_covers_compact_untrusted_segment_sequences() {
         "lexical_manifest_len",
         "lexical_manifest_checksum",
         "rabitq_artifact_file",
+        "diskann_source_digest",
         "rabitq_artifact_len",
         "rabitq_artifact_checksum",
         "rabitq_source_digest",

@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Query stages share one working account. Native result ownership is coordinated
 //! separately; ordinary APIs and complete registered serving remain distinct.
@@ -198,6 +198,15 @@ impl SearchOutOfCoreReader {
                 .map(|context| context.memory.reserve(0))
                 .transpose()?,
         };
+        let mut retained = retained_limit
+            .map(|limit| {
+                BoundedScoreCollector::with_context(
+                    Some(limit),
+                    self.config.max_score_entries.get(),
+                    context,
+                )
+            })
+            .transpose()?;
         for segment in &self.segments {
             if let Some(context) = context {
                 context.checkpoint()?;
@@ -206,19 +215,22 @@ impl SearchOutOfCoreReader {
                 Ok(self.visibility.is_visible(segment.content_segment_id, id)
                     && candidates.contains(id, metrics)?)
             };
-            let report = segment.lexical_projection.score_terms_with_stable_filter(
-                terms,
-                ScoringInputs {
-                    complete_candidate_limit: None,
-                    delta: &crate::lexical_projection::LexicalMiniDelta::default(),
-                    max_term_bytes: self.lexical_term_policy.max_term_bytes(),
-                    retained_score_limit: retained_limit,
-                    global_statistics: Some(statistics),
-                    prune_blocks: prune,
-                    context,
-                },
-                allowed,
-            )?;
+            let report = segment
+                .lexical_projection
+                .score_terms_with_stable_filter_and_floor(
+                    terms,
+                    ScoringInputs {
+                        complete_candidate_limit: None,
+                        delta: &crate::lexical_projection::LexicalMiniDelta::default(),
+                        max_term_bytes: self.lexical_term_policy.max_term_bytes(),
+                        retained_score_limit: retained_limit,
+                        global_statistics: Some(statistics),
+                        prune_blocks: prune,
+                        context,
+                    },
+                    retained.as_ref().and_then(BoundedScoreCollector::floor),
+                    allowed,
+                )?;
             output.matching_count = output
                 .matching_count
                 .checked_add(report.report.matching_document_count)
@@ -234,6 +246,29 @@ impl SearchOutOfCoreReader {
                 if let Some(context) = context {
                     context.checkpoint()?;
                 }
+                if let Some(retained) = &mut retained {
+                    // Do not rely on dropping a losing ID to hide a duplicate
+                    // live layer. Bounds only identify possible overlaps; the
+                    // existing exact routing probe validates membership.
+                    if self.segments.iter().any(|other| {
+                        !std::ptr::eq(other, segment)
+                            && self.visibility.is_visible(other.content_segment_id, &id)
+                            && other.descriptor.segments.iter().any(|range| {
+                                range.first_document_id <= id && id <= range.last_document_id
+                            })
+                    }) {
+                        let route = self.segment_for_document_with_context(&id, context)?;
+                        if let Some(route) = route {
+                            output.bytes_read = output
+                                .bytes_read
+                                .saturating_add(route.lexical_document_bytes_read);
+                        }
+                    }
+                    // Only global K and the current segment's K remain
+                    // resident together, including admission during transfer.
+                    retained.push(id, score)?;
+                    continue;
+                }
                 if output.values.contains_key(&id) {
                     return Err(HawDBError::Storage(format!(
                         "search out-of-core segment set has duplicate document {id}"
@@ -244,6 +279,11 @@ impl SearchOutOfCoreReader {
                 }
                 output.values.insert(id, score);
             }
+        }
+        if let Some(retained) = retained {
+            let scores = retained.finish()?;
+            output.values = scores.values;
+            output._memory = scores.memory;
         }
         if let Some(context) = context {
             context.checkpoint()?;

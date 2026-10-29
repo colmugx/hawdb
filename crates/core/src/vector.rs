@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Shared finite Float32 values and exact distance operators for SQL and Cypher.
 //! The canonical payload is a little-endian u32 dimension followed by f32 bits.
@@ -201,6 +201,20 @@ impl VectorDistance {
         self.distance_coordinates(left.iter().copied(), right.iter().copied(), checkpoint)
     }
 
+    /// Scores a raw query against a validated, byte-backed immutable vector
+    /// without allocating an aligned coordinate copy.
+    pub fn distance_slice_to_vector_with_work(
+        self,
+        left: &[f32],
+        right: VectorRef<'_>,
+        checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<f64> {
+        if left.len() != right.dimension.get() as usize {
+            return Err(invalid("distance dimensions must match"));
+        }
+        self.distance_coordinates(left.iter().copied(), right.coordinates(), checkpoint)
+    }
+
     fn distance_coordinates(
         self,
         left: impl Iterator<Item = f32>,
@@ -274,6 +288,17 @@ mod tests {
                     .distance_slices_with_work(&query, &coordinates, || Ok(()))
                     .unwrap();
                 assert_eq!(projection.to_bits(), canonical.to_bits());
+                let encoded = Vector::new(&coordinates).unwrap();
+                let mut unaligned = vec![0];
+                unaligned.extend_from_slice(encoded.encoded());
+                let mapped = metric
+                    .distance_slice_to_vector_with_work(
+                        &query,
+                        VectorRef::from_encoded(&unaligned[1..]).unwrap(),
+                        || Ok(()),
+                    )
+                    .unwrap();
+                assert_eq!(mapped.to_bits(), canonical.to_bits());
             }
         }
         let distance = |coordinates: &[f32]| {
@@ -307,6 +332,16 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, HawDBError::ProjectionBusy));
         assert_eq!(checkpoints, 2);
+        let encoded = Vector::new(&coordinates).unwrap();
+        let error = VectorDistance::Cosine
+            .distance_slice_to_vector_with_work(&coordinates, encoded.as_ref(), || {
+                Err(HawDBError::ProjectionBusy)
+            })
+            .unwrap_err();
+        assert!(matches!(error, HawDBError::ProjectionBusy));
+        assert!(VectorDistance::Cosine
+            .distance_slice_to_vector_with_work(&[1.0], encoded.as_ref(), || Ok(()))
+            .is_err());
     }
 
     #[test]

@@ -85,6 +85,10 @@ impl GraphReadWork<'_> {
         self.0.is_some()
     }
 
+    pub(crate) fn check_work_limit(self) -> hawdb_core::Result<()> {
+        self.0.map_or(Ok(()), |task| task.check_work_limit())
+    }
+
     pub(crate) fn charge_work(self, units: usize) -> hawdb_core::Result<()> {
         self.0.map_or(Ok(()), |task| task.charge_work(units))
     }

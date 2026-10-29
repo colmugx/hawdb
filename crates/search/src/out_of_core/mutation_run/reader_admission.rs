@@ -126,6 +126,7 @@ impl SearchMutationRun {
             .map_err(|error| HawDBError::Execution(error.to_string()))?;
         Ok(Self {
             body: envelope.body,
+            vector_retraction_count: OnceLock::new(),
             open_working_bytes: working as u64,
             _reader_memory: Some(memory),
         })

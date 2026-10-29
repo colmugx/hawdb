@@ -17,6 +17,8 @@ use std::fmt::{Display, Formatter};
 
 mod resource;
 pub use resource::{ResourceBudgetError, ResourceBudgetKind, ResourceBudgetScope};
+mod storage_format;
+pub use storage_format::StorageFormatError;
 
 /// Descriptor admission failures are distinct from corrupt storage or a busy
 /// branch. Project quota counts belong to one engine resource domain; OS-limit
@@ -95,6 +97,14 @@ pub enum HawDBError {
     Storage(String),
     FileDescriptors(FileDescriptorError),
     StorageIntegrity(String),
+    /// Recovery IO may have completed an effect; reopen to resume its audit.
+    WalRecoveryIo {
+        operation: &'static str,
+        kind: std::io::ErrorKind,
+        os_code: Option<i32>,
+        message: String,
+    },
+    UnsupportedStorageFormat(StorageFormatError),
     /// A registered Search target is retained by another native operation.
     ProjectionBusy,
     Execution(String),
@@ -155,9 +165,11 @@ impl Display for HawDBError {
             HawDBError::Semantic(message) => write!(f, "semantic error: {message}"),
             HawDBError::Storage(message) => write!(f, "storage error: {message}"),
             HawDBError::FileDescriptors(error) => Display::fmt(error, f),
+            HawDBError::WalRecoveryIo { operation, message, .. } => write!(f, "WAL recovery {operation} failed; retain evidence and retry open: {message}"),
             HawDBError::StorageIntegrity(message) => {
                 write!(f, "storage integrity error: {message}")
             }
+            HawDBError::UnsupportedStorageFormat(error) => Display::fmt(error, f),
             HawDBError::ProjectionBusy => f.write_str("search projection operation is busy"),
             HawDBError::Execution(message) => write!(f, "execution error: {message}"),
             HawDBError::ResourceBudgetExceeded(error) => write!(f, "execution error: {error}"),
@@ -219,6 +231,7 @@ impl std::error::Error for HawDBError {
             Self::FileDescriptors(error) => Some(error),
             Self::ResourceBudgetExceeded(error) => Some(error.as_ref()),
             Self::ReadBudgetExceeded(error) => Some(error),
+            Self::UnsupportedStorageFormat(error) => Some(error),
             Self::BranchReclamationBlocked { cause, .. } => Some(cause.as_ref()),
             _ => None,
         }
@@ -238,7 +251,7 @@ impl HawDBError {
         })
     }
 
-    /// Preserve a resource rejection through nested storage error wrappers.
+    /// Preserve typed storage refusals through nested error wrappers.
     pub fn from_storage_error(error: impl std::error::Error + 'static) -> Self {
         if let Some(error) = (&error as &dyn std::error::Error).downcast_ref::<Self>() {
             return error.clone();
@@ -247,6 +260,8 @@ impl HawDBError {
             Self::FileDescriptors(resource)
         } else if let Some(resource) = resource::find_resource_budget_error(&error) {
             Self::from(resource)
+        } else if let Some(error) = storage_format::find_storage_format_error(&error) {
+            Self::UnsupportedStorageFormat(error)
         } else {
             Self::Storage(error.to_string())
         }

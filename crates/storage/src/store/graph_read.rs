@@ -454,6 +454,26 @@ impl GraphStore {
             .map(Option::flatten)
     }
 
+    /// Test visibility in this immutable view without owning property values.
+    pub fn contains_node(&self, id: NodeId) -> Result<bool> {
+        ensure_graph_read_flags_usable(&self.integrity_poisoned, &self.post_wal_apply_poisoned)?;
+        if self.node_tombstones.contains(&id) {
+            return Ok(false);
+        }
+        if self.nodes.contains_key(&id) {
+            return Ok(true);
+        }
+        self.canonical_base
+            .as_ref()
+            .map(|reader| {
+                reader
+                    .with_node_input(id, |_| Ok(()))
+                    .map_err(canonical_segment_error)
+            })
+            .transpose()
+            .map(|node| node.flatten().is_some())
+    }
+
     pub fn node_owned(&self, id: NodeId) -> Result<Option<NodeRecord>> {
         if self.node_tombstones.contains(&id) {
             return Ok(None);

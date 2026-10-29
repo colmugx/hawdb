@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 use super::read::{VectorIndexReadError, VectorIndexReadTransaction};
 use super::*;
@@ -36,6 +36,20 @@ impl VectorIndexLanguageReport {
     /// None means execution did not reach the index operator, for example LIMIT 0.
     pub fn index(&self) -> Option<&VectorIndexQueryReport> {
         self.index.as_deref().map(VectorIndexRetainedOutput::report)
+    }
+
+    /// Logical index reads and spill counters from the retained execution.
+    pub fn index_metrics(&self) -> Option<&crate::SearchOutOfCoreMetrics> {
+        self.index
+            .as_deref()
+            .map(VectorIndexRetainedOutput::metrics)
+    }
+
+    /// Runtime memory still owned by the index output, excluding query rows.
+    pub fn index_retained_capacity_bytes(&self) -> Option<u64> {
+        self.index
+            .as_deref()
+            .map(VectorIndexRetainedOutput::retained_capacity_bytes)
     }
 }
 

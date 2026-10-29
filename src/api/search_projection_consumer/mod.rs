@@ -279,6 +279,7 @@ impl Database {
             destination,
             options,
             RuntimeTaskContext::default(),
+            hawdb_search::consumer::RegisteredConsumerProjector::HostMapping,
             |snapshot, index, _permit| initialize(snapshot, index),
         )
     }
@@ -289,6 +290,7 @@ impl Database {
         destination: &Path,
         options: SearchProjectionConsumerOptions,
         task: RuntimeTaskContext,
+        projector: hawdb_search::consumer::RegisteredConsumerProjector,
         initialize: F,
     ) -> SearchProjectionConsumerResult<SearchProjectionConsumer>
     where
@@ -316,7 +318,13 @@ impl Database {
             .verify_search_consumer_allocation_evidence()?;
         let destination = normalize_consumer_target(destination)?;
         let destination = destination.as_path();
-        let permit = self.consumer_publication_permit()?;
+        let permit = if projector
+            == hawdb_search::consumer::RegisteredConsumerProjector::CanonicalVectorField
+        {
+            self.vector_consumer_publication_permit(&task)?
+        } else {
+            self.consumer_publication_permit()?
+        };
         let recovery = self
             .runtime
             .get_mut()?
@@ -436,6 +444,7 @@ impl Database {
                 limits: registered_creation_limits(),
                 recovery_memory,
                 previous: None,
+                projector,
             },
             |index| initialize(&mut snapshot, index, &permit),
         );
@@ -578,6 +587,33 @@ impl Database {
         id: &SearchProjectionConsumerId,
         projection_directory: impl AsRef<Path>,
     ) -> SearchProjectionConsumerResult<SearchProjectionConsumer> {
+        self.open_search_projection_consumer_with_task(
+            id,
+            projection_directory,
+            RuntimeTaskContext::default(),
+        )
+    }
+
+    /// Reopen with an explicit working-memory ceiling and cancellation state.
+    /// The task must be unbound. Its memory reservation is admitted against the
+    /// host governor; an absent reservation retains the 64 MiB default.
+    /// Generation and resident compatibility limits remain unchanged.
+    pub fn open_search_projection_consumer_with_task(
+        &mut self,
+        id: &SearchProjectionConsumerId,
+        projection_directory: impl AsRef<Path>,
+        task: RuntimeTaskContext,
+    ) -> SearchProjectionConsumerResult<SearchProjectionConsumer> {
+        if task.has_resource_controllers() {
+            return Err(
+                HawDBError::Semantic("Consumer open requires an unbound task".into()).into(),
+            );
+        }
+        task.checkpoint()
+            .map_err(|reason| HawDBError::Execution(reason.to_string()))?;
+        let working_bytes = task
+            .memory_reservation()
+            .map_or(64 << 20, |reservation| reservation.memory_bytes());
         let _descriptor_operation = self.internal_descriptor_operation()?;
         self.ensure_writable()?;
         self.reload_consumer_registry_if_unavailable()?;
@@ -589,7 +625,7 @@ impl Database {
             .contains_key(id.as_str())
         {
             let destination = normalize_consumer_target(projection_directory.as_ref())?;
-            let permit = self.consumer_publication_permit()?;
+            let permit = self.consumer_publication_permit_with_limits(working_bytes, 0)?;
             let recovery = self
                 .runtime
                 .get_mut()?
@@ -605,13 +641,10 @@ impl Database {
                     .insert(id.as_str().into(), recovery);
                 return Err(Error::InvalidHandle);
             }
-            return match recovery.retry(&permit, RuntimeTaskContext::default()) {
-                Ok(Some(prepared)) => self.finish_consumer_creation(
-                    id.clone(),
-                    prepared,
-                    permit,
-                    RuntimeTaskContext::default(),
-                ),
+            return match recovery.retry(&permit, task.clone()) {
+                Ok(Some(prepared)) => {
+                    self.finish_consumer_creation(id.clone(), prepared, permit, task)
+                }
                 Ok(None) => Err(Error::InvalidHandle),
                 Err(error) => Err(self.retain_consumer_recovery(id, *error)?),
             };
@@ -643,7 +676,7 @@ impl Database {
         {
             return Err(Error::InvalidHandle);
         }
-        let permit = self.consumer_publication_permit()?;
+        let permit = self.consumer_publication_permit_with_limits(working_bytes, 0)?;
         let (request, context) = {
             let runtime = self.runtime.get()?;
             (
@@ -666,7 +699,7 @@ impl Database {
                 parent,
                 &destination,
                 permit,
-                RuntimeTaskContext::default(),
+                task,
                 RegisteredConsumerLimits::default(),
             )
         })() {
@@ -720,7 +753,7 @@ impl Database {
         ) -> Result<SearchProjectionRelationalDelta>,
     {
         let _descriptor_operation = self.internal_descriptor_operation()?;
-        if consumer.search_index()?.vector_index_descriptor().is_some() {
+        if consumer.vector_index_descriptor()?.is_some() {
             return Err(HawDBError::Semantic(
                 "schema-bound vector indexes require rebuild_vector_index maintenance".into(),
             )
@@ -791,6 +824,7 @@ impl Database {
                     limits: RegisteredConsumerLimits::default(),
                     recovery_memory,
                     previous: Some(consumer.projection()),
+                    projector: hawdb_search::consumer::RegisteredConsumerProjector::HostMapping,
                 },
                 |index| {
                     consumer.projection().copy_completed_documents_into(index)?;
@@ -842,6 +876,7 @@ impl Database {
         &mut self,
         consumer: &mut SearchProjectionConsumer,
         task: RuntimeTaskContext,
+        admission_error: &mut Option<hawdb_qos::RuntimeAdmissionError>,
         initialize: F,
     ) -> SearchProjectionConsumerResult<()>
     where
@@ -849,9 +884,10 @@ impl Database {
             &mut DatabaseReadTransaction,
             &mut SearchIndex,
             &hawdb_qos::RuntimePermit,
-            &SearchIndex,
+            &hawdb_core::VectorIndexDescriptor,
         ) -> Result<()>,
     {
+        *admission_error = None;
         if task.has_resource_controllers() {
             return Err(HawDBError::Execution(
                 "Consumer rebuild task already has a resource controller".into(),
@@ -860,10 +896,22 @@ impl Database {
         }
         task.checkpoint()
             .map_err(|reason| HawDBError::Execution(reason.to_string()))?;
+        let _descriptor_operation = self.internal_descriptor_operation()?;
         let root = self.consumer_writable_root()?;
         self.reload_consumer_registry_if_unavailable()?;
         self.validate_consumer_receipt(consumer)?;
-        let permit = self.consumer_publication_permit()?;
+        // Keep the pre-effect governor refusal typed across the generic
+        // Consumer result, without changing admission or custody ordering.
+        let permit =
+            self.admit_vector_consumer_publication(&task)
+                .map_err(|error| match error {
+                    crate::VectorIndexBuildError::Admission(error) => {
+                        *admission_error = Some(error);
+                        HawDBError::Execution(error.to_string())
+                    }
+                    crate::VectorIndexBuildError::Query(error) => error,
+                    error => HawDBError::Execution(error.to_string()),
+                })?;
         let mut snapshot = self.begin_read_transaction_with_context(&task)?;
         let recovery_memory = permit
             .reserve_retained_memory(
@@ -888,8 +936,15 @@ impl Database {
                 limits: RegisteredConsumerLimits::default(),
                 recovery_memory,
                 previous: Some(consumer.projection()),
+                projector:
+                    hawdb_search::consumer::RegisteredConsumerProjector::CanonicalVectorField,
             },
-            |index| initialize(&mut snapshot, index, &permit, consumer.search_index()?),
+            |index| {
+                let definition = consumer.vector_index_descriptor()?.ok_or_else(|| {
+                    HawDBError::Semantic("Consumer has no vector index definition".into())
+                })?;
+                initialize(&mut snapshot, index, &permit, definition)
+            },
         );
         drop(snapshot);
         let prepared = match prepared {
@@ -1158,7 +1213,7 @@ impl Database {
             Err(Error::RebuildRequired(reason)) => status.state = State::RebuildRequired(reason),
             Err(error) => return Err(error),
         }
-        let freshness = consumer.search_index()?.projection_freshness();
+        let freshness = consumer.projection_freshness()?;
         let changefeed = status.changefeed.readiness_after(
             freshness.source_graph_commit_epoch,
             freshness.durable_source_graph_commit_epoch,
@@ -1232,9 +1287,44 @@ impl Database {
         &mut self,
         result_bytes: u64,
     ) -> Result<Arc<hawdb_qos::RuntimePermit>> {
+        self.consumer_publication_permit_with_limits(64 << 20, result_bytes)
+    }
+
+    fn vector_consumer_publication_permit(
+        &mut self,
+        task: &RuntimeTaskContext,
+    ) -> Result<Arc<hawdb_qos::RuntimePermit>> {
+        self.admit_vector_consumer_publication(task)
+            .map_err(|error| match error {
+                crate::VectorIndexBuildError::Query(error) => error,
+                error => HawDBError::Execution(error.to_string()),
+            })
+    }
+
+    fn admit_vector_consumer_publication(
+        &mut self,
+        task: &RuntimeTaskContext,
+    ) -> std::result::Result<Arc<hawdb_qos::RuntimePermit>, crate::VectorIndexBuildError> {
+        let working_bytes = task.memory_reservation().map_or(64 << 20, |reservation| {
+            reservation.memory_bytes().max(64 << 20)
+        });
         self.consumer_governor()?
             .try_admit(
-                hawdb_qos::RuntimeWorkRequest::background_maintenance(64 * 1024 * 1024)
+                hawdb_qos::RuntimeWorkRequest::background_maintenance(working_bytes)
+                    .with_io_wave_slots(1),
+            )
+            .map(Arc::new)
+            .map_err(crate::VectorIndexBuildError::Admission)
+    }
+
+    fn consumer_publication_permit_with_limits(
+        &mut self,
+        working_bytes: u64,
+        result_bytes: u64,
+    ) -> Result<Arc<hawdb_qos::RuntimePermit>> {
+        self.consumer_governor()?
+            .try_admit(
+                hawdb_qos::RuntimeWorkRequest::background_maintenance(working_bytes)
                     .with_result_bytes(result_bytes)
                     .with_io_wave_slots(1),
             )
@@ -1339,7 +1429,7 @@ impl Database {
         if !consumer.projection().binding_is_valid() {
             return Err(Error::RebuildRequired(Reason::UntrackedProjectionMutation));
         }
-        let freshness = consumer.search_index()?.projection_freshness();
+        let freshness = consumer.projection_freshness()?;
         if freshness.source_graph_commit_epoch != Some(receipt.source_epoch)
             || freshness.has_uncheckpointed_changes
         {

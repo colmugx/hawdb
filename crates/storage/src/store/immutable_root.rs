@@ -877,10 +877,7 @@ impl GraphStore {
             .map_err(|error| {
                 BranchAdmissionError::Recovery(HawDBError::from_storage_error(error))
             })?;
-        if matches!(
-            request.replay_config.recovery_mode,
-            RecoveryMode::AutoRepairTornTail | RecoveryMode::DoctorRepairTornTail
-        ) {
+        if request.replay_config.recovery_mode == RecoveryMode::DoctorRepairTornTail {
             return Err(BranchAdmissionError::Recovery(HawDBError::Storage(
                 "automatic repair of a branch private WAL requires branch-aware repair publication"
                     .into(),
@@ -1327,6 +1324,42 @@ impl GraphStore {
             None
         };
 
+        // Check reader capabilities before replacing disposable runtime files.
+        // Keep the captured WAL handle so namespace replacement cannot redirect admission.
+        let mut format_limits = request.replay_config;
+        let mut check_formats = || -> Result<()> {
+            let bytes = objects
+                .read(root.durable_manifest)
+                .map_err(HawDBError::from_storage_error)?;
+            let text = std::str::from_utf8(&bytes).map_err(|_| {
+                HawDBError::StorageIntegrity("sealed durable manifest is not UTF-8".into())
+            })?;
+            let manifest = super::DurableManifest::decode(text)?;
+            manifest.validate()?;
+            super::format_admission::validate_sealed_formats(
+                &objects,
+                &root,
+                manifest,
+                &mut format_limits,
+            )?;
+            let captured = captured_active_wal.is_some();
+            let file = match captured_active_wal.take() {
+                Some(file) => file,
+                None => crate::file_io::File::open(&active_wal_path)?,
+            };
+            let (_, file) = super::format_admission::validate_wal_formats_from_file(
+                file,
+                root.commit_epoch,
+                &mut format_limits,
+                true,
+            )?;
+            if captured {
+                captured_active_wal = Some(file);
+            }
+            Ok(())
+        };
+        let format_result = check_formats();
+
         let runtime_directory = branch_directory.join("runtime");
         // Mutable WAL dependencies survive disposable-runtime cleanup. They
         // belong to this UUID, never to its parent or to the materialization.
@@ -1335,6 +1368,7 @@ impl GraphStore {
             validate_captured_admission_namespace(project, &branch_lease, branch_directory)?;
         }
         let result = (|| {
+            format_result.map_err(BranchAdmissionError::Recovery)?;
             mount_branch_runtime(
                 &objects,
                 &root,
@@ -1483,7 +1517,10 @@ impl GraphStore {
                 // A known replaced/uncertain locator cannot authorize unlink.
                 // Relative cleanup and the remaining runtime paths are still
                 // pending; retain this evidence when the legacy fence refuses.
-                if project.is_none_or(|project| {
+                if !matches!(
+                    error,
+                    BranchAdmissionError::Recovery(HawDBError::UnsupportedStorageFormat(_))
+                ) && project.is_none_or(|project| {
                     validate_captured_admission_namespace(project, &branch_lease, branch_directory)
                         .is_ok()
                 }) {
@@ -2333,7 +2370,7 @@ fn ensure_source_wal_budget(entries: u64, bytes: u64, config: WalReplayConfig) -
     Ok(())
 }
 
-fn validate_source_wal_op(
+pub(super) fn validate_source_wal_op(
     op: &crate::wal::WalOp,
     epoch: u64,
     max_batch_ops: Option<usize>,
@@ -2345,7 +2382,7 @@ fn validate_source_wal_op(
                 record,
                 crate::relational::RelationalDecodeLimits::wal(),
             )
-            .map_err(HawDBError::from_storage_error)?
+            .map_err(crate::relational::RelationalError::into_wal_recovery_error)?
             .epoch,
         ),
         WalOp::RelationalSnapshot { record } => Some(
@@ -2353,7 +2390,7 @@ fn validate_source_wal_op(
                 record,
                 crate::relational::RelationalDecodeLimits::checkpoint(),
             )
-            .map_err(HawDBError::from_storage_error)?
+            .map_err(crate::relational::RelationalError::into_wal_recovery_error)?
             .epoch,
         ),
         WalOp::Append { record } => Some(
@@ -2882,6 +2919,7 @@ fn combine_recovery_reports(
         .saturating_add(private_wal.replayed_wal_bytes);
     sealed_root.torn_tail_ignored |= private_wal.torn_tail_ignored;
     sealed_root.torn_tail_repaired |= private_wal.torn_tail_repaired;
+    sealed_root.wal_repair = private_wal.wal_repair.or(sealed_root.wal_repair);
     sealed_root.discarded_wal_tail_bytes = sealed_root
         .discarded_wal_tail_bytes
         .saturating_add(private_wal.discarded_wal_tail_bytes);
@@ -3641,6 +3679,7 @@ mod tests {
         for read_only in [false, true] {
             let mut request = request();
             request.read_only = read_only;
+            request.replay_config.recovery_mode = RecoveryMode::Strict;
             let admitted = GraphStore::admit_captured_branch(request).unwrap();
             assert_eq!(admitted.store().node_count_for_label(None), 2);
             assert_eq!(

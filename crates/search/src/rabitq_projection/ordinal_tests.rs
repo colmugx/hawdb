@@ -221,6 +221,7 @@ fn resident_and_out_of_core_writers_emit_identical_vector_artifacts() {
             let documents = seeded_documents(count as u64, count);
             let directory = root.join(format!("{count}-{bit_width:?}"));
             let options = SearchOutOfCoreGenerationBuildOptions {
+                vector_backend: None,
                 rabitq_bit_width: bit_width,
                 rabitq_segment_rows: NonZeroUsize::new(7).unwrap(),
                 rabitq_transform_seed: 17,
@@ -300,6 +301,7 @@ fn resident_and_out_of_core_writers_emit_identical_vector_artifacts() {
 fn checkpoint_reopen_restores_generation_local_mapping_after_mutations() {
     let root = super::tests::unique_test_dir("ordinal-reopen");
     let mut index = SearchIndex::open(&root).unwrap();
+    index.set_rabitq_projection_build_options(Default::default());
     for (id, vector) in [
         ("b", Some(vec![1.0, 0.0])),
         ("c", None),

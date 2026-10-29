@@ -455,6 +455,9 @@ impl RelationalOverflowRootReader {
 
 fn publication_error(error: RelationalError) -> RelationalOverflowPublicationError {
     match error {
+        RelationalError::UnsupportedFormat(error) => {
+            RelationalOverflowPublicationError::UnsupportedFormat(error)
+        }
         RelationalError::FileDescriptors(error) => {
             RelationalOverflowPublicationError::FileDescriptors(error)
         }

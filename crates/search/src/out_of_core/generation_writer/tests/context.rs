@@ -264,7 +264,10 @@ fn cancellation_after_vector_core_calls_preserves_the_active_generation() {
         let task = context(32 * 1024 * 1024);
         let mut writer = SearchOutOfCoreGenerationWriter::create_with_context(
             &root,
-            Default::default(),
+            SearchOutOfCoreGenerationBuildOptions {
+                vector_backend: None,
+                ..Default::default()
+            },
             task.clone(),
         )
         .unwrap();

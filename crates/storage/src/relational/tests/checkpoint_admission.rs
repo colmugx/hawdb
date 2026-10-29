@@ -1530,6 +1530,7 @@ fn controlled_update_match_denies_wide_key_before_copy_and_retries() {
                 changed_keys: &mut changed,
                 checkpoint_allocations: Some(&context),
                 replay_access_tracker: None,
+                primary_key_lookup: true,
             },
         );
         let wide_allocations = observer.finish();

@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Registered stationary generations. Construction and resident compatibility
 //! loading finish before selection; the selector never moves a live directory.
@@ -47,6 +47,16 @@ pub struct RegisteredConsumerPreparation<'a> {
     pub limits: RegisteredConsumerLimits,
     pub recovery_memory: RuntimeRetainedMemory,
     pub previous: Option<&'a ConsumerProjection>,
+    pub projector: RegisteredConsumerProjector,
+}
+
+/// Chosen by the facade before invoking any host initializer. A builder's
+/// completion marker alone cannot grant fixed-projector publication authority.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisteredConsumerProjector {
+    HostMapping,
+    CanonicalVectorField,
 }
 
 #[derive(Debug)]
@@ -187,6 +197,7 @@ impl ConsumerProjection {
             limits,
             recovery_memory,
             previous,
+            projector,
         } = preparation;
         let mut cleanup = UnsealedRegisteredConsumer {
             birth: Some(birth),
@@ -230,7 +241,9 @@ impl ConsumerProjection {
                     permit: Arc::clone(&permit),
                     task: task.clone(),
                     generation_bytes: limits.generation_bytes,
+                    projector,
                 },
+                previous,
                 initialize,
             )?;
             if !producer
@@ -292,14 +305,14 @@ impl ConsumerProjection {
             )?;
             {
                 let mut output = target.begin_candidate_output(total)?;
-                output.install_artifact(
+                output.install_sealed_artifact_link(
                     scratch_directory,
                     crate::out_of_core::OUT_OF_CORE_MANIFEST_FILE,
                     crate::out_of_core::OUT_OF_CORE_MANIFEST_FILE,
                     manifest,
                 )?;
                 for artifact in &artifacts {
-                    output.install_artifact(
+                    output.install_sealed_artifact_link(
                         scratch_directory,
                         artifact.name,
                         artifact.name,
@@ -573,13 +586,127 @@ impl ConsumerProjection {
     /// Populate a private candidate without changing the selected version or
     /// its completed cursor. The host's hydrator still runs against one pinned E.
     pub fn copy_completed_documents_into(&self, target: &mut SearchIndex) -> Result<()> {
-        self.require_completed_view()?;
+        self.index()?;
         target.documents = self.index.documents.clone();
         target.embedding_manifest = self.index.embedding_manifest.clone();
         target.embedding_dimension = self.index.embedding_dimension;
         target.import_source_graph_commit_epoch = self.index.import_source_graph_commit_epoch;
         target.source_graph_commit_epoch = self.index.source_graph_commit_epoch;
         Ok(())
+    }
+
+    pub(crate) fn canonical_vector_summary(
+        &self,
+    ) -> Result<crate::vector_index::VectorDocumentSummary> {
+        self.require_completed_view()?;
+        let summary = self
+            .index
+            .vector_document_summary
+            .ok_or_else(|| invalid("vector baseline has no logical summary"))?;
+        if self.index.canonical_vector_source_epoch != self.index.source_graph_commit_epoch
+            || self.index.canonical_vector_source_epoch.is_none()
+            || summary.document_count != summary.vector_document_count
+        {
+            return Err(invalid(
+                "vector baseline was not built by the fixed canonical projector",
+            ));
+        }
+        Ok(summary)
+    }
+
+    fn write_vector_successor(
+        &self,
+        index: &SearchIndex,
+        target: &SearchProjectionPublishLease,
+        task: RuntimeTaskContext,
+        generation_bytes: NonZeroU64,
+        permit: Arc<RuntimePermit>,
+    ) -> Result<crate::snapshot_writer::SearchSnapshotWriteReport> {
+        self.canonical_vector_summary()?;
+        let delta = index
+            .canonical_vector_delta
+            .as_ref()
+            .ok_or_else(|| invalid("vector successor has no changes"))?;
+        let binding = index
+            .consumer_binding
+            .as_ref()
+            .ok_or_else(|| invalid("vector successor has no binding"))?;
+        if self.index.canonical_vector_source_epoch != Some(delta.base_epoch)
+            || self.index.vector_index_descriptor != index.vector_index_descriptor
+            || binding.database_uuid != self.binding().database_uuid
+            || binding.projection_uuid != self.binding().projection_uuid
+            || binding.consumer_id != self.binding().consumer_id
+        {
+            return Err(invalid(
+                "vector successor does not match its completed base",
+            ));
+        }
+        self.stationary
+            .as_ref()
+            .ok_or_else(|| invalid("vector baseline is not stationary"))?
+            .view
+            .write_vector_successor(index, self, target, task, generation_bytes, permit)
+    }
+
+    pub(crate) fn seed_vector_producer(
+        &self,
+        target: &SearchProjectionPublishLease,
+        memory: &BuildMemory,
+        task: &RuntimeTaskContext,
+        generation_bytes: u64,
+    ) -> Result<()> {
+        self.canonical_vector_summary()?;
+        // Includes bounded decode, sorted reference collection and verification scratch.
+        let _metadata = memory.spool.reserve(
+            crate::out_of_core::MAX_OUT_OF_CORE_MANIFEST_BYTES as usize * 16
+                + crate::build_memory::SPOOL_BUFFER_BYTES,
+        )?;
+        let references =
+            crate::out_of_core::consumer_producer_references(self.authority.publication())?;
+        let total = references.artifacts.iter().try_fold(
+            references.manifest.byte_length,
+            |total, (_, reference)| {
+                total
+                    .checked_add(reference.byte_length)
+                    .ok_or_else(|| invalid("vector baseline byte length overflow"))
+            },
+        )?;
+        if total > generation_bytes {
+            return Err(invalid(
+                "vector baseline exceeds successor generation admission",
+            ));
+        }
+        let mut buffer = [0; crate::build_memory::SPOOL_BUFFER_BYTES];
+        self.authority
+            .publication()
+            .with_captured_directory(|source| {
+                target.with_captured_directory(|destination| {
+                    let context = source.operation_context();
+                    for (name, reference) in std::iter::once((
+                        crate::out_of_core::OUT_OF_CORE_MANIFEST_FILE,
+                        references.manifest,
+                    ))
+                    .chain(
+                        references
+                            .artifacts
+                            .iter()
+                            .map(|(name, reference)| (name.as_str(), *reference)),
+                    ) {
+                        let file = open_verified_candidate_child(
+                            source,
+                            &context,
+                            name,
+                            reference,
+                            task,
+                            &mut buffer,
+                            None,
+                        )?;
+                        source.link_child_new(&context, name, &file, destination, name)?;
+                    }
+                    destination.sync(&destination.operation_context())?;
+                    Ok(())
+                })
+            })
     }
 }
 
@@ -790,6 +917,7 @@ struct ProducerControls {
     permit: Arc<RuntimePermit>,
     task: RuntimeTaskContext,
     generation_bytes: NonZeroU64,
+    projector: RegisteredConsumerProjector,
 }
 
 fn initialize_producer<F>(
@@ -798,6 +926,7 @@ fn initialize_producer<F>(
     binding: ConsumerBinding,
     epoch: u64,
     controls: ProducerControls,
+    previous: Option<&ConsumerProjection>,
     initialize: F,
 ) -> Result<ConsumerProjection>
 where
@@ -831,7 +960,18 @@ where
                 HawDBError::Execution("Consumer initializer panicked before publication".into())
             })??;
     }
+    if index.canonical_vector_source_epoch.is_some()
+        != (controls.projector == RegisteredConsumerProjector::CanonicalVectorField)
+    {
+        return Err(invalid(
+            "canonical vector completion differs from the admitted projector",
+        ));
+    }
     if !authority.owns(&index)
+        || !index.consumer_binding_valid
+        || index
+            .canonical_vector_source_epoch
+            .is_some_and(|source| source != epoch)
         || index.path.is_some()
         || index.consumer_binding.is_some()
         || index
@@ -859,13 +999,24 @@ where
     };
     context.with_component_context(label, || {
         if producer.index.vector_index_descriptor.is_some() {
-            let snapshot = crate::SearchOutOfCoreGenerationWriter::write_consumer(
-                &producer.index,
-                producer.authority.publication(),
-                task,
-                controls.generation_bytes,
-                controls.permit,
-            )?;
+            let snapshot = match producer.index.canonical_vector_delta.as_ref() {
+                Some(_) => previous
+                    .ok_or_else(|| invalid("vector delta has no selected base"))?
+                    .write_vector_successor(
+                        &producer.index,
+                        producer.authority.publication(),
+                        task,
+                        controls.generation_bytes,
+                        controls.permit,
+                    )?,
+                None => crate::SearchOutOfCoreGenerationWriter::write_consumer(
+                    &producer.index,
+                    producer.authority.publication(),
+                    task,
+                    controls.generation_bytes,
+                    controls.permit,
+                )?,
+            };
             *producer
                 .index
                 .consumer_receipt
@@ -889,7 +1040,7 @@ where
             producer.pending_mutation = false;
             Ok(producer.receipt())
         } else {
-            producer.checkpoint_inner(false)
+            producer.checkpoint_inner_with_task(false, &task)
         }
     })??;
     if !producer

@@ -17,6 +17,11 @@ use crate::error::{ProjectionError, Result};
 use crate::model::RaBitQBitWidth;
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod avx2;
+#[cfg(target_arch = "aarch64")]
+mod neon;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanKernel {
@@ -46,22 +51,37 @@ pub enum KernelPreference {
 
 pub(crate) fn select_kernel(preference: KernelPreference) -> Result<ScanKernel> {
     match preference {
-        // Faiss's current ARM_NEON RaBitQ entry points intentionally delegate
-        // to their scalar reference implementation. Keep the same correctness
-        // boundary while reporting the actual scorer as Scalar.
+        KernelPreference::Auto | KernelPreference::Avx2 if avx2_available() => Ok(ScanKernel::Avx2),
+        // NEON remains explicit until native AArch64 performance is qualified.
         KernelPreference::Auto | KernelPreference::Scalar => Ok(ScanKernel::Scalar),
         KernelPreference::Avx2 => Err(ProjectionError::UnsupportedKernel("avx2")),
-        KernelPreference::Neon => select_neon_scalar_fallback(),
+        KernelPreference::Neon => select_neon(),
     }
 }
 
-#[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
-fn select_neon_scalar_fallback() -> Result<ScanKernel> {
+fn avx2_available() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    return std::is_x86_feature_detected!("avx2");
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    false
+}
+
+#[cfg(target_arch = "aarch64")]
+fn select_neon() -> Result<ScanKernel> {
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        Ok(ScanKernel::Neon)
+    } else {
+        Err(ProjectionError::UnsupportedKernel("neon"))
+    }
+}
+
+#[cfg(target_arch = "arm")]
+fn select_neon() -> Result<ScanKernel> {
     Ok(ScanKernel::Scalar)
 }
 
 #[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
-fn select_neon_scalar_fallback() -> Result<ScanKernel> {
+fn select_neon() -> Result<ScanKernel> {
     Err(ProjectionError::UnsupportedKernel("neon"))
 }
 
@@ -80,14 +100,35 @@ pub(crate) fn score_codes(codes: &[u8], query: &[f32], bit_width: RaBitQBitWidth
 pub(crate) type ScoreFunction = fn(&[u8], &[f32], RaBitQBitWidth) -> f32;
 
 pub(crate) fn score_function(_kernel: ScanKernel) -> ScoreFunction {
-    // The initial RaBitQ switch retains a single scalar reference kernel on
-    // every target. SIMD implementations are a later optimization and must
-    // prove exact ordering parity against this code before dispatch changes.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if _kernel == ScanKernel::Avx2 {
+        return avx2::score_codes;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if _kernel == ScanKernel::Neon {
+        return neon::score_codes;
+    }
     score_codes
 }
 
 #[cfg(test)]
+fn native_simd_preference() -> Option<KernelPreference> {
+    [KernelPreference::Avx2, KernelPreference::Neon]
+        .into_iter()
+        .find(|preference| {
+            matches!(
+                select_kernel(*preference),
+                Ok(ScanKernel::Avx2 | ScanKernel::Neon)
+            )
+        })
+}
+
+#[cfg(test)]
 mod benchmark;
+#[cfg(test)]
+mod parity_tests;
+#[cfg(test)]
+mod scan_tests;
 
 #[cfg(test)]
 mod tests {
@@ -112,11 +153,30 @@ mod tests {
     }
 
     #[test]
-    fn explicit_avx2_kernel_selection_is_rejected_until_implemented() {
-        assert!(matches!(
-            select_kernel(KernelPreference::Avx2),
-            Err(ProjectionError::UnsupportedKernel("avx2"))
-        ));
+    fn kernel_selection_matches_cpu_capabilities() {
+        assert_eq!(
+            select_kernel(KernelPreference::Scalar).unwrap(),
+            ScanKernel::Scalar
+        );
+        if avx2_available() {
+            assert_eq!(
+                select_kernel(KernelPreference::Avx2).unwrap(),
+                ScanKernel::Avx2
+            );
+            assert_eq!(
+                select_kernel(KernelPreference::Auto).unwrap(),
+                ScanKernel::Avx2
+            );
+        } else {
+            assert!(matches!(
+                select_kernel(KernelPreference::Avx2),
+                Err(ProjectionError::UnsupportedKernel("avx2"))
+            ));
+            assert_eq!(
+                select_kernel(KernelPreference::Auto).unwrap(),
+                ScanKernel::Scalar
+            );
+        }
     }
 
     #[cfg(not(any(target_arch = "aarch64", target_arch = "arm")))]
@@ -128,11 +188,31 @@ mod tests {
         ));
     }
 
-    #[cfg(any(target_arch = "aarch64", target_arch = "arm"))]
+    #[cfg(target_arch = "arm")]
     #[test]
     fn explicit_neon_kernel_selection_uses_the_scalar_fallback() {
         assert_eq!(
             select_kernel(KernelPreference::Neon).unwrap(),
+            ScanKernel::Scalar
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn explicit_neon_selection_matches_cpu_capabilities() {
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            assert_eq!(
+                select_kernel(KernelPreference::Neon).unwrap(),
+                ScanKernel::Neon
+            );
+        } else {
+            assert!(matches!(
+                select_kernel(KernelPreference::Neon),
+                Err(ProjectionError::UnsupportedKernel("neon"))
+            ));
+        }
+        assert_eq!(
+            select_kernel(KernelPreference::Auto).unwrap(),
             ScanKernel::Scalar
         );
     }

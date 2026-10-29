@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Schema resolution and Consumer ownership for explicit vector indexes.
 
@@ -12,7 +12,7 @@ use hawdb_integrity::IntegrityHasher;
 use hawdb_storage::relational::RelationalScalarType;
 
 mod build;
-pub use build::{VectorIndexBuildError, VectorIndexBuildOptions};
+pub use build::{VectorIndexBuildError, VectorIndexBuildOptions, VectorIndexUpdateReport};
 mod language;
 pub use language::{
     VectorIndexLanguageBudget, VectorIndexLanguageReport, VectorIndexSqlReport,

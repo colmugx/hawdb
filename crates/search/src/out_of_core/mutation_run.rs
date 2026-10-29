@@ -27,6 +27,7 @@ use crate::{checksum_bytes, SearchDocument};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::OnceLock;
 
 mod read;
 mod read_encoding;
@@ -231,6 +232,7 @@ struct SearchMutationRunEnvelope {
 #[derive(Debug)]
 pub(super) struct SearchMutationRun {
     body: SearchMutationRunBody,
+    vector_retraction_count: OnceLock<usize>,
     open_working_bytes: u64,
     _reader_memory: Option<crate::build_memory::read::ReaderMemory>,
 }
@@ -306,6 +308,17 @@ impl MutationVisibility {
 
     pub(super) fn retractions(&self) -> impl Iterator<Item = &SearchMutationRunEntry> {
         self.runs.iter().flat_map(SearchMutationRun::entries)
+    }
+
+    pub(super) fn vector_retraction_count(&self, index: usize) -> Option<usize> {
+        self.runs.get(index)?.vector_retraction_count.get().copied()
+    }
+
+    #[cfg(feature = "vector-search")]
+    pub(super) fn total_vector_retractions(&self) -> Option<usize> {
+        self.runs.iter().try_fold(0usize, |total, run| {
+            total.checked_add(*run.vector_retraction_count.get()?)
+        })
     }
 
     pub(super) fn visible_count(
@@ -575,6 +588,7 @@ impl SearchMutationRun {
         budget.retain(add(retained, target_index_bytes)?)?;
         Ok(Self {
             body: envelope.body,
+            vector_retraction_count: OnceLock::new(),
             open_working_bytes: working_bytes,
             _reader_memory: None,
         })
@@ -582,6 +596,15 @@ impl SearchMutationRun {
 
     pub(super) fn entries(&self) -> &[SearchMutationRunEntry] {
         &self.body.entries
+    }
+
+    pub(super) fn record_vector_retraction_count(&self, count: usize) -> Result<()> {
+        if *self.vector_retraction_count.get_or_init(|| count) != count {
+            return Err(HawDBError::StorageIntegrity(
+                "validated vector retraction count changed".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -761,115 +784,123 @@ pub(super) fn validate_targets_with_admission<'a>(
     } else {
         None
     };
-    for entry in runs.flat_map(SearchMutationRun::entries) {
-        crate::build_control::checkpoint(task)?;
-        let mut terms = entry
-            .retraction
-            .unique_terms
-            .cursor_with_query_context(query)?;
-        let missing = || {
-            HawDBError::Storage(
-                "search mutation-run target document is absent from its content segment".into(),
-            )
-        };
-        let artifact = segments
-            .iter()
-            .find(|segment| segment.content_segment_id == entry.target_segment_id)
-            .ok_or_else(missing)?;
-        let id = entry.document_id.as_str();
-        let position = artifact
-            .descriptor
-            .segments
-            .binary_search_by(|segment| {
-                if segment.last_document_id.as_str() < id {
-                    std::cmp::Ordering::Less
-                } else if segment.first_document_id.as_str() > id {
-                    std::cmp::Ordering::Greater
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
-            .map_err(|_| missing())?;
-        if !artifact
-            .lexical_projection
-            .probe_document_id_with_admission(id, admission)?
-            .present
-        {
-            return Err(missing());
-        }
-        let file = {
-            let _io = admission
-                .map(|(admission, _)| admission.io())
-                .transpose()
-                .map_err(|error| HawDBError::Execution(error.to_string()))?;
-            if let Some(body) = &mut captured_body {
-                use std::io::{Seek, SeekFrom};
-                body.set_len(0)?;
-                body.seek(SeekFrom::Start(0))?;
-                body.try_clone()?
-            } else {
-                hawdb_storage::file_io::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .open(&*path)?
+    for run in runs {
+        let mut vector_retractions = 0usize;
+        for entry in run.entries() {
+            crate::build_control::checkpoint(task)?;
+            let mut terms = entry
+                .retraction
+                .unique_terms
+                .cursor_with_query_context(query)?;
+            let missing = || {
+                HawDBError::Storage(
+                    "search mutation-run target document is absent from its content segment".into(),
+                )
+            };
+            let artifact = segments
+                .iter()
+                .find(|segment| segment.content_segment_id == entry.target_segment_id)
+                .ok_or_else(missing)?;
+            let id = entry.document_id.as_str();
+            let position = artifact
+                .descriptor
+                .segments
+                .binary_search_by(|segment| {
+                    if segment.last_document_id.as_str() < id {
+                        std::cmp::Ordering::Less
+                    } else if segment.first_document_id.as_str() > id {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+                .map_err(|_| missing())?;
+            if !artifact
+                .lexical_projection
+                .probe_document_id_with_admission(id, admission)?
+                .present
+            {
+                return Err(missing());
             }
-        };
-        let limits = (
-            config.max_uncompressed_segment_bytes.get(),
-            config.max_document_header_bytes.get(),
-        );
-        let source = match admission {
-            Some((admission, maximum)) => {
-                super::hydration::source::Source::capture_with_read_admission(
+            let file = {
+                let _io = admission
+                    .map(|(admission, _)| admission.io())
+                    .transpose()
+                    .map_err(|error| HawDBError::Execution(error.to_string()))?;
+                if let Some(body) = &mut captured_body {
+                    use std::io::{Seek, SeekFrom};
+                    body.set_len(0)?;
+                    body.seek(SeekFrom::Start(0))?;
+                    body.try_clone()?
+                } else {
+                    hawdb_storage::file_io::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(&*path)?
+                }
+            };
+            let limits = (
+                config.max_uncompressed_segment_bytes.get(),
+                config.max_document_header_bytes.get(),
+            );
+            let source = match admission {
+                Some((admission, maximum)) => {
+                    super::hydration::source::Source::capture_with_read_admission(
+                        artifact,
+                        &artifact.descriptor.segments[position],
+                        id,
+                        file,
+                        limits,
+                        admission,
+                        maximum,
+                    )?
+                }
+                None => super::hydration::source::Source::capture(
                     artifact,
                     &artifact.descriptor.segments[position],
                     id,
                     file,
                     limits,
-                    admission,
-                    maximum,
-                )?
+                    memory,
+                    task,
+                )?,
+            };
+            let length = artifact.lexical_projection.source_retraction(
+                &source,
+                analyzer,
+                crate::lexical_projection::retraction::RetractionContext {
+                    root: &stage.path,
+                    scratch: stage.scratch_directory(),
+                    memory,
+                    task,
+                    needs_chinese: source.needs_chinese,
+                    source_policy,
+                },
+                |term| {
+                    if terms.next()?.as_deref() != Some(&term) {
+                        return Err(HawDBError::Storage(
+                            "search mutation-run retraction does not match its target document"
+                                .into(),
+                        ));
+                    }
+                    Ok(())
+                },
+            )?;
+            if terms.next()?.is_some()
+                || length != entry.retraction.lexical_document_len
+                || source.documents_digest()? != entry.retraction.documents_digest
+            {
+                return Err(HawDBError::Storage(
+                    "search mutation-run retraction does not match its target document".into(),
+                ));
             }
-            None => super::hydration::source::Source::capture(
-                artifact,
-                &artifact.descriptor.segments[position],
-                id,
-                file,
-                limits,
-                memory,
-                task,
-            )?,
-        };
-        let length = artifact.lexical_projection.source_retraction(
-            &source,
-            analyzer,
-            crate::lexical_projection::retraction::RetractionContext {
-                root: &stage.path,
-                scratch: stage.scratch_directory(),
-                memory,
-                task,
-                needs_chinese: source.needs_chinese,
-                source_policy,
-            },
-            |term| {
-                if terms.next()?.as_deref() != Some(&term) {
-                    return Err(HawDBError::Storage(
-                        "search mutation-run retraction does not match its target document".into(),
-                    ));
-                }
-                Ok(())
-            },
-        )?;
-        if terms.next()?.is_some()
-            || length != entry.retraction.lexical_document_len
-            || source.documents_digest()? != entry.retraction.documents_digest
-        {
-            return Err(HawDBError::Storage(
-                "search mutation-run retraction does not match its target document".into(),
-            ));
+            vector_retractions = vector_retractions
+                .checked_add(usize::from(source.header.embedding.is_some()))
+                .ok_or_else(size_overflow)?;
         }
+        run.record_vector_retraction_count(vector_retractions)?;
     }
     Ok(())
 }
@@ -1098,11 +1129,13 @@ mod tests {
         second.target_segment_id = 8;
         let visibility = MutationVisibility::from_validated_runs(vec![
             SearchMutationRun {
+                vector_retraction_count: OnceLock::new(),
                 open_working_bytes: 0,
                 _reader_memory: None,
                 body: SearchMutationRunBody::new(3, 5, vec![first]).unwrap(),
             },
             SearchMutationRun {
+                vector_retraction_count: OnceLock::new(),
                 open_working_bytes: 0,
                 _reader_memory: None,
                 body: SearchMutationRunBody::new(4, 5, vec![second]).unwrap(),
@@ -1116,6 +1149,7 @@ mod tests {
         combined.target_segment_id = 8;
         let combined_visibility =
             MutationVisibility::from_validated_runs(vec![SearchMutationRun {
+                vector_retraction_count: OnceLock::new(),
                 open_working_bytes: 0,
                 _reader_memory: None,
                 body: SearchMutationRunBody::new(5, 5, vec![entry("memory:001"), combined])

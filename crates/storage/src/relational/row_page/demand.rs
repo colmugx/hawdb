@@ -236,6 +236,7 @@ pub enum RelationalRowPageDemandReadError {
     Corrupt(String),
     Durability(String),
     FileDescriptors(hawdb_core::error::FileDescriptorError),
+    UnsupportedFormat(hawdb_core::error::StorageFormatError),
     MissingTable(String),
     Stopped(RuntimeCancellationReason),
 }
@@ -253,6 +254,7 @@ impl fmt::Display for RelationalRowPageDemandReadError {
                 write!(formatter, "corrupt relational row demand reader: {message}")
             }
             Self::FileDescriptors(error) => fmt::Display::fmt(error, formatter),
+            Self::UnsupportedFormat(error) => fmt::Display::fmt(error, formatter),
             Self::Durability(message) => {
                 write!(
                     formatter,
@@ -276,6 +278,7 @@ impl std::error::Error for RelationalRowPageDemandReadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::FileDescriptors(error) => Some(error),
+            Self::UnsupportedFormat(error) => Some(error),
             Self::Stopped(reason) => Some(reason),
             _ => None,
         }
@@ -1358,6 +1361,9 @@ impl<'a> DemandReadContext<'a> {
         error: RelationalOverflowPublicationError,
     ) -> RelationalRowPageDemandReadError {
         let mapped = match error {
+            RelationalOverflowPublicationError::UnsupportedFormat(error) => {
+                RelationalRowPageDemandReadError::UnsupportedFormat(error)
+            }
             RelationalOverflowPublicationError::FileDescriptors(error) => {
                 RelationalRowPageDemandReadError::FileDescriptors(error)
             }
@@ -1628,6 +1634,9 @@ fn map_row_publication_error(
     error: RelationalRowPagePublicationError,
 ) -> RelationalRowPageDemandReadError {
     match error {
+        RelationalRowPagePublicationError::UnsupportedFormat(error) => {
+            RelationalRowPageDemandReadError::UnsupportedFormat(error)
+        }
         RelationalRowPagePublicationError::FileDescriptors(error) => {
             RelationalRowPageDemandReadError::FileDescriptors(error)
         }

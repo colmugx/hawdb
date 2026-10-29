@@ -113,6 +113,19 @@ pub struct AppendGenerationManifest {
 }
 
 impl AppendGenerationManifest {
+    pub(crate) fn read_file(
+        path: &Path,
+        config: AppendPublicationConfig,
+    ) -> Result<Self, AppendTableError> {
+        validate_config(config)?;
+        let encoded = read_bounded(
+            path,
+            config.max_manifest_bytes,
+            "append generation manifest",
+        )?;
+        decode_manifest(&encoded, config)
+    }
+
     /// Reads one self-authenticating historical generation manifest without
     /// requiring the current durable-manifest binding. This is used by
     /// generation reclamation to retain immutable segments referenced by a
@@ -124,12 +137,7 @@ impl AppendGenerationManifest {
     ) -> Result<Self, AppendTableError> {
         validate_config(config)?;
         let path = directory.join(append_generation_manifest_file(generation));
-        let encoded = read_bounded(
-            &path,
-            config.max_manifest_bytes,
-            "append generation manifest",
-        )?;
-        let manifest = decode_manifest(&encoded, config)?;
+        let manifest = Self::read_file(&path, config)?;
         if manifest.generation != generation {
             return Err(AppendTableError::Corruption(format!(
                 "append generation manifest {} identifies generation {}",

@@ -267,6 +267,22 @@ pub trait GraphExecutionRead {
         None
     }
 
+    /// Optional scalar-index projection with before-copy admission and bounded
+    /// work. The caller proves complete index coverage in its catalog snapshot.
+    /// None must not invoke the consumer or reserve ownership; use the ordinary
+    /// admitted property scan for readers without this capability.
+    fn visit_indexed_projected_nodes_by_property_admitted(
+        &self,
+        _label_id: LabelId,
+        _property: &str,
+        _values: &[hawdb_core::Value],
+        _properties: &BTreeSet<String>,
+        _admit: &mut hawdb_storage::read_view::GraphReadAllocator<'_>,
+        _consumer: &mut dyn FnMut(ProjectedNodeRecord) -> Result<ScanControl>,
+    ) -> Result<Option<ScanControl>> {
+        Ok(None)
+    }
+
     fn node_count_for_label(&self, label_id: Option<LabelId>) -> usize;
 
     fn relationship_count_for_type(&self, rel_type: Option<RelTypeId>) -> usize;

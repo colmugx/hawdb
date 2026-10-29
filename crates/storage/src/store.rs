@@ -98,6 +98,7 @@ mod durable;
 mod graph_apply;
 #[path = "store/graph_checkpoint.rs"]
 mod graph_checkpoint;
+mod wal_fence;
 #[doc(hidden)]
 pub use graph_checkpoint::CheckpointPreparation;
 #[path = "store/graph_checkpoint_candidate.rs"]
@@ -130,6 +131,7 @@ mod read_dependencies;
 pub use read_dependencies::ReadDependencyValidationFailures;
 #[doc(hidden)]
 pub use read_dependencies::{GraphReadDependencies, GraphReadDependencyError};
+mod format_admission;
 #[path = "store/graph_recovery.rs"]
 mod graph_recovery;
 #[path = "store/immutable_root.rs"]
@@ -403,8 +405,7 @@ use wal_codec::frame::{
     encode_binary_wal_header, frame_binary_wal_record, WAL_BINARY_FILE_HEADER_BYTES,
 };
 use wal_codec::{
-    quarantine_corrupt_wal, reject_corrupt_wal_record, WalCursorEvent, WalEntry, WalOp,
-    WalOpenOutcome, WalRecordCursor,
+    reject_corrupt_wal_record, WalCursorEvent, WalEntry, WalOp, WalOpenOutcome, WalRecordCursor,
 };
 
 use hawdb_storage::durable_manifest::{safe_reclaim_commit_epoch, STORAGE_VERSION};
@@ -1818,6 +1819,29 @@ impl GraphStore {
         durable_manifest_open_micros: u64,
         replay: impl FnOnce(&mut Self, &mut Catalog, WalReplayConfig) -> Result<StorageRecoveryReport>,
     ) -> Result<(Self, Catalog)> {
+        // Legacy stores do not pass through immutable branch admission.
+        // Check all selected codec capabilities before cleanup or runtime writes.
+        if durable.wal_path.parent() == Some(durable.root_path.as_path()) {
+            let manifest = DurableManifest::load(durable.manifest_path())?;
+            let mut limits = replay_config;
+            format_admission::validate_checkpoint_formats(manifest, limits, |name| {
+                Ok(durable.root_path.join(name))
+            })?;
+            if fs::try_exists(&durable.wal_path)? && fs::metadata(&durable.wal_path)?.len() != 0 {
+                format_admission::validate_wal_formats(
+                    &durable.wal_path,
+                    manifest.checkpoint_commit_epoch,
+                    &mut limits,
+                    true,
+                )?;
+            }
+        }
+        if !durable.read_only {
+            cleanup_abandoned_checkpoint_preparations(
+                &durable.root_path,
+                durable.checkpoint_epoch,
+            )?;
+        }
         let projection_generation_root = durable.root_path.join("projection-generations");
         let projection_generations = if durable.read_only {
             if projection_generation_root.exists() {
@@ -3595,8 +3619,14 @@ mod tests {
         let domain =
             crate::file_descriptors::ProjectFileDescriptors::acquire_existing(&path, 64).unwrap();
         drop(store);
-        let (repaired, _) =
-            GraphStore::open_for_derived_repair(&path, WalReplayConfig::default()).unwrap();
+        let (repaired, _) = GraphStore::open_for_derived_repair(
+            &path,
+            WalReplayConfig {
+                recovery_mode: crate::config::RecoveryMode::Strict,
+                ..WalReplayConfig::default()
+            },
+        )
+        .unwrap();
         assert_eq!(repaired.file_descriptor_metrics().unwrap().limit, 64);
         assert!(matches!(
             crate::file_descriptors::ProjectFileDescriptors::acquire_existing(&path, 256),
@@ -8708,6 +8738,7 @@ mod tests {
         let store = GraphStore::open(&path, &mut catalog).unwrap();
         assert_eq!(store.commit_epoch(), 2);
         assert_eq!(store.search_projection_change_log_start_epoch(), 0);
+        assert!(store.node_owned(NodeId(0)).unwrap().is_none());
         assert_eq!(
             store.search_projection_graph_changes_after(0),
             vec![
@@ -8723,7 +8754,7 @@ mod tests {
                 },
                 SearchProjectionGraphChange {
                     commit_epoch: 2,
-                    upsert_node_ids: Vec::new(),
+                    upsert_node_ids: vec![0],
                     delete_document_ids: vec!["memory:deleted-memory".to_string()],
                     relational_primary_key_changes:
                         hawdb_storage::relational::RelationalPrimaryKeyChangeCapture::Captured {
@@ -9127,7 +9158,10 @@ mod tests {
             &path,
             &mut catalog,
             DurabilityPolicy::default(),
-            replay,
+            WalReplayConfig {
+                recovery_mode: crate::config::RecoveryMode::Strict,
+                ..replay
+            },
         )
         .unwrap();
         assert_eq!(
@@ -9288,7 +9322,10 @@ mod tests {
             &path,
             &mut catalog,
             durability,
-            replay,
+            WalReplayConfig {
+                recovery_mode: crate::config::RecoveryMode::Strict,
+                ..replay
+            },
         )
         .unwrap();
         assert_private_checkpoint_recovery_rows(&read_only, epoch, &row);
@@ -9561,7 +9598,10 @@ mod tests {
                     &path,
                     &mut catalog,
                     durability,
-                    replay,
+                    WalReplayConfig {
+                        recovery_mode: crate::config::RecoveryMode::Strict,
+                        ..replay
+                    },
                 )
                 .unwrap();
                 check(&read_only, 4);
@@ -13271,7 +13311,13 @@ mod tests {
             .unwrap();
 
         let mut catalog = Catalog::default();
-        let error = GraphStore::open(&path, &mut catalog).unwrap_err();
+        let error = GraphStore::open_with_durability_and_recovery(
+            &path,
+            &mut catalog,
+            DurabilityPolicy::SyncOnEveryWrite,
+            crate::config::RecoveryMode::Strict,
+        )
+        .unwrap_err();
         assert!(error
             .to_string()
             .contains("strict WAL recovery rejected torn tail"));

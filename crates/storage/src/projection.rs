@@ -449,6 +449,7 @@ pub struct StorageRecoveryReport {
     pub torn_tail_repaired: bool,
     pub discarded_wal_tail_bytes: u64,
     pub torn_tail_reason: Option<String>,
+    pub wal_repair: Option<crate::doctor::WalTailRepairReport>,
     pub recovered_commit_epoch: u64,
 }
 
@@ -522,6 +523,8 @@ pub struct PropertyIndexProjectionRebuildAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchProjectionChange {
     pub commit_epoch: u64,
+    /// Native changed-node candidates, including deleted nodes. A projector
+    /// hydrates the pinned end epoch and retracts its own ID when absent.
     pub upsert_node_ids: Vec<u64>,
     pub delete_document_ids: Vec<String>,
     pub relational_primary_key_changes: RelationalPrimaryKeyChangeCapture,

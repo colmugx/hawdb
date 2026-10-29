@@ -286,15 +286,41 @@ jobs:
           - os: macos-latest
             shard: full
           - os: windows-latest
-            shard: head
+            shard: head-every-write
           - os: windows-latest
-            shard: manifest
+            shard: head-checkpoint
           - os: windows-latest
-            shard: root
+            shard: manifest-every-write
           - os: windows-latest
-            shard: wal-sync
+            shard: manifest-checkpoint
+          - os: windows-latest
+            shard: root-every-write
+          - os: windows-latest
+            shard: root-checkpoint
+          - os: windows-latest
+            shard: wal-sync-every-write
+          - os: windows-latest
+            shard: wal-sync-checkpoint
           - os: windows-latest
             shard: remaining
+          - os: windows-latest
+            shard: consumer-publication
+          - os: windows-latest
+            shard: search-publication
+          - os: windows-latest
+            shard: branch-gc
+          - os: windows-latest
+            shard: abandonment
+          - os: windows-latest
+            shard: recovery-births
+          - os: windows-latest
+            shard: recovery-unselected
+          - os: windows-latest
+            shard: recovery-selected
+          - os: windows-latest
+            shard: recovery-lost-sql
+          - os: windows-latest
+            shard: recovery-lost-nodes
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -348,6 +374,26 @@ jobs:
             "$test_filter" -- "${test_arguments[@]}" 2>&1 \
             | tee branch-power-loss-results/test-output.txt
           test_status=$?
+          if [[ "$test_status" -eq 0 ]]; then
+            recovery_scope=remaining
+            automatic_scope=remaining
+            case "$POWER_LOSS_SHARD" in
+              recovery-*|full) recovery_scope="$POWER_LOSS_SHARD" ;;
+            esac
+            case "$POWER_LOSS_SHARD" in
+              head-*|root-*|wal-sync-*|manifest-*|full) automatic_scope="$POWER_LOSS_SHARD" ;;
+            esac
+            python3 scripts/vector_recovery_cases.py "$recovery_scope" \
+              --validate-log branch-power-loss-results/test-output.txt \
+              > branch-power-loss-results/recovery-coverage.json
+            test_status=$?
+            if [[ "$test_status" -eq 0 ]]; then
+              python3 scripts/automatic_checkpoint_cases.py "$automatic_scope" \
+                --validate-log branch-power-loss-results/test-output.txt \
+                > branch-power-loss-results/automatic-coverage.json
+              test_status=$?
+            fi
+          fi
           set -e
           df -Pk . "${TMPDIR:-/tmp}" > branch-power-loss-results/disk-after.txt
           namespace_assumption=posix-directory-sync

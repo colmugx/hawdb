@@ -104,6 +104,9 @@ fn qualification_probe_error(
         "relational index qualification probe {ordinal} on {table}.{index} failed: {error}"
     );
     match error {
+        RelationalIndexShadowError::UnsupportedFormat(error) => {
+            HawDBError::UnsupportedStorageFormat(error)
+        }
         RelationalIndexShadowError::FileDescriptors(error) => HawDBError::FileDescriptors(error),
         RelationalIndexShadowError::Corrupt(_) => HawDBError::StorageIntegrity(context),
         RelationalIndexShadowError::Admission(_)

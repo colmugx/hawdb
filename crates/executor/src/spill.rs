@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 mod compaction;
 mod pool;
+mod sort_keys;
 
 pub(crate) use compaction::{
     compact_runs_serial, compact_runs_with_memory, default_compaction_worker_limit,
@@ -58,6 +59,7 @@ pub struct SpillRun {
 struct RunMemory {
     record: AtomicUsize,
     staging: AtomicUsize,
+    sort_key: AtomicUsize,
 }
 
 impl SpillRun {
@@ -67,6 +69,10 @@ impl SpillRun {
 
     pub(crate) fn staging_bytes(&self) -> usize {
         self.memory.staging.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn sort_key_bytes(&self) -> usize {
+        self.memory.sort_key.load(Ordering::Relaxed)
     }
 
     pub(crate) fn create_with_buffer_bytes(
@@ -133,9 +139,15 @@ impl SpillRun {
         &self,
         buffer_bytes: NonZeroUsize,
     ) -> Result<SpillReader> {
-        let file = self
-            .lease
-            .file_descriptors()
+        self.reader_with_context(buffer_bytes, self.lease.file_descriptors())
+    }
+
+    pub(crate) fn reader_with_context(
+        &self,
+        buffer_bytes: NonZeroUsize,
+        context: &hawdb_storage::file_descriptors::FileOpenContext,
+    ) -> Result<SpillReader> {
+        let file = context
             .open(OpenOptions::new().read(true), self.lease.path())
             .map_err(|error| spill_io_error("open spill run", self.lease.path(), error))?;
         Ok(SpillReader {
@@ -152,6 +164,10 @@ pub struct SpillWriter {
 }
 
 impl SpillWriter {
+    pub(crate) fn note_sort_key_bytes(&self, bytes: usize) {
+        self.memory.sort_key.fetch_max(bytes, Ordering::Relaxed);
+    }
+
     pub(crate) fn note_merge_record_bytes(&self, bytes: usize) {
         self.memory.record.fetch_max(bytes, Ordering::Relaxed);
     }
@@ -167,27 +183,27 @@ impl SpillWriter {
         self.memory
             .staging
             .fetch_max(encoded_len, Ordering::Relaxed);
-        let _staging_lease = spill_budget.reserve_staging(encoded_len)?;
-        let mut payload = Vec::with_capacity(encoded_len);
-        write_u64(&mut payload, ordinal)?;
-        write_binding(&mut payload, binding)?;
-        if payload.len() != encoded_len {
-            return Err(HawDBError::Execution(format!(
-                "spill binding codec declared {encoded_len} bytes but encoded {} bytes",
-                payload.len()
-            )));
-        }
-        let payload_len = u64::try_from(payload.len()).map_err(|_| {
+        let payload_len = u64::try_from(encoded_len).map_err(|_| {
             HawDBError::Execution("spill record exceeds the supported size".to_string())
         })?;
         let record_bytes = payload_len.saturating_add(8);
         let (reservation, budget_reservation) = spill_budget.reserve_write(record_bytes)?;
-        self.writer
-            .write_all(&payload_len.to_le_bytes())
-            .and_then(|_| self.writer.write_all(&payload))
-            .map_err(|error| {
-                HawDBError::Execution(format!("failed to write spill run: {error}"))
-            })?;
+        // Preflight above validates the whole binding before changing the run.
+        // Encode into the existing IO buffer so spilling a full operator does
+        // not need a second, record-sized allocation to make progress.
+        write_u64(&mut self.writer, payload_len)?;
+        let mut payload = SpillPayloadWriter {
+            writer: &mut self.writer,
+            remaining: encoded_len,
+        };
+        write_u64(&mut payload, ordinal)?;
+        write_binding(&mut payload, binding)?;
+        if payload.remaining != 0 {
+            return Err(HawDBError::Execution(format!(
+                "spill binding codec declared {encoded_len} bytes but encoded {} bytes",
+                encoded_len - payload.remaining
+            )));
+        }
         reservation.commit(&self.lease);
         budget_reservation.commit();
         Ok(record_bytes)
@@ -223,6 +239,29 @@ impl SpillWriter {
         })?;
         self.lease.mark_flushed();
         Ok(())
+    }
+}
+
+struct SpillPayloadWriter<'a, W> {
+    writer: &'a mut W,
+    remaining: usize,
+}
+
+impl<W: Write> Write for SpillPayloadWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.remaining {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "spill binding codec exceeded its declared length",
+            ));
+        }
+        let written = self.writer.write(bytes)?;
+        self.remaining -= written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
     }
 }
 
@@ -491,16 +530,14 @@ fn estimate_binding_memory_bytes(input: &mut Cursor<&[u8]>) -> Result<usize> {
         let (properties, _) = estimate_value_map_memory(input, 0, true)?;
         payload_bytes = encoded_len_add(payload_bytes, properties)?;
     }
-    let entry_count = values
-        .checked_add(nodes)
-        .and_then(|count| count.checked_add(relationships))
-        .ok_or_else(|| HawDBError::Execution("spill binding entry count overflow".to_string()))?;
+    let values_layout = encoded_len_mul(values, std::mem::size_of::<usize>() * 6)?;
+    let graph_layout = encoded_len_add(
+        crate::binding::graph_slot_memory_bytes(nodes),
+        crate::binding::graph_slot_memory_bytes(relationships),
+    )?;
     encoded_len_add(
         std::mem::size_of::<Binding>(),
-        encoded_len_add(
-            payload_bytes,
-            encoded_len_mul(entry_count, std::mem::size_of::<usize>() * 6)?,
-        )?,
+        encoded_len_add(payload_bytes, encoded_len_add(values_layout, graph_layout)?)?,
     )
 }
 
@@ -706,7 +743,7 @@ fn encoded_len_mul(left: usize, right: usize) -> Result<usize> {
         .ok_or_else(|| HawDBError::Execution("spill record encoded length overflow".to_string()))
 }
 
-fn write_binding(output: &mut Vec<u8>, binding: &Binding) -> Result<()> {
+fn write_binding(output: &mut impl Write, binding: &Binding) -> Result<()> {
     write_value_map(output, &binding.values, 0)?;
     write_len(output, binding.nodes.len())?;
     for (name, node) in &binding.nodes {
@@ -766,13 +803,13 @@ fn read_binding(input: &mut Cursor<&[u8]>) -> Result<Binding> {
     }
     Ok(Binding {
         values,
-        nodes,
-        relationships,
+        nodes: nodes.into(),
+        relationships: relationships.into(),
     })
 }
 
 fn write_value_map(
-    output: &mut Vec<u8>,
+    output: &mut impl Write,
     values: &BTreeMap<String, Value>,
     depth: usize,
 ) -> Result<()> {
@@ -794,49 +831,48 @@ fn read_value_map(input: &mut Cursor<&[u8]>, depth: usize) -> Result<BTreeMap<St
     Ok(values)
 }
 
-fn write_value(output: &mut Vec<u8>, value: &Value, depth: usize) -> Result<()> {
+fn write_value(output: &mut impl Write, value: &Value, depth: usize) -> Result<()> {
     check_depth(depth)?;
     match value {
-        Value::Null => output.push(0),
+        Value::Null => write_bytes(output, &[0])?,
         Value::Bool(value) => {
-            output.push(1);
-            output.push(u8::from(*value));
+            write_bytes(output, &[1, u8::from(*value)])?;
         }
         Value::Int(value) => {
-            output.push(2);
-            output.extend_from_slice(&value.to_le_bytes());
+            write_bytes(output, &[2])?;
+            write_bytes(output, &value.to_le_bytes())?;
         }
         Value::Float(value) => {
-            output.push(3);
-            output.extend_from_slice(&value.to_bits().to_le_bytes());
+            write_bytes(output, &[3])?;
+            write_bytes(output, &value.to_bits().to_le_bytes())?;
         }
         Value::String(value) => {
-            output.push(4);
+            write_bytes(output, &[4])?;
             write_string(output, value)?;
         }
         Value::Binary(value) => {
-            output.push(7);
+            write_bytes(output, &[7])?;
             write_len(output, value.len())?;
-            output.extend_from_slice(value);
+            write_bytes(output, value)?;
         }
         Value::Vector(value) => {
-            output.push(9);
+            write_bytes(output, &[9])?;
             write_len(output, value.encoded().len())?;
-            output.extend_from_slice(value.encoded());
+            write_bytes(output, value.encoded())?;
         }
         Value::Uuid(value) => {
-            output.push(8);
-            output.extend_from_slice(value.as_bytes());
+            write_bytes(output, &[8])?;
+            write_bytes(output, value.as_bytes())?;
         }
         Value::List(values) => {
-            output.push(5);
+            write_bytes(output, &[5])?;
             write_len(output, values.len())?;
             for value in values {
                 write_value(output, value, depth + 1)?;
             }
         }
         Value::Map(values) => {
-            output.push(6);
+            write_bytes(output, &[6])?;
             write_value_map(output, values, depth + 1)?;
         }
     }
@@ -915,10 +951,9 @@ fn check_depth(depth: usize) -> Result<()> {
     Ok(())
 }
 
-fn write_string(output: &mut Vec<u8>, value: &str) -> Result<()> {
+fn write_string(output: &mut impl Write, value: &str) -> Result<()> {
     write_len(output, value.len())?;
-    output.extend_from_slice(value.as_bytes());
-    Ok(())
+    write_bytes(output, value.as_bytes())
 }
 
 fn read_string(input: &mut Cursor<&[u8]>) -> Result<String> {
@@ -931,7 +966,7 @@ fn read_string(input: &mut Cursor<&[u8]>) -> Result<String> {
         .map_err(|error| HawDBError::Execution(format!("invalid spill string: {error}")))
 }
 
-fn write_len(output: &mut Vec<u8>, value: usize) -> Result<()> {
+fn write_len(output: &mut impl Write, value: usize) -> Result<()> {
     write_u64(
         output,
         u64::try_from(value).map_err(|_| {
@@ -956,10 +991,14 @@ fn read_len(input: &mut Cursor<&[u8]>) -> Result<usize> {
     Ok(value)
 }
 
-fn write_u64(output: &mut Vec<u8>, value: u64) -> Result<()> {
+fn write_u64(output: &mut impl Write, value: u64) -> Result<()> {
+    write_bytes(output, &value.to_le_bytes())
+}
+
+fn write_bytes(output: &mut impl Write, bytes: &[u8]) -> Result<()> {
     output
-        .write_all(&value.to_le_bytes())
-        .map_err(|error| HawDBError::Execution(format!("failed to encode spill integer: {error}")))
+        .write_all(bytes)
+        .map_err(|error| HawDBError::Execution(format!("failed to write spill record: {error}")))
 }
 
 fn read_u8(input: &mut Cursor<&[u8]>) -> Result<u8> {
@@ -1018,10 +1057,19 @@ mod tests {
     }
 
     #[test]
-    fn spill_staging_shares_the_query_root_with_operator_state() {
+    fn spill_write_does_not_stage_a_second_copy_of_a_large_binding() {
         let mut memory = test_memory("query-ledger");
-        memory.query_memory_bytes = NonZeroUsize::new(200).unwrap();
-        memory.blocking_operator_bytes = NonZeroUsize::new(256).unwrap();
+        let binding = Binding {
+            values: BTreeMap::from([(
+                "payload".to_string(),
+                Value::String("x".repeat(256 * 1024)),
+            )]),
+            nodes: BTreeMap::new().into(),
+            relationships: BTreeMap::new().into(),
+        };
+        let binding_bytes = binding_memory_bytes(&binding);
+        memory.query_memory_bytes = NonZeroUsize::new(binding_bytes).unwrap();
+        memory.blocking_operator_bytes = memory.query_memory_bytes;
         let ledger = QueryMemoryLedger::new(memory.query_memory_bytes);
         let mut tracker = OperatorMemoryTracker::with_account(
             memory.blocking_operator_bytes,
@@ -1031,23 +1079,68 @@ mod tests {
                 memory.blocking_operator_bytes,
             ),
         );
-        tracker.try_charge(100).unwrap();
+        tracker.try_charge(binding_bytes).unwrap();
         let spill_budget = SpillBudgetTracker::with_ledger("Test", &memory, &ledger);
         let (run, mut writer) = spill_budget.create_run("query-ledger").unwrap();
+
+        let encoded_len = binding_record_encoded_len(&binding).unwrap();
+        assert_eq!(
+            writer.write(42, &binding, &spill_budget).unwrap(),
+            (encoded_len + 8) as u64
+        );
+        writer.finish().unwrap();
+        assert_eq!(spill_budget.staging_peak_bytes(), 0);
+        assert_eq!(ledger.snapshot().peak_bytes, binding_bytes);
+        // Merge admission still needs the encoded-size bound for reading.
+        assert_eq!(run.staging_bytes(), encoded_len);
+        let mut reader = run.reader().unwrap();
+        assert_eq!(reader.read(usize::MAX).unwrap(), Some((42, binding)));
+        assert_eq!(reader.read(usize::MAX).unwrap(), None);
+        drop(reader);
+        drop(run);
+        drop(tracker);
+        assert_eq!(ledger.snapshot().used_bytes, 0);
+        assert_eq!(memory.spill_pool_snapshot().unwrap().active_bytes, 0);
+        std::fs::remove_dir_all(&memory.spill_directory).unwrap();
+    }
+
+    #[test]
+    fn spill_read_staging_shares_the_query_root_with_operator_state() {
+        let mut memory = test_memory("read-query-ledger");
+        memory.query_memory_bytes = NonZeroUsize::new(200).unwrap();
+        memory.blocking_operator_bytes = NonZeroUsize::new(256).unwrap();
+        let ledger = QueryMemoryLedger::new(memory.query_memory_bytes);
+        let spill_budget = SpillBudgetTracker::with_ledger("Test", &memory, &ledger);
+        let (run, mut writer) = spill_budget.create_run("read-query-ledger").unwrap();
         let binding = Binding {
             values: BTreeMap::from([("payload".to_string(), Value::String("x".repeat(64)))]),
-            nodes: BTreeMap::new(),
-            relationships: BTreeMap::new(),
+            nodes: BTreeMap::new().into(),
+            relationships: BTreeMap::new().into(),
         };
 
-        let error = writer.write(0, &binding, &spill_budget).unwrap_err();
+        writer.write(0, &binding, &spill_budget).unwrap();
+        writer.finish().unwrap();
+        let mut tracker = OperatorMemoryTracker::with_account(
+            memory.blocking_operator_bytes,
+            ledger.account(
+                QueryMemoryClass::BlockingState,
+                "test state",
+                memory.blocking_operator_bytes,
+            ),
+        );
+        tracker.try_charge(100).unwrap();
+        let mut reader = run.reader().unwrap();
+        let error = reader
+            .read_record_payload(memory.blocking_operator_bytes.get(), &spill_budget)
+            .err()
+            .expect("reading must still admit the record payload");
 
         assert!(
             error.to_string().contains("query_memory_bytes 200"),
             "{error}"
         );
         assert_eq!(ledger.snapshot().used_bytes, 100);
-        drop(writer);
+        drop(reader);
         drop(run);
         drop(tracker);
         assert_eq!(ledger.snapshot().used_bytes, 0);
@@ -1063,8 +1156,8 @@ mod tests {
         let spill_budget = SpillBudgetTracker::with_ledger("Test", &memory, &ledger);
         let binding = Binding {
             values: BTreeMap::from([("payload".to_string(), Value::String("x".repeat(64)))]),
-            nodes: BTreeMap::new(),
-            relationships: BTreeMap::new(),
+            nodes: BTreeMap::new().into(),
+            relationships: BTreeMap::new().into(),
         };
         let (run, mut writer) = spill_budget.create_run("decode-query-ledger").unwrap();
         writer.write(0, &binding, &spill_budget).unwrap();
@@ -1186,8 +1279,8 @@ mod tests {
     fn empty_binding() -> Binding {
         Binding {
             values: BTreeMap::new(),
-            nodes: BTreeMap::new(),
-            relationships: BTreeMap::new(),
+            nodes: BTreeMap::new().into(),
+            relationships: BTreeMap::new().into(),
         }
     }
 
@@ -1315,6 +1408,9 @@ mod tests {
         let binding = Binding {
             values: BTreeMap::from([
                 ("vector".to_string(), vector.clone()),
+                ("null".to_string(), Value::Null),
+                ("false".to_string(), Value::Bool(false)),
+                ("negative".to_string(), Value::Int(i64::MIN)),
                 ("uuid".to_string(), uuid.clone()),
                 ("binary".to_string(), Value::Binary(vec![0, 1, 0xfe, 0xff])),
                 (
@@ -1341,7 +1437,8 @@ mod tests {
                         ("vector".to_string(), vector.clone()),
                     ]),
                 },
-            )]),
+            )])
+            .into(),
             relationships: BTreeMap::from([(
                 "r".to_string(),
                 RelRecord {
@@ -1355,7 +1452,8 @@ mod tests {
                         ("vector".to_string(), vector),
                     ]),
                 },
-            )]),
+            )])
+            .into(),
         };
         let memory = test_memory("codec");
         let spill_budget = SpillBudgetTracker::new("CodecTest", &memory);
@@ -1420,6 +1518,120 @@ mod tests {
         );
         assert_eq!(cursor.position() as usize, size);
         assert_eq!(read_value(&mut cursor, 0).unwrap(), Value::Int(42));
+    }
+
+    #[test]
+    fn spill_write_preflight_rejections_leave_record_boundaries_intact() {
+        let mut memory = test_memory("stream-preflight");
+        let binding = Binding::scalar("payload", Value::String("x".repeat(8193)));
+        let record_bytes = (binding_record_encoded_len(&binding).unwrap() + 8) as u64;
+        memory.max_spill_bytes = NonZeroU64::new(record_bytes).unwrap();
+        let spill_budget = SpillBudgetTracker::new("Preflight", &memory);
+        let (run, mut writer) = spill_budget.create_run("preflight").unwrap();
+
+        let too_large = Binding::scalar("payload", Value::String("x".repeat(8194)));
+        let error = writer.write(0, &too_large, &spill_budget).unwrap_err();
+        assert!(error.to_string().contains("max_spill_bytes"));
+        let mut too_deep = Value::Null;
+        for _ in 0..=MAX_VALUE_DEPTH {
+            too_deep = Value::List(vec![too_deep]);
+        }
+        let error = writer
+            .write(1, &Binding::scalar("nested", too_deep), &spill_budget)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("nesting exceeds the safety limit"));
+        assert_eq!(spill_budget.used_bytes(), 0);
+        let snapshot = memory.spill_pool_snapshot().unwrap();
+        assert_eq!(snapshot.active_bytes, 0);
+        assert_eq!(snapshot.pending_write_bytes, 0);
+
+        assert_eq!(
+            writer.write(2, &binding, &spill_budget).unwrap(),
+            record_bytes
+        );
+        let error = writer
+            .write(3, &empty_binding(), &spill_budget)
+            .unwrap_err();
+        assert!(error.to_string().contains("max_spill_bytes"));
+        writer.finish().unwrap();
+        assert_eq!(
+            std::fs::metadata(run.lease.path()).unwrap().len(),
+            record_bytes
+        );
+        let mut reader = run.reader().unwrap();
+        assert_eq!(reader.read(usize::MAX).unwrap(), Some((2, binding)));
+        assert_eq!(reader.read(usize::MAX).unwrap(), None);
+        drop(reader);
+        drop(run);
+        let snapshot = memory.spill_pool_snapshot().unwrap();
+        assert_eq!(snapshot.active_bytes, 0);
+        assert_eq!(snapshot.active_runs, 0);
+        std::fs::remove_dir(&memory.spill_directory).unwrap();
+    }
+
+    #[test]
+    fn streaming_binding_codec_propagates_short_writes_and_io_errors() {
+        struct ShortWriter {
+            bytes: Vec<u8>,
+            fail_after: usize,
+        }
+
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.bytes.len() == self.fail_after {
+                    return Err(std::io::Error::other("injected spill IO failure"));
+                }
+                let count = bytes.len().min(3).min(self.fail_after - self.bytes.len());
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let binding = Binding::scalar(
+            "nested",
+            Value::List(vec![
+                Value::Null,
+                Value::Bool(true),
+                Value::Int(-7),
+                Value::Float(1.5),
+                Value::String("payload".to_string()),
+                Value::Binary(vec![0, 255, 1]),
+                Value::Vector(hawdb_core::Vector::new(&[1.0, -0.0]).unwrap()),
+                Value::Uuid(hawdb_core::Uuid::from_bytes([0xa5; 16])),
+                Value::Map(BTreeMap::new()),
+            ]),
+        );
+        let encoded_len = binding_encoded_len(&binding).unwrap();
+        for fail_after in 0..=encoded_len {
+            let mut sink = ShortWriter {
+                bytes: Vec::new(),
+                fail_after,
+            };
+            let mut payload = SpillPayloadWriter {
+                writer: &mut sink,
+                remaining: encoded_len,
+            };
+            let result = write_binding(&mut payload, &binding);
+            assert_eq!(payload.remaining, encoded_len - fail_after);
+            if fail_after == encoded_len {
+                result.unwrap();
+                assert_eq!(
+                    read_binding(&mut Cursor::new(sink.bytes.as_slice())).unwrap(),
+                    binding
+                );
+            } else {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("injected spill IO failure"));
+            }
+        }
     }
 
     #[test]

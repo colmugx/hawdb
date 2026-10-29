@@ -247,6 +247,69 @@ fn database_facade_builds_search_projection_delta_request_from_changefeed() {
 }
 
 #[test]
+fn legacy_graph_delta_keeps_live_candidates_and_delete_budget_after_checkpoint_reopen() {
+    for residency in [
+        StorageResidencyMode::Materialized,
+        StorageResidencyMode::OutOfCore,
+    ] {
+        let root = unique_test_dir("legacy_graph_delta_deleted_native_key");
+        let config = DatabaseConfig {
+            storage_residency_mode: residency,
+            ..Default::default()
+        };
+        let mut database = Database::open_with_config(&root, config.clone()).unwrap();
+        database
+            .query("CREATE (:Memory {id:'removed', title:'Removed'})")
+            .unwrap();
+        database
+            .query("CREATE (:Memory {id:'retained', title:'Retained'})")
+            .unwrap();
+        let c = database.commit_epoch().unwrap();
+        let mut index = SearchIndex::in_memory();
+        database
+            .rebuild_search_projection(&mut index, Default::default())
+            .unwrap();
+        database.checkpoint().unwrap();
+        database
+            .query("MATCH (m:Memory {id:'removed'}) DETACH DELETE m")
+            .unwrap();
+        let e = database.commit_epoch().unwrap();
+        database.checkpoint().unwrap();
+        drop(database);
+        let database = Database::open_with_config(&root, config).unwrap();
+        let runtime = database.runtime.get().unwrap();
+        assert!(!runtime.store.contains_node(NodeId(0)).unwrap());
+        assert!(runtime.store.contains_node(NodeId(1)).unwrap());
+        assert!(!runtime.store.contains_node(NodeId(u64::MAX)).unwrap());
+        let changes = runtime.store.search_projection_changes_after(c);
+        assert!(changes
+            .iter()
+            .any(|change| change.upsert_node_ids.contains(&0)));
+        assert!(changes.iter().any(|change| change
+            .delete_document_ids
+            .iter()
+            .any(|id| id == "memory:removed")));
+        drop(runtime);
+        let request = database
+            .build_search_projection_graph_delta_request_after(c, Some(1))
+            .unwrap()
+            .unwrap();
+        assert!(request.upsert_node_ids.is_empty());
+        assert_eq!(request.delete_document_ids, ["memory:removed"]);
+        assert_eq!(request.complete_through_graph_commit_epoch, Some(e));
+        let report = database
+            .apply_search_projection_graph_delta(&mut index, request)
+            .unwrap();
+        assert_eq!(report.operation_count, 1);
+        assert_eq!(report.deleted_documents, 1);
+        assert!(index.document("memory:removed").is_none());
+        assert!(index.document("memory:retained").is_some());
+        drop(database);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[test]
 fn unified_search_projection_changefeed_captures_relational_primary_keys() {
     let mut db = Database::new();
     db.query_sql("CREATE TABLE public.thread_messages (id BIGINT PRIMARY KEY, body TEXT NOT NULL)")
@@ -1856,8 +1919,9 @@ fn legacy_deleted_prefix_1043_preserves_the_old_checkpoint_until_complete_retry(
         let before = index.document("memory:a").unwrap().clone();
         let base_epoch = db.commit_epoch().unwrap();
 
-        db.query("MATCH (m:Memory {id: 'a'}) SET m.title = 'new'")
-            .unwrap();
+        // A surviving update consumes the prefix budget even though the raw
+        // native key for the subsequently deleted node is not a live upsert.
+        db.query("MATCH (m:Memory) SET m.title = 'new'").unwrap();
         let prefix_epoch = db.commit_epoch().unwrap();
         db.query("MATCH (m:Memory {id: 'a'}) DETACH DELETE m")
             .unwrap();
@@ -1867,6 +1931,8 @@ fn legacy_deleted_prefix_1043_preserves_the_old_checkpoint_until_complete_retry(
             .unwrap()
             .unwrap();
         assert_eq!(batch.complete_through_commit_epoch(), Some(prefix_epoch));
+        assert_eq!(batch.graph_delta().upsert_node_ids.len(), 1);
+        assert!(batch.graph_delta().delete_document_ids.is_empty());
         let error = db
             .apply_search_projection_change_batch(
                 &mut index,

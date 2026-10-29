@@ -1,0 +1,36 @@
+{
+  "baseline_revision": "28b8fdb3026234516f1e18063252d7d70a9706ca",
+  "profile": "repository dev profile, default features",
+  "build_command": "env CARGO_BUILD_JOBS=2 cargo build --locked --bench host_boundary --bench host_boundary_allocations",
+  "first_build_seconds": 173,
+  "candidate_rebuild_seconds": 10.66,
+  "binary_sha256": {
+    "candidate-timing": "e363999f1dd9d89ec20274aabcb2d59fca91070271b4fe781bb8efb972f2b5e9",
+    "baseline-timing": "e83eb07f616577d21cf35b5dfe990edfec941bbd749f19ca2b97294c970d571a",
+    "baseline-allocations": "f1ef4d76866a849a4f9bf70b0c86ed3687f842bad9eeb55ea13f92056aaffa96",
+    "candidate-allocations": "13d8cb38fee18effd9dfb0d2731890314437c88c3e0019ddf97cbf17158a897f"
+  },
+  "source_diff_sha256": "b4cb81e7b6e5e7a75b9b86da0f67a7cbb8a61bb73a1c480fb5fdff04715880a6",
+  "probe_binary_sha256": {
+    "candidate-probe": "9bf2851c2d72e9074fd1a03c62c961d629a71e234bc410e33a9f4ccac9cd0d36",
+    "baseline-probe": "9ac0f3c46aa98001c410ef5f64ebc29431db6f30a0c09f3b091abcab0f172ebd"
+  },
+  "candidate_source_sha256": {
+    "src/api/plan_cache.rs": "7e6040c9b96b9d5f1ac26020417a18c8211f2345b51dddde66b781bb3c6b983e",
+    "src/api/mod.rs": "6a8fbe0a013a05adda6e046e36622cab3e82dddfc52cae2ed4e321414c70ff36",
+    "src/api/observability.rs": "6348f4fd053ff8bd3ae5f3c4c37b6563ca9a51e42e5fffd806fe951ba5396508",
+    "src/api/query_runtime.rs": "46c9f40eb9f383bc714475d80dd84ac4b44a6a06f6cd063678c4a6eb84ab17ba",
+    "src/api/concurrent.rs": "2c2332bd4ed45c917b48d635418f8bc647474baa9f89b2eb72a231429c40a733",
+    "src/api/concurrent/autocommit.rs": "6ef374ad9bd527466dae7bcaa6cce19dda41173ce80630d7f87d58b36eede968",
+    "src/api/concurrent/publication.rs": "b5659a7ad59e4f3c49810c2b1ae46c41f8e451a5a99f184bc8a299f38080a53e",
+    "benches/host_boundary.rs": "37956d1efe222c12b87b5e791d067d6e90c154dae702ab9d3b059fc1e4f85739",
+    "benches/host_boundary_allocations.rs": "08599967b781ed156b53b0e1fdffb85bbcd606833ca376e22de609d38376e487",
+    "benches/host_boundary/workload.rs": "3722abcd4c9269662fbfa91f5e3f27f65eac40bbf90f8d0bf2c4385b5dc52761",
+    "bindings/benchmarks/native_alloc.rs": "774bab473f8c3cfde14346156afa94439d05aef99cf735483bc952b383e05435",
+    "docs/benchmarks/query_identity_2026_10_27/query_identity_probe.rs": "9b38c4eaa3120824145bdc2407175b4759194b08ef88e02b5ae572b7eff53472"
+  },
+  "compiler": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: aarch64-apple-darwin\nrelease: 1.97.1\nLLVM version: 22.1.6\n",
+  "host_boundary_samples": 84,
+  "facade_probe_samples": 36,
+  "scope": "In-memory synthetic fixtures, repository dev profile/default features. Allocator requests include successful reallocations. No release, RSS, persistence, tail-latency or remote CI performance claim."
+}

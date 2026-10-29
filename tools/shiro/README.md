@@ -101,6 +101,71 @@ The differential reducer first minimizes graph mutations and then typed query AS
 a candidate only when the same failure signature still triggers, so a setup, parse, or execution
 error cannot replace a semantic mismatch during reduction.
 
+## SQL maintenance and composite ranges
+
+Every generated case also runs a bounded stateful campaign over an indexed
+source and an unindexed reference table. Identical parameterized writes update
+both in one transaction. Materialized projection, grouped and ungrouped
+COUNT/COUNT(column)/SUM/MIN/MAX results are compared with full SELECT
+recomputation on the reference; projection bags retain duplicates and NULLs.
+BIGINT and TEXT extrema include duplicate extrema, NULL keys, all-NULL groups,
+filter changes, primary-key moves and deletion of the last contributing row.
+Views are backfilled over existing rows and include an index on visible outputs.
+
+The deterministic sequence mixes INSERT, UPSERT, UPDATE and DELETE with random
+values and target keys, explicit rollback, clear/repopulation and aggregate
+BIGINT overflow rejection after an earlier staged write. Each transaction checks
+read-your-writes, committed or rolled-back results, and the unchanged pinned
+pre-write snapshot. Rejection must match the specific aggregate overflow
+condition and leave the source, views, reference and commit epoch unchanged;
+arbitrary matching SQL errors never count as agreement.
+
+Composite `(bucket, score, id)` queries compare indexed and unindexed execution
+with inclusive/exclusive endpoints, equal/reversed/NULL bounds, ASC/DESC order,
+a non-indexed residual filter, and LIMIT/OFFSET with a total order. The existing
+seed/case-index replay controls all choices. `sql_maintenance_coverage` reports
+completed operations and actual range-index versus fallback plan selections
+separately. Plan counters describe the initial fixture, not every later step.
+
+Failures retain typed rows, queries/parameters, plans for result mismatches,
+the transaction step, complete setup and operation sequence. Reduction removes
+whole transactions on fresh databases and retains only the same failure
+signature. The campaign protocol is `shiro-multi-oracle-fuzz-v4`; older progress
+files cannot resume with the stronger oracle. Maintenance replay bundles use
+`shiro-sql-maintenance-v2` and describe explicit commit/rollback boundaries.
+
+Cases rotate deterministically through memory, file-backed Shadow indexes and
+file-backed DemandPaged indexes (`case_index % 3`). Each disk case reopens after
+initial WAL-tail writes, after checkpoints, and after further WAL mutations.
+Setup appends data after its final DDL because schema changes themselves require
+a checkpoint; the initial recovery must replay a non-empty WAL tail.
+The sequence covers rollback/refusal before reopen, empty checkpoints, later
+repopulation and continued view/index maintenance after recovery. Checkpoints
+also retain the pre-write reader until its old results have been verified.
+Before closing, the oracle keeps the complete query results and commit epoch
+outside the database. Reopened results must match these saved values as well as
+the recomputed reference, so losing both source and reference cannot pass.
+Recovery reports must prove durable admission, the expected commit/checkpoint
+epochs and actual WAL replay; a checkpoint-only reopen must replay zero entries.
+`storage_profiles` and `recovery` counters distinguish these paths in coverage.
+
+Disk fixtures use the default SyncOnEveryWrite durability. Source rows remain
+resident because materialized views require that mode; DemandPaged exercises
+file-backed indexes. Authoritative/out-of-core materialized views are unsupported.
+Automatic checkpoint age is one hour so age-triggered publication does not
+interfere with the explicit schedule in these short cases. Storage mode and
+per-step recovery boundaries survive reduction.
+Original failures retain their scratch database path in the report; successful
+and reduction-attempt fixtures are removed. Scratch paths use the platform
+temporary directory; a local invocation can set TMPDIR to a disk-backed directory.
+
+For example, replay Shadow with `--seed 7 --cases 32 --case-index 1`, and
+DemandPaged with `--seed 7 --cases 32 --case-index 2`. These test file codecs,
+WAL/checkpoint reopen and continued maintenance. They do not establish machine
+power-loss safety, crash/torn-write recovery, concurrent-writer serializability,
+or correctness of SQL semantics shared by both executions. Existing fault and
+MVCC campaigns remain complementary. No CI job or production dependency is added.
+
 ## Extended SQL operator relations
 
 Shiro now additionally runs these relations against one pinned relational snapshot:

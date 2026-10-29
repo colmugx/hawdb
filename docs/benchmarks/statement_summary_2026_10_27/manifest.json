@@ -1,0 +1,43 @@
+{
+  "baseline": "d2511859f0952680eb93cd8393c747e9be72781f",
+  "source_sha256": {
+    "crates/system-sql/src/lib.rs": "c39d7daeb6cc1b82cf1806e0532855d013746c3819a3f2fedf6af482921b712a",
+    "src/api/observability.rs": "6348f4fd053ff8bd3ae5f3c4c37b6563ca9a51e42e5fffd806fe951ba5396508"
+  },
+  "candidate_source_sha256": {
+    "crates/system-sql/src/lib.rs": "df6022abf41d4dc4e38cc0d4fd1196d06b64d9a5033b4ef8f4cded6105bf2dda",
+    "src/api/observability.rs": "cddc1c98889f3b05394c2094b345ad559f508eca95f49ddaa3563c4014b94eda",
+    "examples/statement_summary_allocations.rs": "3cbea81fdb946215b4df494a7015228730dfb5375349dd261674c7173dec05c8",
+    "docs/benchmarks/query_identity_2026_10_27/query_identity_probe.rs": "9b38c4eaa3120824145bdc2407175b4759194b08ef88e02b5ae572b7eff53472",
+    "bindings/benchmarks/native_alloc.rs": "774bab473f8c3cfde14346156afa94439d05aef99cf735483bc952b383e05435",
+    ".cargo/config.toml": "06c7ca26d39223bd90a6412acd8609c380ce2d1650a72b70c90171656ca89819",
+    "Cargo.toml": "f187acafc9eef08184d4082ed22634bdd1e9b4458c70523fe9b4d27946d32c48",
+    "Cargo.lock": "e73da74eea4d42da935e32f41c91d300f74d4fe2e0962bb20f24a7b61f347beb"
+  },
+  "binary_sha256": {
+    "baseline-allocations": "86bc8bc5c784c2fd153412582a472cf2be52b4ac617dbe40368d8f38b2d301a3",
+    "baseline-probe": "adc62b931caa1d8e619aa287e8761638105d88e23256831153781df400bdaacb",
+    "baseline-timing": "3165627c875f40ea7ce17f224f670d9376979dd9a2ead414236ef1bcf2a71685",
+    "candidate-allocations": "c2ec143b1de9fe171c60723d40a2496ff22ec04964b7cf55480b6f8f9cef64e3",
+    "candidate-component": "ef2282c2374b2cb73d3afd9cf7838e444bdb1acbafe3741832f165322c0b53ad",
+    "candidate-probe": "e8e7a61d492aa6db906cc090c53ee7a1389b6412c0a38fd00e9560c1ea3cf454",
+    "candidate-timing": "33bb8373d3e05fa2d1d7c7d033f7c5d4235ebbe1b86366f187c90986038fdbe2"
+  },
+  "host_job_sha256": {
+    "fill_bulk.json": "fc698d02e8b9fb4c1034f41c4bc4477b1183ef2108e33deafe85a8f8d3e4ea07",
+    "point.json": "d0cbc2ed3a1b7efef9e68bd736812292dd01366cef054fb10321258a53971467",
+    "point_one.json": "4d19e98163043174652d5223ed3d2709411c6d29dc2638f47b6fc7106818c4ed",
+    "select.json": "17fc6f4dc881a37d5905d17d1f0d884a7cf8844bb45cf1afd3f3ff18b3f67e0f"
+  },
+  "compiler": "rustc 1.97.1 (8bab26f4f 2026-07-14)\nbinary: rustc\ncommit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452\ncommit-date: 2026-07-14\nhost: aarch64-apple-darwin\nrelease: 1.97.1\nLLVM version: 22.1.6\n",
+  "scope": {
+    "profile": "repository dev profile; default features",
+    "facade_records": 36,
+    "component_records": 36,
+    "admitted_host_records": 112,
+    "facade_pairs": 3,
+    "component_pairs": 3,
+    "host_pairs": 7,
+    "scope": "Requested allocator traffic; component owned control uses current record API. No general latency/RSS claim."
+  }
+}

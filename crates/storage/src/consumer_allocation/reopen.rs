@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Reconstruct native read custody from a completed durable selection.
 //! Saved locators are descriptions; the caller supplies the original parent.
@@ -13,6 +13,18 @@ use hawdb_core::RuntimeTaskContext;
 // prepays this envelope on its existing account and retains it through this
 // object's destruction. This is not allocator/RSS or serving qualification.
 pub const CONSUMER_REOPEN_MEMORY_BOUND: u64 = 16 * MAX_BYTES as u64;
+
+enum PublicationRecovery {
+    NotSelected {
+        next: SelectedRoot,
+        previous: Option<SelectedRoot>,
+    },
+    Selected {
+        next: SelectedRoot,
+        previous: Option<SelectedRoot>,
+        marker: Vec<u8>,
+    },
+}
 
 /// Captured source custody only, prepared without decoding the ledger under
 /// SourceOwner. Execute after releasing that fence with fresh working/I/O/FD
@@ -69,6 +81,7 @@ pub(crate) fn prepare(
 impl ConsumerReopenRequest {
     /// Resolve only the recorded original selector; a newer graph epoch does
     /// not turn a selected operation into a rollback. No target is adopted by name.
+    /// The caller holds exclusive logical-target publication custody throughout.
     pub fn resolve_publication(
         &self,
         parent: &SourceDirectory,
@@ -88,7 +101,7 @@ impl ConsumerReopenRequest {
             .source
             .project
             .with_locked_catalog(|root, context, catalog| {
-                let ledger = check_source(
+                let mut ledger = check_source(
                     &self.source.project,
                     &self.source.owner,
                     self.source.branch,
@@ -98,10 +111,8 @@ impl ConsumerReopenRequest {
                 )?;
                 let mut pending = ledger.pending.iter().filter(|row| {
                     self.matches(row)
-                        && row
-                            .publication_intent
-                            .as_ref()
-                            .is_some_and(PublicationIntent::pending)
+                        && row.unresolved()
+                        && !matches!(row.native_birth, NativeBirth::Reserved)
                 });
                 let Some(row) = pending.next() else {
                     return Ok(None);
@@ -109,24 +120,74 @@ impl ConsumerReopenRequest {
                 if pending.next().is_some() || Path::new(&row.target_locator) != locator {
                     return Err(invalid("Consumer recovery target differs"));
                 }
+                let active = ledger
+                    .selected
+                    .iter()
+                    .find(|selected| selected.matches_consumer(row));
+                if row.publication_intent.is_none() {
+                    // Exclusive logical custody excludes the original producer.
+                    // Without an intent it could never have selected a root.
+                    // Close only the stale update grant; retain all born bytes
+                    // for separately authorized physical cleanup and keep IDs.
+                    if row.previous_operation.is_none() {
+                        return Ok(None);
+                    }
+                    require_reserved_predecessor(&ledger, row)?;
+                    let operation = row.operation;
+                    ledger.pending.retain(|row| row.operation != operation);
+                    compact_completed(&mut ledger, None);
+                    validate(&ledger)?;
+                    let bytes = encode(&ledger)?;
+                    let name = format!(
+                        "consumer-abandoned-update-{}.tmp",
+                        hawdb_core::generate_uuidv7()?
+                    );
+                    publish_ledger(root, context, &name, &bytes, &mut false)?;
+                    return Ok(None);
+                }
+                let previous = row
+                    .publication_intent
+                    .as_ref()
+                    .expect("pending intent")
+                    .previous
+                    .clone();
+                let not_selected = active == previous.as_ref();
                 let next = SelectedRoot::from_candidate(row)?;
+                if not_selected {
+                    return Ok(Some(PublicationRecovery::NotSelected { next, previous }));
+                }
                 let marker = super::native_birth::marker_bytes(
                     self.source.project.allocation_identity().project_id(),
                     row,
                     &next.generation_name,
                     &next.parent_locator,
                 )?;
-                Ok(Some((
+                Ok(Some(PublicationRecovery::Selected {
                     next,
-                    row.publication_intent
-                        .as_ref()
-                        .expect("pending intent")
-                        .previous
-                        .clone(),
+                    previous,
                     marker,
-                )))
+                }))
             })?;
-        if let Some((next, previous, marker)) = operation {
+        if let Some(operation) = operation {
+            let (next, previous, marker) = match operation {
+                PublicationRecovery::NotSelected { next, previous } => {
+                    // A private E preparation may outlive an unsynchronized
+                    // source transaction. The unchanged C selector proves
+                    // non-selection without adopting E or serving its files.
+                    super::selection::complete_outcome(
+                        &self.source.project,
+                        &next,
+                        &previous,
+                        super::selection::ExpectedOutcome::NotSelected,
+                    )?;
+                    return Ok(());
+                }
+                PublicationRecovery::Selected {
+                    next,
+                    previous,
+                    marker,
+                } => (next, previous, marker),
+            };
             if next.seal.source_epoch > self.source_epoch {
                 return Err(invalid(
                     "Consumer recovery source is behind the original operation",

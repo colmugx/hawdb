@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 //! A canonical snapshot and an index generation are admitted as one read domain.
 
@@ -107,8 +107,7 @@ impl DatabaseReadTransaction {
             )
             .map_err(VectorIndexReadError::Admission)?;
         let definition = consumer
-            .search_index()?
-            .vector_index_descriptor()
+            .vector_index_descriptor()?
             .ok_or_else(|| invalid("Consumer has no vector index definition"))?;
         let field = VectorIndexField::from_target(definition.target());
         let resolved = self.resolve_vector_index(

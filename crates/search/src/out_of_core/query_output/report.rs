@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 use super::*;
 use crate::build_memory::reserve_capacity;
@@ -122,9 +122,9 @@ impl Memory<'_> {
             policy_epoch: policy,
         })
     }
-    pub(in crate::out_of_core) fn top_ids(
+    pub(in crate::out_of_core) fn top_ids<K: AsRef<str> + Ord>(
         self,
-        ranks: &BTreeMap<String, usize>,
+        ranks: &BTreeMap<K, usize>,
         limit: usize,
     ) -> Result<Vec<String>> {
         let Some(frame) = self.0 else {
@@ -137,9 +137,9 @@ impl Memory<'_> {
         }
         Ok(output)
     }
-    pub(in crate::out_of_core) fn top_candidates(
+    pub(in crate::out_of_core) fn top_candidates<K: AsRef<str> + Ord>(
         self,
-        ranks: &BTreeMap<String, usize>,
+        ranks: &BTreeMap<K, usize>,
         scores: &BTreeMap<String, f64>,
         limit: usize,
     ) -> Result<Vec<SearchRetrieverCandidate>> {
@@ -239,7 +239,10 @@ struct Ranked<'a> {
     _memory: QueryMemoryLease,
 }
 impl<'a> Ranked<'a> {
-    fn new(ranks: &'a BTreeMap<String, usize>, query: QueryContext<'_>) -> Result<Self> {
+    fn new<K: AsRef<str> + Ord>(
+        ranks: &'a BTreeMap<K, usize>,
+        query: QueryContext<'_>,
+    ) -> Result<Self> {
         let mut output = Self {
             values: Vec::new(),
             _memory: query.memory.reserve(0)?,
@@ -247,7 +250,7 @@ impl<'a> Ranked<'a> {
         reserve_capacity(&mut output.values, ranks.len(), &mut output._memory)?;
         for (id, rank) in ranks {
             query.checkpoint()?;
-            output.values.push((id.as_str(), *rank));
+            output.values.push((id.as_ref(), *rank));
         }
         output
             .values

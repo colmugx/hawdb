@@ -96,8 +96,12 @@ pub(super) struct SearchSnapshotMetadata<'a> {
     pub embedding_dimension: Option<usize>,
     pub consumer_binding: Option<&'a super::consumer::ConsumerBinding>,
     pub vector_index_descriptor: Option<&'a hawdb_core::VectorIndexDescriptor>,
+    pub vector_document_summary: Option<crate::vector_index::VectorDocumentSummary>,
+    pub canonical_vector_source_epoch: Option<u64>,
+    pub rabitq_checkpoint: Option<(u8, usize, u64)>,
 }
 
+#[cfg(test)]
 pub(super) fn write_search_snapshot<'a>(
     target: &Path,
     metadata: SearchSnapshotMetadata<'_>,
@@ -118,6 +122,28 @@ pub(crate) fn write_search_snapshot_with_context<'a>(
     use crate::build_control::{checkpoint, CheckedWriter};
     use crate::build_memory::{checked_add, checked_mul};
     checkpoint(task)?;
+    if metadata.canonical_vector_source_epoch.is_some()
+        && (metadata.canonical_vector_source_epoch != metadata.source_graph_commit_epoch
+            || !metadata
+                .vector_document_summary
+                .is_some_and(|summary| summary.document_count == summary.vector_document_count))
+    {
+        return Err(crate::vector_index::invalid(
+            "invalid canonical vector snapshot provenance",
+        ));
+    }
+    let mut documents = documents.peekable();
+    if let Some(summary) = metadata.vector_document_summary {
+        summary.validate()?;
+        if metadata.consumer_binding.is_none()
+            || metadata.vector_index_descriptor.is_none()
+            || documents.peek().is_some()
+        {
+            return Err(crate::vector_index::invalid(
+                "metadata-only vector snapshot requires a bound Consumer and no resident rows",
+            ));
+        }
+    }
     crate::build_memory::compression::require_qualified_zstd("workspace admission")?;
     let _workspace = memory
         .retained
@@ -133,6 +159,9 @@ pub(crate) fn write_search_snapshot_with_context<'a>(
         embedding_dimension,
         consumer_binding,
         vector_index_descriptor,
+        vector_document_summary,
+        canonical_vector_source_epoch,
+        rabitq_checkpoint,
     } = metadata;
     let compressed_path = target.with_extension("hawdb.zstd.tmp");
     let mut compressed_guard = TemporaryFile::new(compressed_path.clone());
@@ -215,6 +244,21 @@ pub(crate) fn write_search_snapshot_with_context<'a>(
             line.as_bytes(),
         )?;
     }
+    if let Some((bits, rows, seed)) = rabitq_checkpoint {
+        if !matches!(bits, 1 | 4) || rows == 0 || rows > u32::MAX as usize {
+            return Err(HawDBError::Storage(
+                "invalid explicit RaBitQ checkpoint settings".into(),
+            ));
+        }
+        let line = format!("rabitq_checkpoint\t{bits}\t{rows}\t{seed}\n");
+        write_body_chunk(
+            &mut encoder,
+            &mut body_checksum,
+            &mut uncompressed_checksum,
+            &mut uncompressed_bytes,
+            line.as_bytes(),
+        )?;
+    }
     if let Some(dimension) = embedding_dimension {
         let line = format!("embedding_dimension\t{dimension}\n");
         write_body_chunk(
@@ -226,8 +270,32 @@ pub(crate) fn write_search_snapshot_with_context<'a>(
         )?;
     }
 
-    let mut document_count = 0usize;
-    let mut vector_document_count = 0usize;
+    if let Some(summary) = vector_document_summary {
+        let line = format!(
+            "vector_document_summary\t{}\t{}\t{}\n",
+            summary.document_count, summary.vector_document_count, summary.documents_digest
+        );
+        write_body_chunk(
+            &mut encoder,
+            &mut body_checksum,
+            &mut uncompressed_checksum,
+            &mut uncompressed_bytes,
+            line.as_bytes(),
+        )?;
+    }
+    if let Some(epoch) = canonical_vector_source_epoch {
+        let line = format!("canonical_vector_source_epoch\t{epoch}\n");
+        write_body_chunk(
+            &mut encoder,
+            &mut body_checksum,
+            &mut uncompressed_checksum,
+            &mut uncompressed_bytes,
+            line.as_bytes(),
+        )?;
+    }
+    let mut document_count = vector_document_summary.map_or(0, |summary| summary.document_count);
+    let mut vector_document_count =
+        vector_document_summary.map_or(0, |summary| summary.vector_document_count);
     for document in documents {
         checkpoint(task)?;
         let _record_memory = memory.input.reserve(checked_add(

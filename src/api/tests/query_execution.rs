@@ -136,6 +136,45 @@ fn parameterized_create_and_index_seek_execute_end_to_end() {
 }
 
 #[test]
+fn bounded_scalar_index_queries_rebind_in_and_union_parameters() {
+    let mut db = Database::new();
+    db.query("CREATE INDEX ON :BoundedIndex(key)").unwrap();
+    db.query("CREATE INDEX ON :BoundedIndex(other)").unwrap();
+    for key in 0..256 {
+        db.query_with_params(
+            "CREATE (:BoundedIndex {key: $key, other: $other})",
+            &BTreeMap::from([
+                ("key".into(), Value::Int(key)),
+                ("other".into(), Value::Int(key + 1000)),
+            ]),
+        )
+        .unwrap();
+    }
+    for (query, expected) in [
+        ("MATCH (n:BoundedIndex) WHERE n.key = $key RETURN n.key AS key", vec![2]),
+        ("MATCH (n:BoundedIndex) WHERE n.key IN $keys RETURN n.key AS key ORDER BY key", vec![2, 17]),
+        ("MATCH (n:BoundedIndex) WHERE n.key IN $keys OR n.other = $other RETURN n.key AS key ORDER BY key", vec![2, 3, 17]),
+    ] {
+        for offset in [0, 40] {
+            let parameters = BTreeMap::from([
+                ("key".into(), Value::Int(2 + offset)),
+                ("keys".into(), Value::List(vec![Value::Int(17 + offset), Value::Int(2 + offset), Value::Int(17 + offset)])),
+                ("other".into(), Value::Int(1003 + offset)),
+            ]);
+            let explain = db.explain_query_with_params(query, &parameters).unwrap();
+            assert!(explain.trace.selected_plan.contains("NodeProjectionScanExec"), "{}", explain.trace.selected_plan);
+            let task = hawdb_core::RuntimeTaskContext::default().with_work_limit(64);
+            let output = db.query_with_params_context(query, &parameters, &task).unwrap();
+            assert_eq!(
+                output.rows.iter().map(|row| row.get("key").unwrap().clone()).collect::<Vec<_>>(),
+                expected.iter().map(|key| Value::Int(key + offset)).collect::<Vec<_>>(),
+                "query={query} offset={offset}",
+            );
+        }
+    }
+}
+
+#[test]
 fn durable_source_filter_uses_segment_scan_through_query_runtime() {
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -460,6 +499,7 @@ fn read_transaction_inherits_database_result_row_cap() {
 fn read_only_database_rejects_cypher_mutations_before_writing() {
     let mut db = Database::new_with_config(DatabaseConfig {
         read_only: true,
+        recovery_mode: crate::RecoveryMode::Strict,
         ..DatabaseConfig::default()
     });
 
@@ -478,6 +518,7 @@ fn read_only_database_rejects_cypher_mutations_before_writing() {
 fn read_only_rejected_mutations_do_not_populate_plan_cache() {
     let mut db = Database::new_with_config(DatabaseConfig {
         read_only: true,
+        recovery_mode: crate::RecoveryMode::Strict,
         max_plan_cache_entries: Some(8),
         ..DatabaseConfig::default()
     });

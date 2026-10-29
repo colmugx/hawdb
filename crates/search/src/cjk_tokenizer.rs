@@ -18,7 +18,7 @@ use std::sync::LazyLock;
 pub(super) const ANALYZER_FORMAT_VERSION: &[u8] =
     b"hawdb-search-analyzer-v3-jieba-0.11.0-search-han-ngrams";
 
-static CHINESE_TOKENIZER: LazyLock<Jieba> = LazyLock::new(Jieba::new);
+static CHINESE_TOKENIZER: LazyLock<Jieba> = LazyLock::new(crate::cjk_dictionary::load);
 
 #[cfg(test)]
 pub(super) fn chinese_search_tokens(text: &str) -> Vec<String> {

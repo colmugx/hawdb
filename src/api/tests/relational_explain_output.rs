@@ -44,6 +44,22 @@ fn migrated_explain_keeps_planner_coverage_and_execution_evidence() {
             let output = database
                 .query_sql_with_params(&sql, std::slice::from_ref(&parameter))
                 .unwrap();
+            let columns: &[&str] = if analyze {
+                &[
+                    "id",
+                    "estRows",
+                    "actRows",
+                    "task",
+                    "access object",
+                    "execution info",
+                    "operator info",
+                    "memory",
+                    "disk",
+                ]
+            } else {
+                &["id", "estRows", "task", "access object", "operator info"]
+            };
+            assert_eq!(output.schema().columns(), columns);
             assert_eq!(output.rows.iter().any(|row| matches!(row.get("id"), Some(Value::String(id)) if id.contains("logical_selection"))), residual);
             for row in output.rows.iter() {
                 assert_eq!(row.get("actRows").is_some(), analyze);

@@ -113,7 +113,7 @@ mod capability_parity_tests {
     }
 }
 
-pub const CAMPAIGN_PROTOCOL: &str = "shiro-multi-oracle-fuzz-v2";
+pub const CAMPAIGN_PROTOCOL: &str = "shiro-multi-oracle-fuzz-v4";
 pub const GRAPH_PREDICATE_REWRITE_PROTOCOL: &str = "hawdb-graph-predicate-rewrite-fuzz-v1";
 pub const GRAPH_TLP_AGGREGATE_PROTOCOL: &str = "hawdb-graph-tlp-aggregate-fuzz-v1";
 pub const GRAPH_TLP_PROTOCOL: &str = "hawdb-graph-tlp-fuzz-v1";
@@ -1810,7 +1810,7 @@ impl CampaignReport {
             "failed_case_count": self.failed_case_count,
             "complete_shape_coverage": self.complete_shape_coverage,
             "plan_coverage": self.plan_coverage.json(),
-            "oracles": ["plan_differential", "graph_tlp", "graph_tlp_aggregate", "graph_predicate_rewrite", "graph_metamorphic", "sql_tlp", "sql_tlp_aggregate", "sql_predicate_rewrite", "sql_join_rewrite", "sql_operator_relations"],
+            "oracles": ["plan_differential", "graph_tlp", "graph_tlp_aggregate", "graph_predicate_rewrite", "graph_metamorphic", "sql_tlp", "sql_tlp_aggregate", "sql_predicate_rewrite", "sql_join_rewrite", "sql_operator_relations", "sql_maintenance"],
             "oracle_protocols": {
                 "plan_differential": PLAN_DIFFERENTIAL_PROTOCOL,
                 "graph_tlp": GRAPH_TLP_PROTOCOL,
@@ -1822,6 +1822,7 @@ impl CampaignReport {
                 "sql_predicate_rewrite": SQL_PREDICATE_REWRITE_PROTOCOL,
                 "sql_join_rewrite": SQL_JOIN_REWRITE_PROTOCOL,
                 "sql_operator_relations": sql_oracle::extended_protocol(),
+                "sql_maintenance": sql_oracle::stateful::PROTOCOL,
             },
             "capability_profiles": {
                 "plan_differential": capability_profile_json(&plan_profile),
@@ -1833,8 +1834,10 @@ impl CampaignReport {
                 "sql_tlp_aggregate": sql_oracle::sql_capability_profile_json(true),
                 "sql_predicate_rewrite": sql_oracle::sql_predicate_rewrite_capability_profile_json(),
                 "sql_join_rewrite": sql_oracle::sql_join_rewrite_capability_profile_json(),
+                "sql_maintenance": { "materialized_views": ["projection", "grouped", "global", "indexed_projection"], "aggregates": ["count", "sum", "min", "max"], "reference": "unindexed_table_full_select", "transactions": ["commit", "rollback", "pinned_old_snapshot"], "index_ranges": ["interval", "equal", "reversed", "null"], "storage_profiles": ["memory", "disk_shadow", "disk_demand_paged"], "persistence": ["wal_replay", "checkpoint_reopen", "checkpoint_plus_wal"], "power_loss_qualification": false },
                 "sql_operator_relations": { "oracles": ["norec_filter", "dqp", "having_tlp", "distinct_tlp", "sum_tlp", "distinct_count", "cross_join", "ordered_limit"], "norec_reference": "sum_filter_not_case_when", "dqp_same_sql": true, "dqp_distinct_plan_reported_separately": true },
             },
+            "sql_maintenance_coverage": sql_oracle::stateful::coverage(&self.cases.iter().map(CampaignCaseReport::json).collect::<Vec<_>>()),
             "sql_operator_coverage": sql_oracle::extended_coverage(&self.cases.iter().map(CampaignCaseReport::json).collect::<Vec<_>>()),
             "cases": self.cases.iter().map(CampaignCaseReport::json).collect::<Vec<_>>(),
         })
@@ -2099,6 +2102,7 @@ pub fn merge_campaign_report_json(
     );
     json["plan_coverage"] = plan_coverage.report().json();
     json["sql_operator_coverage"] = sql_oracle::extended_coverage(&cases);
+    json["sql_maintenance_coverage"] = sql_oracle::stateful::coverage(&cases);
     json["cases"] = JsonValue::Array(cases);
     json
 }
@@ -2208,11 +2212,13 @@ fn error_class(error: &HawDBError) -> &'static str {
         HawDBError::Storage(_)
         | HawDBError::FileDescriptors(_)
         | HawDBError::StorageIntegrity(_)
+        | HawDBError::WalRecoveryIo { .. }
         | HawDBError::AppendSequenceExhausted { .. }
         | HawDBError::BranchBusy { .. }
         | HawDBError::BranchReclamationBlocked { .. } => "storage",
         HawDBError::BranchEvidenceBudgetExceeded { .. } => "execution",
         HawDBError::CapabilityUnavailable { .. } => "capability_unavailable",
+        HawDBError::UnsupportedStorageFormat(_) => "unsupported_storage_format",
     }
 }
 
@@ -2486,6 +2492,18 @@ mod tests {
         assert_eq!(json["oracles"][6], "sql_tlp_aggregate");
         assert_eq!(json["oracles"][7], "sql_predicate_rewrite");
         assert_eq!(json["oracles"][8], "sql_join_rewrite");
+        assert_eq!(json["oracles"][10], "sql_maintenance");
+        assert_eq!(
+            json["sql_maintenance_coverage"]["attempted"],
+            report.executed_case_count
+        );
+        assert_eq!(json["sql_maintenance_coverage"]["failed"], 0);
+        assert!(
+            json["sql_maintenance_coverage"]["operations"]["overflow_rejection"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
         assert_eq!(
             json["oracle_protocols"]["plan_differential"],
             PLAN_DIFFERENTIAL_PROTOCOL

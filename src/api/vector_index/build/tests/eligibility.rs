@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 use super::*;
 use crate::{QueryRequest, QueryStreamOptions, VectorIndexLanguageBudget, VectorIndexSqlRequest};
@@ -151,7 +151,7 @@ fn eligibility_after_ineligible_prefix(mode: hawdb_core::VectorIndexQueryMode) {
     );
     for (report, input_rows) in [(sql_report.index(), 5), (graph_report.index().unwrap(), 3)] {
         assert_eq!(report.mode, mode);
-        assert_eq!(report.backend, if exact { "exact" } else { "rabitq" });
+        assert_eq!(report.backend, if exact { "exact" } else { "diskann" });
         assert_eq!(
             report.filter_position,
             if exact {

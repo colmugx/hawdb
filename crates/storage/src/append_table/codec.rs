@@ -381,11 +381,6 @@ fn decode_envelope_with_work<'a>(
         ));
     }
     let version = u16::from_le_bytes(encoded[8..10].try_into().expect("fixed header"));
-    if version != APPEND_CODEC_VERSION || encoded[10..12] != [0, 0] {
-        return Err(AppendTableError::Corruption(format!(
-            "unsupported append WAL version {version}"
-        )));
-    }
     let epoch = u64::from_le_bytes(encoded[12..20].try_into().expect("fixed header"));
     let payload_len = usize::try_from(u64::from_le_bytes(
         encoded[20..28].try_into().expect("fixed header"),
@@ -412,6 +407,20 @@ fn decode_envelope_with_work<'a>(
     if digest.crc32c.get() != expected_crc || digest.sha256.as_bytes() != expected_sha {
         return Err(AppendTableError::Corruption(
             "append WAL checksum mismatch".to_string(),
+        ));
+    }
+    if version != APPEND_CODEC_VERSION {
+        return Err(AppendTableError::UnsupportedFormat(
+            hawdb_core::StorageFormatError::UnsupportedVersion {
+                format: "append WAL",
+                found: version,
+                supported: APPEND_CODEC_VERSION,
+            },
+        ));
+    }
+    if encoded[10..12] != [0, 0] {
+        return Err(AppendTableError::Corruption(
+            "non-zero append WAL reserved flags".into(),
         ));
     }
     Ok((epoch, payload))
@@ -460,6 +469,32 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn append_wal_versions_preserve_integrity_classification() {
+        for version in [2_u16, 4, u16::MAX] {
+            let mut encoded = encode_append_wal_batch(42, &transaction()).unwrap();
+            encoded[8..10].copy_from_slice(&version.to_le_bytes());
+            assert!(matches!(
+                decode_append_wal_batch(&encoded, AppendDecodeLimits::wal()),
+                Err(AppendTableError::UnsupportedFormat(hawdb_core::StorageFormatError::UnsupportedVersion {
+                    format: "append WAL", found, supported: APPEND_CODEC_VERSION,
+                })) if found == version
+            ));
+            let last = encoded.len() - 1;
+            encoded[last] ^= 1;
+            assert!(matches!(
+                decode_append_wal_batch(&encoded, AppendDecodeLimits::wal()),
+                Err(AppendTableError::Corruption(_))
+            ));
+        }
+        let mut encoded = encode_append_wal_batch(42, &transaction()).unwrap();
+        encoded[10] = 1;
+        assert!(matches!(
+            decode_append_wal_batch(&encoded, AppendDecodeLimits::wal()),
+            Err(AppendTableError::Corruption(_))
+        ));
     }
 
     #[test]

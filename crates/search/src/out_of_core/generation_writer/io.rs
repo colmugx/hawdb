@@ -206,6 +206,19 @@ impl<'a> GenerationIo<'a> {
         self.seal_file_admitted(file)
     }
 
+    #[cfg(feature = "vector-search")]
+    pub(in crate::out_of_core) fn seal_file_with_checksum(
+        &self,
+        file: &mut File,
+    ) -> Result<(ArtifactSeal, u64)> {
+        let _buffer = self.memory.spool.reserve(SPOOL_BUFFER_BYTES)?;
+        file.seek(SeekFrom::Start(0))?;
+        let length = file.metadata()?.len();
+        let mut checksum = Crc32cHasher::new();
+        let seal = seal_reader(file, length, self.task, Some(&mut checksum))?;
+        Ok((seal, checksum.finish()))
+    }
+
     fn seal_file_admitted(&self, file: &mut File) -> Result<ArtifactSeal> {
         file.seek(SeekFrom::Start(0))?;
         let expected = file.metadata()?.len();

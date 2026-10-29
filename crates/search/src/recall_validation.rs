@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{SearchRetrieverReport, RABITQ_CANDIDATE_BACKEND};
+use super::{SearchRetrieverReport, DISKANN_CANDIDATE_BACKEND, RABITQ_CANDIDATE_BACKEND};
 use crate::{HawDBError, Result};
 use hawdb_evidence::production_evidence_blocker_codes;
 use std::collections::BTreeSet;
@@ -115,10 +115,19 @@ pub struct VectorRecallValidationReport {
 }
 
 impl VectorRecallValidationReport {
+    /// Validate the explicitly required compressed candidate backend.
     pub fn validates_required_approximate_backend(&self) -> bool {
+        self.validates_backend(RABITQ_CANDIDATE_BACKEND)
+    }
+
+    pub fn validates_default_approximate_backend(&self) -> bool {
+        self.validates_backend(DISKANN_CANDIDATE_BACKEND)
+    }
+
+    fn validates_backend(&self, backend: &str) -> bool {
         self.protocol == VECTOR_RECALL_VALIDATION_PROTOCOL
             && self.ready
-            && self.approximate_backend == RABITQ_CANDIDATE_BACKEND
+            && self.approximate_backend == backend
             && self.requested_sample_count > 0
             && self.executed_sample_count == self.requested_sample_count
             && self.exact_hit_count > 0
@@ -172,6 +181,8 @@ pub struct VectorProjectionQualificationIdentity {
     pub document_count: usize,
     pub source_digest: u64,
     pub payload_bytes: u64,
+    /// Raw projection checksum, or the complete selected-manifest fingerprint
+    /// for out-of-core DiskANN graph/visibility artifact closures.
     pub payload_checksum: u32,
     pub format_version: u32,
     pub algorithm: String,
@@ -237,8 +248,13 @@ impl VectorProjectionQualificationIdentity {
             && self.source_digest > 0
             && self.payload_bytes > 0
             && self.format_version > 0
-            && self.algorithm == "rabitq"
-            && matches!(self.bit_width, 1 | 4)
+            && match self.algorithm.as_str() {
+                "rabitq" => matches!(self.bit_width, 1 | 4),
+                "diskann" => {
+                    self.format_version == 2 && self.bit_width == 0 && self.transform_seed == 0
+                }
+                _ => false,
+            }
             && self.dimension > 0
             && self
                 .embedding_model
@@ -295,7 +311,7 @@ impl VectorRecallProductionQualificationReport {
             Ok(())
         } else {
             Err(HawDBError::Storage(format!(
-                "RaBitQ projection is not qualified for the current production release: {}",
+                "Vector projection is not qualified for the current production release: {}",
                 blockers.join(",")
             )))
         }
@@ -325,8 +341,23 @@ impl VectorRecallProductionQualificationReport {
         if self.protocol != VECTOR_RECALL_PRODUCTION_QUALIFICATION_PROTOCOL {
             blockers.push("protocol_mismatch".to_string());
         }
-        if !self.recall.validates_required_approximate_backend() {
+        let backend = match projection_identity.algorithm.as_str() {
+            "rabitq" => RABITQ_CANDIDATE_BACKEND,
+            "diskann" => DISKANN_CANDIDATE_BACKEND,
+            _ => "",
+        };
+        if !self.recall.validates_backend(backend) {
             blockers.push("recall_validation_failed".to_string());
+        }
+        let backend_matches_identity = matches!(
+            (
+                self.recall.approximate_backend.as_str(),
+                projection_identity.algorithm.as_str()
+            ),
+            (RABITQ_CANDIDATE_BACKEND, "rabitq") | (DISKANN_CANDIDATE_BACKEND, "diskann")
+        );
+        if !backend_matches_identity {
+            blockers.push("approximate_backend_identity_mismatch".to_string());
         }
         if !self.projection_identity.complete() || self.projection_identity != *projection_identity
         {
@@ -354,6 +385,7 @@ impl VectorRecallProductionQualificationReport {
 }
 
 pub(super) struct VectorRecallValidationAccumulator {
+    backend: &'static str,
     sample_candidate_count: usize,
     requested_sample_count: usize,
     top_k: usize,
@@ -380,6 +412,7 @@ impl VectorRecallValidationAccumulator {
         options: &VectorRecallValidationOptions,
     ) -> Self {
         Self {
+            backend: RABITQ_CANDIDATE_BACKEND,
             sample_candidate_count,
             requested_sample_count: options
                 .max_samples
@@ -404,6 +437,11 @@ impl VectorRecallValidationAccumulator {
             metadata_filter_valid: true,
             probe_execution_failed: false,
         }
+    }
+
+    pub(super) fn with_backend(mut self, backend: &'static str) -> Self {
+        self.backend = backend;
+        self
     }
 
     pub(super) fn requested_sample_count(&self) -> usize {
@@ -455,7 +493,7 @@ impl VectorRecallValidationAccumulator {
                 .filter(|id| exact_ids.contains(id.as_str()))
                 .count(),
         );
-        if approximate_retriever.backend == RABITQ_CANDIDATE_BACKEND {
+        if approximate_retriever.backend == self.backend {
             self.approximate_backend_count = self.approximate_backend_count.saturating_add(1);
         }
         if !approximate_retriever.fallback_reason_codes.is_empty() {
@@ -532,7 +570,7 @@ impl VectorRecallValidationAccumulator {
         VectorRecallValidationReport {
             protocol: VECTOR_RECALL_VALIDATION_PROTOCOL.to_string(),
             ready: blocker_codes.is_empty(),
-            approximate_backend: RABITQ_CANDIDATE_BACKEND.to_string(),
+            approximate_backend: self.backend.to_string(),
             sample_candidate_count: self.sample_candidate_count,
             requested_sample_count: self.requested_sample_count,
             executed_sample_count: self.executed_sample_count,
@@ -659,6 +697,7 @@ mod tests {
             candidate_scan_filtered_document_count: 0,
             candidate_scan_scanned_block_count: 0,
             candidate_scan_skipped_block_count: 0,
+            candidate_scan_adaptive_exact_scan_count: 0,
             candidate_scan_payload_bytes_read: 0,
             candidate_scan_admitted_working_bytes: 0,
             posting_bytes_read: 0,
@@ -686,6 +725,10 @@ mod tests {
     }
 
     fn ready_recall_report() -> VectorRecallValidationReport {
+        ready_recall_report_for(RABITQ_CANDIDATE_BACKEND)
+    }
+
+    fn ready_recall_report_for(backend: &'static str) -> VectorRecallValidationReport {
         let options = VectorRecallValidationOptions {
             max_samples: 1,
             top_k: 1,
@@ -693,12 +736,13 @@ mod tests {
             minimum_recall_per_million: 1_000_000,
             metadata_filters: Default::default(),
         };
-        let mut accumulator = VectorRecallValidationAccumulator::new(1, &options);
+        let mut accumulator =
+            VectorRecallValidationAccumulator::new(1, &options).with_backend(backend);
         accumulator.record(
             &["a".to_string()],
             &["a".to_string()],
             &["a".to_string()],
-            &retriever(RABITQ_CANDIDATE_BACKEND),
+            &retriever(backend),
         );
         accumulator.finish()
     }
@@ -864,6 +908,42 @@ mod tests {
             .to_string()
             .contains("current_release_identity_mismatch"));
         assert!(error.to_string().contains("evidence_identity_mismatch"));
+    }
+
+    #[test]
+    fn production_qualification_cannot_substitute_compression_recall_for_a_graph() {
+        let expected = production_identity();
+        let mut projection = projection_identity();
+        projection.algorithm = "diskann".into();
+        projection.format_version = 2;
+        projection.bit_width = 0;
+        projection.transform_seed = 0;
+        for backend in [RABITQ_CANDIDATE_BACKEND, DISKANN_CANDIDATE_BACKEND] {
+            let report = VectorRecallProductionQualificationReport::evaluate(
+                ready_recall_report_for(backend),
+                projection.clone(),
+                crate::ProductionEvidenceBinding {
+                    identity: expected.clone(),
+                    generated_at_unix_seconds: 1,
+                },
+                expected.clone(),
+            );
+            if backend == DISKANN_CANDIDATE_BACKEND {
+                assert!(report.ready, "{:?}", report.blocker_codes);
+                report.validate_for(&projection, &expected).unwrap();
+            } else {
+                assert!(!report.ready);
+                assert_eq!(
+                    report.blocker_codes,
+                    vec![
+                        "approximate_backend_identity_mismatch",
+                        "recall_validation_failed"
+                    ]
+                );
+            }
+        }
+        projection.bit_width = 4;
+        assert!(!projection.complete());
     }
 
     #[test]

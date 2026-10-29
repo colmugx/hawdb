@@ -274,6 +274,8 @@ mod tests {
         let path = unique_test_dir("search_projection_probe_command");
         {
             let mut index = SearchIndex::open(&path).unwrap();
+            #[cfg(feature = "vector-search")]
+            index.set_rabitq_projection_build_options(Default::default());
             index
                 .apply_embedding_manifest(SearchEmbeddingManifest {
                     model: "bge-m3".to_string(),

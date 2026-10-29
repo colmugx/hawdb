@@ -1,9 +1,15 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use std::ffi::CStr;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::OpenOptionsExt;
+
+#[cfg(target_vendor = "apple")]
+const NATIVE_COMPONENT_BUFFER: usize = libc::PATH_MAX as usize;
+#[cfg(not(target_vendor = "apple"))]
+const NATIVE_COMPONENT_BUFFER: usize = 256;
 
 pub(super) fn open_root(path: &Path) -> io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
@@ -18,11 +24,64 @@ fn name_bytes(name: ChildName<'_>) -> [u8; 256] {
     bytes
 }
 
+pub(super) fn link_child_new(
+    source: &std::fs::File,
+    source_name: ChildName<'_>,
+    _expected: &std::fs::File,
+    target: &std::fs::File,
+    target_name: ChildName<'_>,
+    _context: &FileOpenContext,
+) -> io::Result<()> {
+    let source_name = name_bytes(source_name);
+    let target_name = name_bytes(target_name);
+    // SAFETY: both captured roots and terminated single components remain
+    // live. Flags zero never follow a source symlink; an occupied destination
+    // is rejected. The owner excludes source replacement and validates the
+    // linked inode against its original held source before acknowledgement.
+    let status = unsafe {
+        libc::linkat(
+            source.as_raw_fd(),
+            source_name.as_ptr().cast(),
+            target.as_raw_fd(),
+            target_name.as_ptr().cast(),
+            0,
+        )
+    };
+    if status == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 pub(super) fn create_directory(root: &std::fs::File, name: ChildName<'_>) -> io::Result<()> {
-    let name = name_bytes(name);
+    create_directory_encoded(
+        root,
+        CStr::from_bytes_until_nul(&name_bytes(name)).expect("terminated artifact name"),
+    )
+}
+
+fn component_bytes(name: DirectoryComponent<'_>) -> [u8; NATIVE_COMPONENT_BUFFER] {
+    use std::os::unix::ffi::OsStrExt;
+    let mut bytes = [0; NATIVE_COMPONENT_BUFFER];
+    bytes[..name.0.len()].copy_from_slice(name.0.as_bytes());
+    bytes
+}
+
+pub(super) fn create_directory_component(
+    root: &std::fs::File,
+    name: DirectoryComponent<'_>,
+) -> io::Result<()> {
+    create_directory_encoded(
+        root,
+        CStr::from_bytes_until_nul(&component_bytes(name)).expect("terminated native component"),
+    )
+}
+
+fn create_directory_encoded(root: &std::fs::File, name: &CStr) -> io::Result<()> {
     // SAFETY: the live parent FD and terminated validated single component
     // outlive mkdirat. Creation is exclusive; an existing symlink is not followed.
-    let result = unsafe { libc::mkdirat(root.as_raw_fd(), name.as_ptr().cast(), 0o700) };
+    let result = unsafe { libc::mkdirat(root.as_raw_fd(), name.as_ptr(), 0o700) };
     if result == -1 {
         Err(io::Error::last_os_error())
     } else {
@@ -184,7 +243,23 @@ pub(super) fn open_directory(
     root: &std::fs::File,
     name: ChildName<'_>,
 ) -> io::Result<std::fs::File> {
-    let bytes = name_bytes(name);
+    open_directory_encoded(
+        root,
+        CStr::from_bytes_until_nul(&name_bytes(name)).expect("terminated artifact name"),
+    )
+}
+
+pub(super) fn open_directory_component(
+    root: &std::fs::File,
+    name: DirectoryComponent<'_>,
+) -> io::Result<std::fs::File> {
+    open_directory_encoded(
+        root,
+        CStr::from_bytes_until_nul(&component_bytes(name)).expect("terminated native component"),
+    )
+}
+
+fn open_directory_encoded(root: &std::fs::File, bytes: &CStr) -> io::Result<std::fs::File> {
     // SAFETY: live borrowed directory, validated NUL-terminated component;
     // O_DIRECTORY and O_NOFOLLOW reject files and symlinks before returning.
     let fd = unsafe {
@@ -360,9 +435,10 @@ pub(super) fn open_recorded_child(
     name: &std::ffi::OsStr,
 ) -> io::Result<std::fs::File> {
     use std::os::unix::ffi::OsStrExt;
+    let bounded = super::native_component_within_input_bound(name);
     let name = name.as_bytes();
     if name.is_empty()
-        || name.len() > 255
+        || !bounded
         || matches!(name, b"." | b"..")
         || name.iter().any(|byte| matches!(byte, 0 | b'/'))
     {
@@ -371,7 +447,7 @@ pub(super) fn open_recorded_child(
             "invalid native child name",
         ));
     }
-    let mut encoded = [0_u8; 256];
+    let mut encoded = [0_u8; NATIVE_COMPONENT_BUFFER];
     encoded[..name.len()].copy_from_slice(name);
     let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: live parent, validated terminated component, valid stat output.

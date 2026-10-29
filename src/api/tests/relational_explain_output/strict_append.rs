@@ -44,6 +44,47 @@ fn parameters() -> [Value; 1] {
     [Value::String("empty".into())]
 }
 
+#[test]
+fn strict_append_explain_column_order_matches_sql_diagnostics() {
+    for door in [
+        FrontDoor::Database,
+        FrontDoor::Snapshot,
+        FrontDoor::Transaction,
+    ] {
+        for analyze in [false, true] {
+            let mut database = fixture();
+            let output = query(
+                &mut database,
+                door,
+                &explain_sql(analyze),
+                QueryStreamOptions::default(),
+            )
+            .unwrap();
+            let columns: &[&str] = if analyze {
+                &[
+                    "id",
+                    "estRows",
+                    "actRows",
+                    "task",
+                    "access object",
+                    "execution info",
+                    "operator info",
+                    "memory",
+                    "disk",
+                ]
+            } else {
+                &["id", "estRows", "task", "access object", "operator info"]
+            };
+            assert_eq!(output.schema().columns(), columns, "{door:?}");
+            assert_eq!(output.rows.value(0, 0), output.rows.get(0, "id"));
+            assert_eq!(
+                output.rows.value(0, columns.len() - 1),
+                output.rows.get(0, columns[columns.len() - 1])
+            );
+        }
+    }
+}
+
 fn query(
     database: &mut Database,
     door: FrontDoor,

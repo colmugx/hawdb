@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 use super::*;
 use hawdb_relational::query::vector_index::{
@@ -29,6 +29,16 @@ pub struct VectorIndexSqlReport {
 impl VectorIndexSqlReport {
     pub fn index(&self) -> &VectorIndexQueryReport {
         self.index.report()
+    }
+
+    /// Logical index reads and spill counters from the retained execution.
+    pub fn index_metrics(&self) -> &crate::SearchOutOfCoreMetrics {
+        self.index.metrics()
+    }
+
+    /// Runtime memory still owned by the index output, excluding query rows.
+    pub fn index_retained_capacity_bytes(&self) -> u64 {
+        self.index.retained_capacity_bytes()
     }
 }
 

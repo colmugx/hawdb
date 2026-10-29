@@ -18,6 +18,7 @@ use hawdb_executor::{QueryMemoryClass, QueryMemoryLedger};
 use std::cell::{Cell, RefCell};
 
 mod allocations;
+mod dictionaries;
 mod filters;
 mod memory_budget;
 

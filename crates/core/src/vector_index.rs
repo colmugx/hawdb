@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Schema-bound vector index definitions shared by SQL and Cypher.
 //!
@@ -97,11 +97,45 @@ pub enum VectorIndexTarget {
 /// Runtime memory limits and cancellation are supplied at build/query time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VectorIndexBackend {
+    DiskAnn {
+        max_degree: u32,
+        build_beam: u32,
+        alpha_milli: u32,
+        lsg: Option<VectorIndexLsg>,
+    },
     RaBitQ {
         bit_width: u8,
         segment_rows: u32,
         transform_seed: u64,
     },
+}
+
+/// Integer-scaled persistent parameters have canonical equality and encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorIndexLsg {
+    pub sample_size: u32,
+    pub neighbors: u32,
+    pub exponent_milli: u32,
+}
+
+impl Default for VectorIndexBackend {
+    fn default() -> Self {
+        Self::DiskAnn {
+            max_degree: 32,
+            build_beam: 128,
+            alpha_milli: 1200,
+            lsg: None,
+        }
+    }
+}
+
+impl VectorIndexBackend {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::DiskAnn { .. } => "diskann",
+            Self::RaBitQ { .. } => "rabitq",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,20 +196,44 @@ impl VectorIndexDescriptor {
                 ));
             }
         }
-        let VectorIndexBackend::RaBitQ {
-            bit_width,
-            segment_rows,
-            ..
-        } = backend;
-        if !matches!(bit_width, 1 | 4) || segment_rows == 0 {
-            return Err(invalid(
-                "RaBitQ requires 1 or 4 bits and a positive segment size",
-            ));
-        }
-        if distance != VectorDistance::Cosine {
-            return Err(invalid(
-                "RaBitQ indexes currently support cosine distance only",
-            ));
+        match backend {
+            VectorIndexBackend::RaBitQ {
+                bit_width,
+                segment_rows,
+                ..
+            } => {
+                if !matches!(bit_width, 1 | 4) || segment_rows == 0 {
+                    return Err(invalid(
+                        "RaBitQ requires 1 or 4 bits and a positive segment size",
+                    ));
+                }
+                if distance != VectorDistance::Cosine {
+                    return Err(invalid(
+                        "RaBitQ indexes currently support cosine distance only",
+                    ));
+                }
+            }
+            VectorIndexBackend::DiskAnn {
+                max_degree,
+                build_beam,
+                alpha_milli,
+                lsg,
+            } => {
+                if max_degree < 2 || build_beam < max_degree || alpha_milli < 1000 {
+                    return Err(invalid(
+                        "DiskANN requires degree >= 2, beam >= degree and alpha >= 1",
+                    ));
+                }
+                if let Some(lsg) = lsg
+                    && (lsg.sample_size < 2
+                        || lsg.neighbors == 0
+                        || lsg.neighbors > lsg.sample_size
+                        || lsg.exponent_milli == 0
+                        || lsg.exponent_milli > 2000)
+                {
+                    return Err(invalid("invalid DiskANN local scaling parameters"));
+                }
+            }
         }
         Ok(Self {
             name,

@@ -23,7 +23,7 @@ use crate::query_output::{push_relational_output, RelationalQueryLimits, Relatio
 use crate::query_value::bind_bound;
 use crate::row_runtime::RelationalRowExecutionEvidence;
 use hawdb_core::{Result, Value};
-use hawdb_executor::Row;
+use hawdb_executor::{QueryRows, QuerySchema, Row};
 use hawdb_optimizer::{
     RelationalAccessPathDescriptor, RelationalAccessPathKind, RelationalJoinPlanningOutcome,
     RelationalJoinPlanningStatus, RelationalOperatorCardinalityProfile, RelationalOperatorId,
@@ -33,6 +33,27 @@ use hawdb_sql::{
     SqlComparisonOp, SqlExpression, SqlFunctionArgument, SqlLikeEscape, SqlOrderDirection,
     SqlPredicate, SqlValue,
 };
+
+/// Column order shared by relational and strict-append SQL diagnostics.
+pub fn sql_explain_schema(analyze: bool) -> QuerySchema {
+    let columns: &[&str] = if analyze {
+        &[
+            "id",
+            "estRows",
+            "actRows",
+            "task",
+            "access object",
+            "execution info",
+            "operator info",
+            "memory",
+            "disk",
+        ]
+    } else {
+        &["id", "estRows", "task", "access object", "operator info"]
+    };
+    QuerySchema::try_new(columns.iter().map(|name| (*name).to_owned()))
+        .expect("SQL EXPLAIN column names are unique")
+}
 
 #[derive(Debug)]
 struct RelationalExplainNode {
@@ -351,7 +372,7 @@ pub fn format_relational_explain(
         }
         push_relational_output(row, &mut rows, &mut payload_bytes, limits)?;
     }
-    output.rows = rows.into();
+    output.rows = QueryRows::try_from_named_rows(sql_explain_schema(analyze), rows)?;
     Ok(output)
 }
 

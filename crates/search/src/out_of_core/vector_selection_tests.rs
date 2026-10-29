@@ -286,6 +286,7 @@ fn required_rerank_preserves_checksum_budget_and_cancellation_guards() {
                 version: Some("v1".into()),
                 dimension: 2,
             }),
+            vector_backend: None,
             ..Default::default()
         },
     )

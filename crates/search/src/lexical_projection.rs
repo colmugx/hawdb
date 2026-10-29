@@ -31,6 +31,7 @@ use hawdb_integrity::Crc32cHasher as Digest;
 use hawdb_storage::file_io::{self as fs, File};
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -1699,7 +1700,7 @@ impl LexicalProjectionReader {
         inputs: ScoringInputs<'_>,
         allowed: impl FnMut(&str) -> Result<bool>,
     ) -> Result<AccountedQueryReport> {
-        self.score_terms_with_filter(query_terms, inputs, false, allowed)
+        self.score_terms_with_filter(query_terms, inputs, false, None, allowed)
     }
 
     /// Internal predicates over a pinned view may reuse one result per document.
@@ -1710,7 +1711,17 @@ impl LexicalProjectionReader {
         inputs: ScoringInputs<'_>,
         allowed: impl FnMut(&str) -> Result<bool>,
     ) -> Result<AccountedQueryReport> {
-        self.score_terms_with_filter(query_terms, inputs, true, allowed)
+        self.score_terms_with_stable_filter_and_floor(query_terms, inputs, None, allowed)
+    }
+
+    pub(super) fn score_terms_with_stable_filter_and_floor<T: Borrow<str> + Ord>(
+        &self,
+        query_terms: &BTreeSet<T>,
+        inputs: ScoringInputs<'_>,
+        floor: Option<f64>,
+        allowed: impl FnMut(&str) -> Result<bool>,
+    ) -> Result<AccountedQueryReport> {
+        self.score_terms_with_filter(query_terms, inputs, true, floor, allowed)
     }
 
     fn score_terms_with_filter<T: Borrow<str> + Ord>(
@@ -1718,6 +1729,7 @@ impl LexicalProjectionReader {
         query_terms: &BTreeSet<T>,
         inputs: ScoringInputs<'_>,
         reuse_filter: bool,
+        inherited_floor: Option<f64>,
         mut allowed: impl FnMut(&str) -> Result<bool>,
     ) -> Result<AccountedQueryReport> {
         let ScoringInputs {
@@ -1758,26 +1770,32 @@ impl LexicalProjectionReader {
             .map(|block| block.length)
             .max()
             .unwrap_or(0);
-        let admitted_stream_bytes =
+        // Encoded bytes are shared by every term cursor. Decoded postings stay
+        // private because cursors can advance through different frames.
+        let encoded_block_bytes = query_terms
+            .iter()
+            .map(query_term)
+            .flat_map(|term| self.posting_blocks(term))
+            .map(|block| block.length)
+            .max()
+            .unwrap_or(0);
+        let admitted_stream_bytes = encoded_block_bytes.saturating_mul(4).saturating_add(
             document_mapping_bytes.saturating_add(query_terms.iter().map(query_term).fold(
                 0u64,
                 |bytes, term| {
-                    let (max_block, max_entries, references) = self.posting_blocks(term).fold(
-                        (0u64, 0u64, 0u64),
-                        |(max, entries, count), block| {
-                            (
-                                max.max(block.length),
-                                entries.max(u64::from(block.entry_count)),
-                                count.saturating_add(1),
-                            )
-                        },
-                    );
+                    let (max_entries, references) =
+                        self.posting_blocks(term)
+                            .fold((0u64, 0u64), |(entries, count), block| {
+                                (
+                                    entries.max(u64::from(block.entry_count)),
+                                    count.saturating_add(1),
+                                )
+                            });
                     // Reserve actual validated posting and document block extents,
                     // old/new decoded Vec capacity during block transitions,
                     // decoded ordinal/frequency buffers, pointer-vector growth,
                     // and retained query term copies.
                     bytes
-                        .saturating_add(max_block.saturating_mul(4))
                         .saturating_add(
                             max_entries
                                 .saturating_mul(4 * std::mem::size_of::<QueryPosting>() as u64),
@@ -1789,7 +1807,8 @@ impl LexicalProjectionReader {
                         .saturating_add((term.len() as u64).saturating_mul(3))
                         .saturating_add(32)
                 },
-            ));
+            )),
+        );
         if admitted_stream_bytes > self.config.query_memory_bytes.get() {
             return Err(self.query_memory_error(
                 "lexical query streams",
@@ -1873,16 +1892,16 @@ impl LexicalProjectionReader {
         )?
         .with_complete_candidate_limit(complete_candidate_limit);
         let mut streams = Vec::new();
+        let encoded = RefCell::new(PostingReadBuffer::default());
         let mut stream_idf = Vec::new();
         let mut candidate_postings = 0u64;
         for term in query_terms.iter().map(query_term) {
             let df = document_frequency.get(term).copied().unwrap_or(0);
             candidate_postings = candidate_postings.saturating_add(df as u64);
             if df > 0 {
-                streams.push(match context {
-                    Some(context) => TermPostingStream::with_context(self, term, Some(context)),
-                    None => TermPostingStream::new(self, term),
-                });
+                streams.push(TermPostingStream::with_context(
+                    self, term, context, &encoded,
+                ));
                 stream_idf.push(idf(document_count, df));
             }
         }
@@ -1895,7 +1914,14 @@ impl LexicalProjectionReader {
             && candidate_postings >= self.config.pruning_min_postings;
         loop {
             query_context::check(context)?;
-            let floor = if prune { collector.floor() } else { None };
+            let floor = if prune {
+                match (collector.floor(), inherited_floor) {
+                    (Some(local), Some(global)) => Some(local.max(global)),
+                    (local, global) => local.or(global),
+                }
+            } else {
+                None
+            };
             order.clear();
             let mut next_ordinal: Option<u64> = None;
             for (index, stream) in streams.iter_mut().enumerate() {
@@ -2120,13 +2146,79 @@ fn validate_posting_length(posting: &QueryPosting, document_len: u32) -> Result<
     Ok(())
 }
 
+#[derive(Default)]
+struct PostingReadBuffer {
+    block: Option<(u64, u64, u64)>,
+    bytes: Vec<u8>,
+    dictionary: Option<fst::Map<PostingDictionaryBytes>>,
+}
+
+/// Own the physical block while exposing only its dictionary to FST. This
+/// avoids a self-reference, a dictionary copy, and a second encoded allocation.
+struct PostingDictionaryBytes {
+    bytes: Vec<u8>,
+    dictionary: std::ops::Range<usize>,
+    payload_start: usize,
+    count: u32,
+}
+
+impl AsRef<[u8]> for PostingDictionaryBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes[self.dictionary.clone()]
+    }
+}
+
+impl PostingReadBuffer {
+    fn read(
+        &mut self,
+        projection: &LexicalProjectionReader,
+        block: &BlockDescriptor,
+        task: Option<&RuntimeTaskContext>,
+    ) -> Result<(&fst::Map<PostingDictionaryBytes>, u64)> {
+        if let Some(task) = task {
+            query_context::checkpoint(task)?;
+        }
+        let identity = (block.offset, block.length, block.checksum);
+        let mut bytes_read = 0;
+        if self.block != Some(identity) {
+            // Invalidate before reading or verifying. Recover the allocation
+            // only after dropping the dictionary that interpreted its bytes.
+            self.block = None;
+            if let Some(dictionary) = self.dictionary.take() {
+                self.bytes = dictionary.into_fst().into_inner().bytes;
+            }
+            projection.read_block_into(block, task, &mut self.bytes)?;
+            bytes_read = self.bytes.len() as u64;
+            let posting_block =
+                split_posting_block(&self.bytes, projection.manifest.generation, block)?;
+            let payload_start = self.bytes.len() - posting_block.payload.len();
+            let dictionary_start = payload_start - posting_block.dictionary.len();
+            let count = posting_block.count;
+            let bytes = PostingDictionaryBytes {
+                bytes: std::mem::take(&mut self.bytes),
+                dictionary: dictionary_start..payload_start,
+                payload_start,
+                count,
+            };
+            self.dictionary = Some(catch_dictionary_panic(|| verified_dictionary(bytes))?);
+            self.block = Some(identity);
+        }
+        Ok((
+            self.dictionary
+                .as_ref()
+                .expect("validated block has a dictionary"),
+            bytes_read,
+        ))
+    }
+}
+
 struct TermPostingStream<'a> {
     projection: &'a LexicalProjectionReader,
     term: &'a str,
     context: Option<QueryContext<'a>>,
     blocks: Vec<&'a BlockDescriptor>,
     block_index: usize,
-    encoded: Vec<u8>,
+    encoded: &'a RefCell<PostingReadBuffer>,
     current: Vec<QueryPosting>,
     position: usize,
     peeked: Option<QueryPosting>,
@@ -2138,14 +2230,20 @@ struct TermPostingStream<'a> {
 }
 
 impl<'a> TermPostingStream<'a> {
-    fn new(projection: &'a LexicalProjectionReader, term: &'a str) -> Self {
-        Self::with_context(projection, term, None)
+    #[cfg(test)]
+    fn new(
+        projection: &'a LexicalProjectionReader,
+        term: &'a str,
+        encoded: &'a RefCell<PostingReadBuffer>,
+    ) -> Self {
+        Self::with_context(projection, term, None, encoded)
     }
 
     fn with_context(
         projection: &'a LexicalProjectionReader,
         term: &'a str,
         context: Option<QueryContext<'a>>,
+        encoded: &'a RefCell<PostingReadBuffer>,
     ) -> Self {
         let blocks = projection.posting_blocks(term).collect();
         Self {
@@ -2154,7 +2252,7 @@ impl<'a> TermPostingStream<'a> {
             context,
             blocks,
             block_index: 0,
-            encoded: Vec::new(),
+            encoded,
             current: Vec::new(),
             position: 0,
             peeked: None,
@@ -2251,18 +2349,21 @@ impl<'a> TermPostingStream<'a> {
                 return Ok(false);
             };
             self.block_index = self.block_index.saturating_add(1);
-            self.projection.read_block_into(
+            let mut buffer = self.encoded.borrow_mut();
+            let (dictionary, bytes_read) = buffer.read(
+                self.projection,
                 block,
                 self.context.map(|context| context.task),
-                &mut self.encoded,
             )?;
-            self.bytes_read = self.bytes_read.saturating_add(self.encoded.len() as u64);
-            let Some(frames) = term_frames(
-                &self.encoded,
-                self.projection.manifest.generation,
-                block,
-                self.term,
-            )?
+            self.bytes_read = self.bytes_read.saturating_add(bytes_read);
+            let storage = dictionary.as_fst().as_inner();
+            let Some(frames) = catch_dictionary_panic(|| {
+                term_frames_from_value(
+                    &storage.bytes[storage.payload_start..],
+                    storage.count,
+                    dictionary.get(self.term),
+                )
+            })?
             else {
                 continue;
             };
@@ -2491,8 +2592,8 @@ impl<'a> ScoreCollector<'a> {
         matches!(&self.storage, ScoreStorage::TopK { limit, .. } if *limit > 0)
     }
 
-    /// Lowest retained score once the rank window is full. A document whose score
-    /// cannot strictly exceed it cannot enter the retained set.
+    /// Lowest retained score once the rank window is full. Scores strictly below
+    /// it cannot enter the set; equal scores remain eligible for ID tie-breaking.
     fn floor(&self) -> Option<f64> {
         let ScoreStorage::TopK { limit, heap } = &self.storage else {
             return None;
@@ -2609,6 +2710,7 @@ struct TermFrames<'a> {
     document_frequency: u32,
 }
 
+#[cfg(test)]
 fn term_frames<'a>(
     bytes: &'a [u8],
     generation: u64,
@@ -2622,21 +2724,29 @@ fn term_frames<'a>(
         ));
     }
     dictionary_map(block.dictionary, |dictionary| {
-        let Some(value) = dictionary.get(term) else {
-            return Ok(None);
-        };
-        let (offset, document_frequency) = unpack_dictionary_value(value)?;
-        if document_frequency > block.count {
-            return Err(HawDBError::Storage(
-                "lexical term dictionary count exceeds its block".to_string(),
-            ));
-        }
-        Ok(Some(TermFrames {
-            payload: block.payload,
-            offset,
-            document_frequency,
-        }))
+        term_frames_from_value(block.payload, block.count, dictionary.get(term))
     })
+}
+
+fn term_frames_from_value(
+    payload: &[u8],
+    count: u32,
+    value: Option<u64>,
+) -> Result<Option<TermFrames<'_>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let (offset, document_frequency) = unpack_dictionary_value(value)?;
+    if document_frequency > count {
+        return Err(HawDBError::Storage(
+            "lexical term dictionary count exceeds its block".to_string(),
+        ));
+    }
+    Ok(Some(TermFrames {
+        payload,
+        offset,
+        document_frequency,
+    }))
 }
 
 impl TermFrames<'_> {
@@ -3549,16 +3659,31 @@ fn dictionary_map<T>(
     bytes: &[u8],
     consume: impl FnOnce(&fst::Map<&[u8]>) -> Result<T>,
 ) -> Result<T> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let dictionary = fst::Map::new(bytes).map_err(|error| {
-            HawDBError::Storage(format!("invalid lexical term dictionary: {error}"))
-        })?;
-        dictionary.as_fst().verify().map_err(|error| {
-            HawDBError::Storage(format!("invalid lexical term dictionary checksum: {error}"))
-        })?;
+    catch_dictionary_panic(|| {
+        let dictionary = verified_dictionary(bytes)?;
         consume(&dictionary)
-    }))
-    .map_err(|_| {
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static DICTIONARY_VERIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn verified_dictionary<D: AsRef<[u8]>>(bytes: D) -> Result<fst::Map<D>> {
+    let dictionary = fst::Map::new(bytes).map_err(|error| {
+        HawDBError::Storage(format!("invalid lexical term dictionary: {error}"))
+    })?;
+    #[cfg(test)]
+    DICTIONARY_VERIFICATIONS.with(|count| count.set(count.get() + 1));
+    dictionary.as_fst().verify().map_err(|error| {
+        HawDBError::Storage(format!("invalid lexical term dictionary checksum: {error}"))
+    })?;
+    Ok(dictionary)
+}
+
+fn catch_dictionary_panic<T>(consume: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(consume)).map_err(|_| {
         HawDBError::Storage("lexical term dictionary panicked during decoding".to_string())
     })?
 }

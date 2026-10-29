@@ -152,6 +152,7 @@ pub fn nowledge_query_fuzz_harness_report(
 #[doc(hidden)]
 pub const fn nowledge_query_fuzz_error_class(error: &HawDBError) -> &'static str {
     match error {
+        HawDBError::UnsupportedStorageFormat(_) => "unsupported_storage_format",
         HawDBError::Parse(_) => "parse",
         HawDBError::Semantic(_) => "semantic",
         HawDBError::Execution(_)
@@ -166,6 +167,7 @@ pub const fn nowledge_query_fuzz_error_class(error: &HawDBError) -> &'static str
         HawDBError::Storage(_)
         | HawDBError::FileDescriptors(_)
         | HawDBError::StorageIntegrity(_)
+        | HawDBError::WalRecoveryIo { .. }
         | HawDBError::ProjectionBusy
         | HawDBError::AppendSequenceExhausted { .. }
         | HawDBError::BranchBusy { .. }

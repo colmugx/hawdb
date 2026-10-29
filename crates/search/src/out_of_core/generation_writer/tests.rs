@@ -29,6 +29,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod compaction;
 mod context;
+#[cfg(feature = "vector-search")]
+mod diskann;
 mod held_spool;
 mod incremental_ownership;
 mod initial;
@@ -470,6 +472,7 @@ fn fused_generation_is_byte_identical_to_three_pass_builds() {
             lexical_build_memory_bytes: NonZeroU64::new(4096).unwrap(),
             lexical_max_merge_fan_in: NonZeroUsize::new(2).unwrap(),
             rabitq_segment_rows: NonZeroUsize::new(3).unwrap(),
+            vector_backend: None,
             #[cfg(feature = "vector-search")]
             rabitq_bit_width: if case % 2 == 0 {
                 hawdb_vector_projection::RaBitQBitWidth::One
@@ -628,6 +631,11 @@ fn fused_generation_sink_failures_preserve_active_artifacts() {
         let before = published_files(&root);
         let mut options = SearchOutOfCoreGenerationBuildOptions {
             lexical_build_memory_bytes: NonZeroU64::new(1024).unwrap(),
+            vector_backend: if fault.starts_with("vector") {
+                None
+            } else {
+                Some(Default::default())
+            },
             ..SearchOutOfCoreGenerationBuildOptions::default()
         };
         let expected = match fault {
@@ -686,6 +694,7 @@ fn fused_generation_sink_failures_preserve_active_artifacts() {
 fn streaming_generation_publishes_reopenable_zero_residency_projection() {
     let root = test_dir("streaming_generation");
     let options = SearchOutOfCoreGenerationBuildOptions {
+        vector_backend: None,
         source_graph_commit_epoch: Some(17),
         embedding_manifest: Some(SearchEmbeddingManifest {
             model: "test-model".to_string(),
@@ -1041,6 +1050,7 @@ fn rabitq_open_rejects_corruption_and_insufficient_serving_memory() {
     let mut writer = SearchOutOfCoreGenerationWriter::create(
         &root,
         SearchOutOfCoreGenerationBuildOptions {
+            vector_backend: None,
             embedding_manifest: Some(SearchEmbeddingManifest {
                 model: "test-model".to_string(),
                 version: Some("v1".to_string()),

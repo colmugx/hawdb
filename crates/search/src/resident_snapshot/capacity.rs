@@ -120,6 +120,10 @@ pub(super) fn generation(generation: &ReadGeneration) -> usize {
         bytes = bytes.saturating_add(reader.retained_capacity_bytes());
     }
     #[cfg(feature = "vector-search")]
+    {
+        bytes = bytes.saturating_add(index.resident_diskann.retained_capacity_bound(index));
+    }
+    #[cfg(feature = "vector-search")]
     if index.path.is_none() {
         // Fixed before the first query, including the lazy build's transient
         // buffers. This charge does not grow after a lease has been admitted.

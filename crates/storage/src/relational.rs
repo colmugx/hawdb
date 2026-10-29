@@ -66,7 +66,7 @@ pub(crate) use codec::{
     decode_relational_table_schema, decode_relational_wal_batch_owned, decode_row_owned,
     decode_schema_owned, encode_relational_checkpoint_with_work_context,
     encode_relational_row_payload, encode_relational_row_payload_with_work_context,
-    encode_relational_table_schema, CheckpointOutputIo,
+    encode_relational_table_schema, validate_relational_checkpoint_file_format, CheckpointOutputIo,
 };
 #[doc(hidden)]
 pub use compaction::relational_row_page_compaction_publication_config;
@@ -4604,10 +4604,20 @@ impl RelationalState {
                         }
                     }));
                 }
-                RelationalWrite::DeleteWhere { table, .. }
-                | RelationalWrite::UpdateWhere { table, .. } => {
-                    self.sparse_plan_table_schema(table)?;
-                    scan_tables.insert(table.clone());
+                RelationalWrite::DeleteWhere { table, predicate }
+                | RelationalWrite::UpdateWhere {
+                    table, predicate, ..
+                } => {
+                    let schema = self.sparse_plan_table_schema(table)?;
+                    validate_predicate(schema, predicate)?;
+                    if let Some(primary_key) = mutation_primary_key(schema, predicate, None)? {
+                        point_access.insert(RelationalReplayAccess {
+                            table: table.clone(),
+                            primary_key,
+                        });
+                    } else {
+                        scan_tables.insert(table.clone());
+                    }
                 }
                 RelationalWrite::CreateTable(_)
                 | RelationalWrite::DropMaterializedView { .. }
@@ -6121,6 +6131,104 @@ pub enum RelationalPredicate {
     },
 }
 
+/// Every matching row must have this complete key. Residual predicates remain
+/// on the write and are evaluated normally against the hydrated row.
+fn mutation_primary_key(
+    schema: &RelationalTableSchema,
+    predicate: &RelationalPredicate,
+    allocations: Option<&crate::background::CheckpointDecodeContext>,
+) -> Result<Option<RelationalKey>, RelationalError> {
+    fn equality<'a>(
+        predicate: &'a RelationalPredicate,
+        column: &str,
+    ) -> Option<&'a RelationalValue> {
+        match predicate {
+            RelationalPredicate::And(left, right) => {
+                equality(left, column).or_else(|| equality(right, column))
+            }
+            RelationalPredicate::Compare {
+                column: name,
+                op: RelationalComparisonOp::Eq,
+                value,
+            } if name == column && !matches!(value, RelationalValue::Null) => Some(value),
+            _ => None,
+        }
+    }
+    if schema.primary_key.is_empty()
+        || schema
+            .primary_key
+            .iter()
+            .any(|column| equality(predicate, column).is_none())
+    {
+        return Ok(None);
+    }
+    collect_results_with_allocations(
+        schema.primary_key.iter().map(|column| {
+            let value = equality(predicate, column).expect("complete primary key checked above");
+            match allocations {
+                Some(context) => value.as_ref().to_owned_value_with_allocations(context),
+                None => Ok(value.clone()),
+            }
+        }),
+        schema.primary_key.len(),
+        allocations,
+    )
+    .map(|values| Some(RelationalKey(values)))
+}
+
+fn mutation_candidate_rows<'a>(
+    rows: &'a RelationalRowPages,
+    schema: &RelationalTableSchema,
+    predicate: &RelationalPredicate,
+    primary_key_lookup: bool,
+    allocations: Option<&crate::background::CheckpointDecodeContext>,
+) -> Result<impl Iterator<Item = (&'a RelationalKey, &'a RelationalRow)> + use<'a>, RelationalError>
+{
+    let key = if primary_key_lookup {
+        mutation_primary_key(schema, predicate, allocations)?
+    } else {
+        None
+    };
+    let scan_limit = if key.is_some() { 0 } else { usize::MAX };
+    let point = key.and_then(|key| rows.get_key_value(&key));
+    Ok(point.into_iter().chain(rows.iter().take(scan_limit)))
+}
+
+fn transaction_uses_primary_key_predicate_lookup(
+    state: &RelationalState,
+    transaction: &RelationalTransaction,
+    index_mode: TransactionIndexMode,
+    checkpoint_access: Option<&RelationalReplayAccessSet>,
+) -> bool {
+    match index_mode {
+        TransactionIndexMode::Materialized => true,
+        TransactionIndexMode::Authoritative => false,
+        TransactionIndexMode::AuthoritativeRecovery => checkpoint_access.is_some_and(|access| {
+            // Legacy scans read every original key, including keys deleted earlier
+            // in the transaction, which are retained by changed-key capture. An
+            // uncovered original key therefore identifies a point-access record.
+            // The executor still verifies the complete resulting access set.
+            state.segments.iter().any(|(table, segment)| {
+                transaction.writes.iter().any(|write| match write {
+                    RelationalWrite::UpdateWhere { table: target, .. }
+                    | RelationalWrite::DeleteWhere { table: target, .. } => target == table,
+                    _ => false,
+                }) && segment.rows.iter().any(|(key, _)| {
+                    access
+                        .entries()
+                        .binary_search_by(|entry| {
+                            entry
+                                .table
+                                .cmp(table)
+                                .then_with(|| entry.primary_key.cmp(key))
+                        })
+                        .is_err()
+                })
+            })
+        }),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelationalUpsertValue {
     ExcludedColumn(String),
@@ -6414,6 +6522,7 @@ pub enum RelationalError {
     Constraint(String),
     Durability(String),
     FileDescriptors(hawdb_core::error::FileDescriptorError),
+    UnsupportedFormat(hawdb_core::error::StorageFormatError),
     Corruption(String),
 }
 
@@ -6426,6 +6535,7 @@ impl fmt::Display for RelationalError {
                 write!(formatter, "relational constraint violation: {message}")
             }
             Self::FileDescriptors(error) => fmt::Display::fmt(error, formatter),
+            Self::UnsupportedFormat(error) => fmt::Display::fmt(error, formatter),
             Self::Durability(message) => {
                 write!(formatter, "relational durability error: {message}")
             }
@@ -6440,6 +6550,7 @@ impl std::error::Error for RelationalError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::FileDescriptors(error) => Some(error),
+            Self::UnsupportedFormat(error) => Some(error),
             _ => None,
         }
     }
@@ -6969,6 +7080,12 @@ fn apply_transaction_inner(
         checkpoint_allocations,
         checkpoint_access,
     } = options;
+    let primary_key_lookup = transaction_uses_primary_key_predicate_lookup(
+        state,
+        &transaction,
+        index_mode,
+        checkpoint_access,
+    );
     let mut next = match checkpoint_allocations {
         Some(context) => state.clone_metadata_with_work_context(&context.work)?,
         None => state.clone(),
@@ -7433,7 +7550,13 @@ fn apply_transaction_inner(
                     }
                 });
                 let mut keys = Vec::new();
-                for (key, row) in segment.rows.iter() {
+                for (key, row) in mutation_candidate_rows(
+                    &segment.rows,
+                    schema,
+                    &predicate,
+                    primary_key_lookup,
+                    match_context.as_ref(),
+                )? {
                     if let Some(tracker) = replay_access_tracker.as_mut() {
                         tracker.record(&table, key)?;
                     }
@@ -7547,7 +7670,7 @@ fn apply_transaction_inner(
                             checkpoint_allocations,
                         )?,
                         replay_access_tracker: replay_access_tracker.as_mut(),
-
+                        primary_key_lookup,
                         checkpoint_allocations,
                     },
                 )?;
@@ -8126,6 +8249,7 @@ struct UpdateApplyContext<'a> {
     changed_keys: &'a mut BTreeSet<RelationalKey>,
     checkpoint_allocations: Option<&'a crate::background::CheckpointDecodeContext>,
     replay_access_tracker: Option<&'a mut RelationalReplayAccessTracker>,
+    primary_key_lookup: bool,
 }
 
 fn apply_update(
@@ -8141,6 +8265,7 @@ fn apply_update(
         changed_keys,
         mut replay_access_tracker,
         checkpoint_allocations,
+        primary_key_lookup,
     } = context;
     let schema = Arc::clone(
         state
@@ -8218,7 +8343,13 @@ fn apply_update(
             memory: Default::default(),
         });
     let mut matched = Vec::new();
-    for (key, row) in segment.rows.iter() {
+    for (key, row) in mutation_candidate_rows(
+        &segment.rows,
+        &schema,
+        predicate,
+        primary_key_lookup,
+        match_context.as_ref(),
+    )? {
         if let Some(tracker) = replay_access_tracker.as_deref_mut() {
             tracker.record(table, key)?;
         }

@@ -180,6 +180,10 @@ fn vector_observability_codes_have_stable_strings() {
         VectorFallbackReasonCode::CompressedVectorBudgetExceeded.as_str(),
         "compressed_vector_budget_exceeded"
     );
+    assert_eq!(
+        VectorFallbackReasonCode::DiskAnnCacheBudgetExceeded.as_str(),
+        "diskann_cache_budget_exceeded"
+    );
 }
 
 #[test]

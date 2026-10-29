@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -365,7 +365,7 @@ mod tests {
         let permit = owner
             .apply(|index| index.borrow_consumer_mutation())
             .unwrap();
-        assert!(owner.index().borrow_consumer_mutation().is_err());
+        assert!(owner.index().unwrap().borrow_consumer_mutation().is_err());
         assert!(matches!(
             owner.checkpoint(),
             Err(HawDBError::ProjectionBusy)

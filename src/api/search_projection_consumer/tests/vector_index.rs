@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Kernel acceptance; language-driven source mapping is tested separately.
 
@@ -8,6 +8,190 @@ use crate::{VectorDistance, VectorIndexBackend, VectorIndexDescriptor, VectorInd
 use hawdb_qos::RuntimeWorkRequest;
 use hawdb_search::{SearchDocument, SearchQueryError, VectorIndexQuery};
 use std::num::NonZeroUsize;
+
+mod incremental_recovery;
+
+#[test]
+fn vector_index_publication_funds_the_explicit_task_memory_envelope() {
+    use hawdb_search::consumer::RegisteredConsumerProjector::{CanonicalVectorField, HostMapping};
+    for (projector, requested, admitted, effective) in [
+        (CanonicalVectorField, None, 64 << 20, 64 << 20),
+        (CanonicalVectorField, Some(32 << 20), 64 << 20, 32 << 20),
+        (CanonicalVectorField, Some(128 << 20), 128 << 20, 128 << 20),
+        (HostMapping, Some(128 << 20), 64 << 20, 64 << 20),
+    ] {
+        let fixture = Fixture::new();
+        let mut db = fixture.database();
+        let task = requested.map_or_else(RuntimeTaskContext::default, |bytes| {
+            RuntimeTaskContext::default()
+                .with_memory_reservation(hawdb_core::RuntimeMemoryReservation::new(bytes, bytes))
+        });
+        let observed = std::cell::Cell::new(false);
+        let result = db.create_consumer_with_initializer::<
+            { hawdb_search::projection_consumer::MAX_CONSUMERS },
+            _,
+        >(
+            id("budget"),
+            &fixture.0.join("budget"),
+            options(100),
+            task.clone(),
+            projector,
+            |_, _, permit| {
+                observed.set(true);
+                assert_eq!(permit.request().memory_bytes, admitted);
+                let controlled = permit.bind_task_context(task.clone());
+                assert_eq!(controlled.memory_reservation().unwrap().memory_bytes(), effective);
+                let memory = controlled.reserve_working_memory(1024).unwrap();
+                assert!(controlled.reserve_working_memory(effective + 1).is_err());
+                drop(memory);
+                Err(HawDBError::Execution("budget probe complete".into()))
+            },
+        );
+        assert!(observed.get());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("budget probe complete"));
+    }
+}
+
+#[test]
+fn vector_index_publication_cannot_exceed_host_memory_capacity() {
+    use hawdb_qos::{
+        IoConcurrencyBudget, RuntimeGovernor, RuntimeGovernorConfig, RuntimeMemorySnapshot,
+        RuntimeResourceBudget, RuntimeResourceSnapshot,
+    };
+    let fixture = Fixture::new();
+    let mut db = fixture.database();
+    let governor = RuntimeGovernor::new(
+        RuntimeGovernorConfig {
+            memory_budget_bytes: Some(64 << 20),
+            ..RuntimeGovernorConfig::shared_host()
+        },
+        RuntimeResourceSnapshot::from_parts(
+            RuntimeResourceBudget::from_limits(NonZeroUsize::new(2).unwrap(), None, None),
+            RuntimeMemorySnapshot::from_limits(Some(1 << 30), Some(1 << 30), None, None, None),
+        ),
+        IoConcurrencyBudget::new(1, 1),
+    );
+    db.set_runtime_governor(governor.clone());
+    let task = RuntimeTaskContext::default().with_memory_reservation(
+        hawdb_core::RuntimeMemoryReservation::new(128 << 20, 128 << 20),
+    );
+    assert!(db.vector_consumer_publication_permit(&task).is_err());
+    assert_eq!(governor.snapshot().admitted_memory_bytes, 0);
+    let permit = db.consumer_publication_permit().unwrap();
+    assert_eq!(governor.snapshot().admitted_memory_bytes, 64 << 20);
+    drop(permit);
+    assert_eq!(governor.snapshot().admitted_memory_bytes, 0);
+}
+
+#[test]
+fn vector_index_reopen_honors_explicit_working_memory_and_host_capacity() {
+    use hawdb_qos::{
+        IoConcurrencyBudget, RuntimeGovernor, RuntimeGovernorConfig, RuntimeMemorySnapshot,
+        RuntimeResourceBudget, RuntimeResourceSnapshot,
+    };
+
+    let fixture = Fixture::new();
+    let mut db = fixture.database();
+    let suspension = db.runtime.suspend_automatic_checkpoint().unwrap();
+    if let Some(suspension) = &suspension {
+        suspension.wait_idle().unwrap();
+    }
+    let path = fixture.0.join("projection");
+    let (consumer, binding) = initialize_bound_index(&mut db, &path);
+    let receipt = consumer.projection().stationary_receipt().unwrap();
+    let generation = receipt.generation_name().to_owned();
+    let epoch = consumer.projection().receipt().source_epoch;
+    drop(consumer);
+    drop(suspension);
+    drop(db);
+    let governor = |bytes| {
+        let governor = RuntimeGovernor::new(
+            RuntimeGovernorConfig {
+                memory_budget_bytes: Some(bytes),
+                ..RuntimeGovernorConfig::shared_host()
+            },
+            RuntimeResourceSnapshot::from_parts(
+                RuntimeResourceBudget::from_limits(NonZeroUsize::new(2).unwrap(), None, None),
+                RuntimeMemorySnapshot::from_limits(Some(1 << 30), Some(1 << 30), None, None, None),
+            ),
+            IoConcurrencyBudget::new(1, 1),
+        );
+        governor.pin_resources();
+        governor
+    };
+    let task = |bytes| {
+        RuntimeTaskContext::default()
+            .with_memory_reservation(hawdb_core::RuntimeMemoryReservation::new(bytes, 0))
+    };
+    let constrained = governor(96 << 20);
+    let mut db = fixture.database();
+    db.set_runtime_governor(constrained.clone());
+    let suspension = db.runtime.suspend_automatic_checkpoint().unwrap();
+    if let Some(suspension) = &suspension {
+        suspension.wait_idle().unwrap();
+    }
+    let rejections = constrained.snapshot().admission_rejections;
+    assert!(db
+        .open_search_projection_consumer_with_task(&id("vectors.embedding"), &path, task(128 << 20))
+        .is_err());
+    assert_eq!(constrained.snapshot().admission_rejections, rejections + 1);
+    assert_eq!(constrained.snapshot().admitted_memory_bytes, 0);
+    let result =
+        db.open_search_projection_consumer_with_task(&id("vectors.embedding"), &path, task(1024));
+    assert!(
+        matches!(
+            result,
+            Err(Error::Database(HawDBError::ResourceBudgetExceeded(_)))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(constrained.snapshot().active_background_tasks, 0);
+    assert_eq!(constrained.snapshot().admitted_memory_bytes, 0);
+
+    // Default callers retain their existing budget and can retry the same target.
+    let consumer = db
+        .open_search_projection_consumer(&id("vectors.embedding"), &path)
+        .unwrap();
+    assert_eq!(
+        consumer
+            .projection()
+            .stationary_receipt()
+            .unwrap()
+            .generation_name(),
+        generation
+    );
+    drop(consumer);
+    assert_eq!(constrained.snapshot().admitted_memory_bytes, 0);
+    drop(suspension);
+    drop(db);
+
+    let funded = governor(256 << 20);
+    let mut db = fixture.database();
+    db.set_runtime_governor(funded.clone());
+    let suspension = db.runtime.suspend_automatic_checkpoint().unwrap();
+    if let Some(suspension) = &suspension {
+        suspension.wait_idle().unwrap();
+    }
+    let consumer = db
+        .open_search_projection_consumer_with_task(&id("vectors.embedding"), &path, task(128 << 20))
+        .unwrap();
+    assert_eq!(
+        consumer
+            .projection()
+            .stationary_receipt()
+            .unwrap()
+            .generation_name(),
+        generation
+    );
+    assert_eq!(consumer.projection().receipt().source_epoch, epoch);
+    assert_eq!(consumer.vector_index_descriptor().unwrap(), Some(&binding));
+    assert_eq!(funded.snapshot().active_background_tasks, 0);
+    drop(consumer);
+    assert_eq!(funded.snapshot().admitted_memory_bytes, 0);
+}
 
 fn initialize_bound_index(
     db: &mut Database,
@@ -142,10 +326,7 @@ fn vector_index_kernel_preserves_signed_distances_and_retained_reopen_results() 
         .unwrap();
     assert_eq!(output.hits(), reopened.hits());
     assert_eq!(output.report().generation, reopened.report().generation);
-    assert_eq!(
-        consumer.search_index().unwrap().vector_index_descriptor(),
-        Some(&binding)
-    );
+    assert_eq!(consumer.vector_index_descriptor().unwrap(), Some(&binding));
 }
 
 #[test]
@@ -252,6 +433,10 @@ fn vector_index_rebuild_recovers_uncertain_selection_without_retargeting_old_rea
         assert!(db
             .rebuild_vector_index(&mut consumer, Default::default())
             .is_err());
+        assert!(
+            consumer.projection().stationary_receipt().is_err(),
+            "an uncertain selection must not satisfy a host's stationary retry guard"
+        );
         let old_generation = old.generation();
         let old_output = old
             .query_candidates(

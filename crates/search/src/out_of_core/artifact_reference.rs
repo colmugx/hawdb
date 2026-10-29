@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Version-four producer references. The wire fixes kind/version to
 //! CheckpointArtifact/1; there is no absent-reference or native-ID fallback.
@@ -122,6 +122,8 @@ impl<S: AsRef<str>> SearchOutOfCoreSegmentManifest<S> {
 pub(super) struct ResidentSnapshot {
     pub(super) object: ArtifactObject,
     pub(super) vector_document_count: usize,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) metadata_only: bool,
 }
 
 #[cfg(test)]

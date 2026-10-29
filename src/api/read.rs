@@ -1043,6 +1043,7 @@ where
             query_runtime::query_runtime_checkpoint(Some(task_context))?;
             return observability::admit_append_explain(
                 crate::relational_sql::format_append_explain(&plan, report.as_ref()),
+                plan.analyze,
                 &self.config,
                 QueryStreamOptions {
                     max_rows,

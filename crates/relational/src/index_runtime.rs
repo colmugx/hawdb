@@ -545,6 +545,9 @@ impl<'a, R: RelationalIndexStoreReader> RelationalIndexRuntime<'a, R> {
             return Err(error);
         }
         match attempt {
+            Some(Err(RelationalIndexShadowError::UnsupportedFormat(error))) => {
+                Err(HawDBError::UnsupportedStorageFormat(error))
+            }
             Some(Err(RelationalIndexShadowError::FileDescriptors(error))) => {
                 Err(HawDBError::FileDescriptors(error))
             }
@@ -743,6 +746,9 @@ impl<'a, R: RelationalIndexStoreReader> RelationalIndexRuntime<'a, R> {
             return Err(error);
         }
         match attempt {
+            Some(Err(RelationalIndexShadowError::UnsupportedFormat(error))) => {
+                Err(HawDBError::UnsupportedStorageFormat(error))
+            }
             Some(Err(RelationalIndexShadowError::FileDescriptors(error))) => {
                 Err(HawDBError::FileDescriptors(error))
             }

@@ -112,7 +112,7 @@ mod vector_index;
 pub use vector_index::{
     VectorIndexBuildError, VectorIndexBuildOptions, VectorIndexField, VectorIndexLanguageBudget,
     VectorIndexLanguageReport, VectorIndexReadError, VectorIndexReadTransaction,
-    VectorIndexSqlReport, VectorIndexSqlRequest,
+    VectorIndexSqlReport, VectorIndexSqlRequest, VectorIndexUpdateReport,
 };
 mod transaction_read_dependencies;
 pub use transaction_read_dependencies::{
@@ -414,6 +414,9 @@ pub struct DatabaseConfig {
     /// the project through this anchor, inclusive. The host must keep that
     /// namespace stable while the project is open; existence is not proof.
     /// `None` retains the default walk through the existing filesystem mount.
+    /// On Windows this includes the volume root and requires writable directory
+    /// handles at every level. Ordinary user-profile storage should select an
+    /// explicit host-guaranteed anchor; access denial never supplies one.
     /// Concurrent opens of one project must use the same canonical anchor.
     pub namespace_durability_anchor: Option<PathBuf>,
     /// Maximum monotonic age of uncheckpointed data in an admitted persistent
@@ -478,8 +481,14 @@ pub struct DatabaseConfig {
     pub max_search_projection_change_log_bytes: Option<usize>,
     pub search_projection_relational_change_limits:
         hawdb_storage::relational::RelationalPrimaryKeyChangeCaptureLimits,
-    /// Maximum entries per graph physical-plan or relational SQL-template cache.
+    /// Maximum entries per graph physical-plan, parameter-binding-template,
+    /// or relational SQL-template cache.
     pub max_plan_cache_entries: Option<usize>,
+    /// Requested-heap budget for the shared logical parameter-binding cache,
+    /// including its keys and table capacity. Defaults to 16 MiB; zero disables
+    /// admission. In-flight plans, physical-plan caches, allocator rounding and
+    /// fixed cache metadata are outside this retention bound.
+    pub max_parameter_binding_cache_bytes: usize,
     /// Commit-epoch lag tolerated before the inline query path recomputes
     /// optimizer statistics. `None` or `Some(0)` refreshes on every committed
     /// data change (freshest plans). Larger values amortize statistics
@@ -747,6 +756,7 @@ impl Default for DatabaseConfig {
             ),
             search_projection_relational_change_limits: Default::default(),
             max_plan_cache_entries: Some(DEFAULT_PLAN_CACHE_MAX_ENTRIES),
+            max_parameter_binding_cache_bytes: 16 * 1024 * 1024,
             optimizer_statistics_inline_commit_lag: None,
             slow_query_log_capacity: system_sql::DEFAULT_SLOW_QUERY_LOG_CAPACITY,
             slow_query_log_threshold_micros: system_sql::DEFAULT_SLOW_QUERY_LOG_THRESHOLD_MICROS,
@@ -883,6 +893,7 @@ impl ProjectionRelationalReadBinding {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct StatementExecutionContext<'a> {
+    query_identity: Option<&'a hawdb_query::QueryIdentity>,
     execution_profile: Option<&'a executor::ReadExecutionProfile>,
     retained_profile: Option<&'a RetainedQueryProfile>,
     access_control: Option<&'a QueryAccessControlContext>,

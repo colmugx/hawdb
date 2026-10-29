@@ -244,6 +244,7 @@ pub enum RelationalRowPagePublicationError {
     Corrupt(String),
     Durability(String),
     FileDescriptors(hawdb_core::error::FileDescriptorError),
+    UnsupportedFormat(hawdb_core::error::StorageFormatError),
     MissingTable(String),
     StaleGeneration {
         expected_previous: Option<u64>,
@@ -261,6 +262,7 @@ impl fmt::Display for RelationalRowPagePublicationError {
                 write!(formatter, "corrupt relational row-page publication: {message}")
             }
             Self::FileDescriptors(error) => fmt::Display::fmt(error, formatter),
+            Self::UnsupportedFormat(error) => fmt::Display::fmt(error, formatter),
             Self::Durability(message) => {
                 write!(formatter, "relational row-page publication durability failed: {message}")
             }
@@ -282,6 +284,7 @@ impl std::error::Error for RelationalRowPagePublicationError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::FileDescriptors(error) => Some(error),
+            Self::UnsupportedFormat(error) => Some(error),
             _ => None,
         }
     }
@@ -308,3 +311,13 @@ fn durability(
 #[cfg(test)]
 #[path = "publication/tests.rs"]
 mod tests;
+
+impl RelationalRowPageRootManifest {
+    pub(crate) fn read_bound_file(
+        path: &Path,
+        config: RelationalRowPagePublicationConfig,
+        expected: RelationalRowPageArtifactMetadata,
+    ) -> Result<Self, RelationalRowPagePublicationError> {
+        manifest::read_bound_manifest(path, config, expected)
+    }
+}

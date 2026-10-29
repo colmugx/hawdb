@@ -17,6 +17,8 @@ use crate::optimizer::OptimizerTrace;
 #[cfg(feature = "acl")]
 use crate::{QueryAccessControlContext, RuntimeCapabilities, RuntimeCapability};
 
+mod query_identity;
+
 #[test]
 fn explain_reports_memo_allocation_limits_without_plan_degradation_warnings() {
     for (max_groups, exceeded) in [(0, true), (128, false)] {
@@ -1604,6 +1606,7 @@ fn slow_query_log_records_acl_epoch_without_policy_inputs() {
 fn failed_cypher_queries_do_not_enter_slow_query_ring() {
     let mut db = Database::new_with_config(DatabaseConfig {
         read_only: true,
+        recovery_mode: crate::RecoveryMode::Strict,
         slow_query_log_threshold_micros: 0,
         slow_query_log_capacity: 8,
         statement_summary_capacity: 8,

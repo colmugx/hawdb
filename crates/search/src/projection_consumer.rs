@@ -91,7 +91,24 @@ impl SearchProjectionConsumer {
 
     pub fn search_index(&self) -> Result<&SearchIndex> {
         self.projection.require_completed_view()?;
-        Ok(self.projection.index())
+        self.projection.index()
+    }
+
+    pub fn vector_index_descriptor(&self) -> Result<Option<&hawdb_core::VectorIndexDescriptor>> {
+        self.projection.vector_index_descriptor()
+    }
+
+    #[doc(hidden)]
+    pub fn canonical_vector_source_epoch(&self) -> Result<Option<u64>> {
+        self.projection.canonical_vector_source_epoch()
+    }
+
+    pub fn document_count(&self) -> Result<usize> {
+        self.projection.document_count()
+    }
+
+    pub fn projection_freshness(&self) -> Result<crate::SearchProjectionFreshness> {
+        self.projection.projection_freshness()
     }
 
     /// Retain this immutable native version across a later publication.

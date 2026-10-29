@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Complete source capture under the existing registered Consumer publication.
 
@@ -21,12 +21,17 @@ use std::path::Path;
 #[cfg(all(test, feature = "vector-search"))]
 mod tests;
 
+mod incremental;
+pub use incremental::VectorIndexUpdateReport;
+
 #[derive(Debug, Clone)]
 pub struct VectorIndexBuildOptions {
     pub distance: VectorDistance,
     pub backend: VectorIndexBackend,
     /// Private source mapping and resident producer envelope, separately funded
     /// from the Consumer publication and retained-reader envelopes.
+    /// A larger explicit envelope also raises canonical publication admission;
+    /// publication remains a separate host charge and honors the task ceiling.
     pub memory_bytes: NonZeroUsize,
     pub max_documents: NonZeroUsize,
     pub max_row_payload_bytes: NonZeroUsize,
@@ -39,11 +44,7 @@ impl Default for VectorIndexBuildOptions {
     fn default() -> Self {
         Self {
             distance: VectorDistance::Cosine,
-            backend: VectorIndexBackend::RaBitQ {
-                bit_width: 4,
-                segment_rows: 1024,
-                transform_seed: 0x534b_4549_4e56_5134,
-            },
+            backend: VectorIndexBackend::default(),
             memory_bytes: NonZeroUsize::new(32 << 20).unwrap(),
             max_documents: NonZeroUsize::new(100_000).unwrap(),
             max_row_payload_bytes: NonZeroUsize::new(1 << 20).unwrap(),
@@ -116,7 +117,7 @@ impl Database {
         let mut producer_memory = None;
         let result = self.create_consumer_with_initializer::<
             { hawdb_search::projection_consumer::MAX_CONSUMERS }, _
-        >(id, destination.as_ref(), consumer_options, build.task.clone(), |source, index, permit| {
+        >(id, destination.as_ref(), consumer_options, build.task.clone(), hawdb_search::consumer::RegisteredConsumerProjector::CanonicalVectorField, |source, index, permit| {
             let mapped = (|| {
                 producer_memory = Some(permit.reserve_retained_memory(build.memory_bytes.get() as u64)
                     .map_err(VectorIndexBuildError::Admission)?);
@@ -139,6 +140,9 @@ impl Database {
     /// Rebuild the same target and algorithm from a complete current snapshot.
     /// Deletes, updates and transitions to NULL are reflected in the successor;
     /// previously bound read domains retain their own source and generation.
+    /// Retryable pre-effect admission and `BranchBusy` handling follow
+    /// [`Self::catch_up_vector_index`]; an uncertain publication requires
+    /// Consumer recovery, never an unconditional rebuild retry.
     pub fn rebuild_vector_index(
         &mut self,
         consumer: &mut SearchProjectionConsumer,
@@ -148,9 +152,11 @@ impl Database {
         build.bind_memory_limit()?;
         let mut input_error = None;
         let mut producer_memory = None;
+        let mut admission_error = None;
         let result = self.rebuild_consumer_with_initializer(
             consumer,
             build.task.clone(),
+            &mut admission_error,
             |source, index, permit, previous| {
                 let mapped = (|| {
                     producer_memory = Some(
@@ -158,9 +164,7 @@ impl Database {
                             .reserve_retained_memory(build.memory_bytes.get() as u64)
                             .map_err(VectorIndexBuildError::Admission)?,
                     );
-                    let definition = previous
-                        .vector_index_descriptor()
-                        .ok_or_else(|| invalid("Consumer has no vector index definition"))?;
+                    let definition = previous;
                     let field = VectorIndexField::from_target(definition.target());
                     build_source(
                         source,
@@ -178,9 +182,10 @@ impl Database {
             },
         );
         drop(producer_memory);
-        match input_error {
-            Some(error) => Err(error),
-            None => result.map_err(VectorIndexBuildError::Consumer),
+        match (input_error, admission_error) {
+            (Some(error), _) => Err(error),
+            (None, Some(error)) => Err(VectorIndexBuildError::Admission(error)),
+            (None, None) => result.map_err(VectorIndexBuildError::Consumer),
         }
     }
 }
@@ -218,10 +223,22 @@ fn build_source(
     index.bind_vector_index(binding.clone())?;
     let mut documents = account.reserve(0)?;
     let mut count = 0usize;
-    let mut cursor = source.store.capture_full_projection_source(
+    // Field completeness excludes unrelated schema and data domains.
+    let (labels, tables) = match binding.target() {
+        VectorIndexTarget::NodeProperty { table, .. } => {
+            let label = source.catalog.label_id(table).ok_or_else(|| {
+                invalid("vector index label is absent from the canonical catalog")
+            })?;
+            (vec![label], Vec::new())
+        }
+        VectorIndexTarget::Relational { table, .. } => (Vec::new(), vec![table.clone()]),
+    };
+    let mut cursor = source.store.capture_projection_source_domains(
         options.feed,
         options.source,
         options.task.clone(),
+        Some(labels),
+        Some(tables),
     )?;
     let row_bytes = add(
         options
@@ -335,6 +352,7 @@ fn build_source(
         })?;
     }
     cursor.finish()?;
+    index.finish_canonical_vector_source(source.commit_epoch(), None, Vec::new())?;
     Ok(())
 }
 

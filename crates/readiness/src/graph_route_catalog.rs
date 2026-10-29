@@ -641,11 +641,13 @@ fn string_array_field(value: &serde_json::Value, field: &str) -> Result<Vec<Stri
 
 fn error_class(error: &HawDBError) -> &'static str {
     match error {
+        HawDBError::UnsupportedStorageFormat(_) => "unsupported_storage_format",
         HawDBError::Parse(_) => "parse",
         HawDBError::Semantic(_) => "semantic",
         HawDBError::Storage(_)
         | HawDBError::FileDescriptors(_)
         | HawDBError::StorageIntegrity(_)
+        | HawDBError::WalRecoveryIo { .. }
         | HawDBError::ProjectionBusy
         | HawDBError::AppendSequenceExhausted { .. }
         | HawDBError::BranchBusy { .. }

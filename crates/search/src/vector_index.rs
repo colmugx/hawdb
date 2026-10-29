@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Schema-binding metadata sealed with ordinary search projection artifacts.
 
@@ -11,6 +11,32 @@ mod query;
 pub use query::{
     VectorIndexHit, VectorIndexQuery, VectorIndexQueryReport, VectorIndexRetainedOutput,
 };
+
+/// Logical identity of a schema-bound Consumer whose rows live exclusively in
+/// the immutable artifact closure. This is never a resident serving index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VectorDocumentSummary {
+    pub(crate) document_count: usize,
+    pub(crate) vector_document_count: usize,
+    pub(crate) documents_digest: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct CanonicalVectorDelta {
+    pub(crate) base_epoch: u64,
+    pub(crate) deletes: Vec<String>,
+}
+
+impl VectorDocumentSummary {
+    pub(crate) fn validate(self) -> Result<()> {
+        if self.vector_document_count > self.document_count {
+            return Err(invalid(
+                "vector summary count exceeds logical document count",
+            ));
+        }
+        Ok(())
+    }
+}
 
 pub(crate) fn encode(descriptor: &VectorIndexDescriptor) -> String {
     use std::fmt::Write;
@@ -39,7 +65,7 @@ pub(crate) fn decode(encoded: &str) -> Result<VectorIndexDescriptor> {
         .map_err(|error| invalid(&format!("invalid descriptor: {error}")))
 }
 
-fn invalid(message: &str) -> HawDBError {
+pub(crate) fn invalid(message: &str) -> HawDBError {
     HawDBError::StorageIntegrity(format!("vector index binding: {message}"))
 }
 
@@ -52,7 +78,10 @@ pub(crate) fn validate_projection(
         bit_width,
         segment_rows,
         transform_seed,
-    } = descriptor.backend();
+    } = descriptor.backend()
+    else {
+        return Err(invalid("RaBitQ artifact has a different bound backend"));
+    };
     if artifact.dimension != descriptor.dimension().get() as usize
         || artifact.bit_width != bit_width
         || artifact.requested_segment_rows != segment_rows as usize
@@ -66,6 +95,65 @@ pub(crate) fn validate_projection(
 }
 
 impl SearchIndex {
+    /// Terminal handoff from the facade's fixed canonical vector projector.
+    /// Enumeration alone is insufficient: the facade must hydrate every mapped
+    /// key from the same pinned source before completing this private builder.
+    #[doc(hidden)]
+    pub fn finish_canonical_vector_source(
+        &mut self,
+        epoch: u64,
+        base_epoch: Option<u64>,
+        deletes: Vec<String>,
+    ) -> Result<()> {
+        let _mutation = self.borrow_consumer_mutation()?;
+        let definition = self
+            .vector_index_descriptor
+            .as_ref()
+            .ok_or_else(|| invalid("canonical source has no vector binding"))?;
+        if self.path.is_some()
+            || self.consumer_binding.is_some()
+            || self.canonical_vector_source_epoch.is_some()
+            || base_epoch.is_some_and(|base| base > epoch)
+            || base_epoch.is_none() && !deletes.is_empty()
+            || deletes.windows(2).any(|pair| pair[0] >= pair[1])
+            || deletes.iter().any(|id| self.documents.contains_key(id))
+        {
+            return Err(invalid("canonical source requires an unsealed private builder and disjoint ordered changes"));
+        }
+        let native_id = |id: &str| {
+            let (prefix, fixed_length) = match definition.target() {
+                hawdb_core::VectorIndexTarget::NodeProperty { .. } => ("n:", Some(16)),
+                hawdb_core::VectorIndexTarget::Relational { .. } => ("r:", None),
+            };
+            id.strip_prefix(prefix).is_some_and(|key| {
+                !key.is_empty()
+                    && key.len().is_multiple_of(2)
+                    && fixed_length.is_none_or(|length| key.len() == length)
+                    && key
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        };
+        if self.documents.values().any(|document| {
+            !native_id(&document.id)
+                || document.embedding.is_none()
+                || !document.title.is_empty()
+                || !document.content.is_empty()
+                || !document.metadata.is_empty()
+        }) || deletes.iter().any(|id| !native_id(id))
+        {
+            return Err(invalid(
+                "canonical source contains a non-native identity or non-vector payload",
+            ));
+        }
+        self.canonical_vector_source_epoch = Some(epoch);
+        self.canonical_vector_delta = base_epoch.map(|base_epoch| CanonicalVectorDelta {
+            base_epoch,
+            deletes,
+        });
+        Ok(())
+    }
+
     pub fn vector_index_descriptor(&self) -> Option<&VectorIndexDescriptor> {
         self.vector_index_descriptor.as_ref()
     }
@@ -98,12 +186,12 @@ impl SearchIndex {
 
     pub(crate) fn restore_vector_index(&mut self, descriptor: VectorIndexDescriptor) {
         #[cfg(feature = "vector-search")]
+        if let hawdb_core::VectorIndexBackend::RaBitQ {
+            bit_width,
+            segment_rows,
+            transform_seed,
+        } = descriptor.backend()
         {
-            let hawdb_core::VectorIndexBackend::RaBitQ {
-                bit_width,
-                segment_rows,
-                transform_seed,
-            } = descriptor.backend();
             self.rabitq_build_options.bit_width = match bit_width {
                 1 => hawdb_vector_projection::RaBitQBitWidth::One,
                 4 => hawdb_vector_projection::RaBitQBitWidth::Four,
@@ -114,6 +202,33 @@ impl SearchIndex {
         }
         self.vector_index_descriptor = Some(descriptor);
     }
+}
+
+#[cfg(feature = "vector-search")]
+pub(crate) fn diskann_build_config(
+    backend: hawdb_core::VectorIndexBackend,
+    max_working_bytes: usize,
+) -> Option<hawdb_vector_projection::diskann::DiskAnnBuildConfig> {
+    let hawdb_core::VectorIndexBackend::DiskAnn {
+        max_degree,
+        build_beam,
+        alpha_milli,
+        lsg,
+    } = backend
+    else {
+        return None;
+    };
+    Some(hawdb_vector_projection::diskann::DiskAnnBuildConfig {
+        max_degree: max_degree as usize,
+        build_beam: build_beam as usize,
+        alpha: f64::from(alpha_milli) / 1000.0,
+        lsg: lsg.map(|value| hawdb_vector_projection::diskann::LsgBuildConfig {
+            sample_size: value.sample_size as usize,
+            neighbors: value.neighbors as usize,
+            exponent: f64::from(value.exponent_milli) / 1000.0,
+        }),
+        max_working_bytes,
+    })
 }
 
 #[cfg(all(test, feature = "vector-search"))]
@@ -150,6 +265,66 @@ mod tests {
             content: String::new(),
             embedding,
             metadata: BTreeMap::new(),
+        }
+    }
+
+    fn summary_snapshot(records: &str) -> String {
+        let binding = crate::consumer::ConsumerBinding {
+            database_uuid: hawdb_core::generate_uuidv7().unwrap(),
+            projection_uuid: hawdb_core::generate_uuidv7().unwrap(),
+            consumer_id: "vector-summary".into(),
+            registration_uuid: hawdb_core::generate_uuidv7().unwrap(),
+            checkpoint_uuid: hawdb_core::generate_uuidv7().unwrap(),
+        };
+        let body = format!(
+            "HAWDB_SEARCH_PROJECTION_V1\n{}source_graph_commit_epoch\t1\nvector_index_binding\t{}\nembedding_dimension\t2\n{records}",
+            binding.record(), encode(&descriptor()),
+        );
+        format!(
+            "{body}checksum\t{}\n",
+            crate::checksum_bytes(body.as_bytes())
+        )
+    }
+
+    #[test]
+    fn vector_index_summary_retains_logical_counts_without_resident_rows() {
+        let mut index = SearchIndex::in_memory();
+        index
+            .parse_snapshot_text(&summary_snapshot(
+                "vector_document_summary\t1000000\t999999\t42\n",
+            ))
+            .unwrap();
+        assert!(index.documents.is_empty());
+        assert_eq!(index.document_count(), 1_000_000);
+        assert_eq!(index.projection_freshness().document_count, 1_000_000);
+        assert_eq!(index.vector_document_summary.unwrap().documents_digest, 42);
+        assert_eq!(index.vector_index_descriptor(), Some(&descriptor()));
+        for records in [
+            "vector_document_summary\t1\t2\t42\n",
+            "vector_document_summary\t1\t1\t42\nvector_document_summary\t1\t1\t42\n",
+            "vector_document_summary\t1\t1\t42\ndoc\t61\t\t\t\t\n",
+            "doc\t61\t\t\t\t\nvector_document_summary\t1\t1\t42\n",
+        ] {
+            assert!(
+                SearchIndex::in_memory()
+                    .parse_snapshot_text(&summary_snapshot(records))
+                    .is_err(),
+                "{records}"
+            );
+        }
+        let text = summary_snapshot("vector_document_summary\t1\t1\t42\n");
+        let (body, _) = crate::split_checksum(&text).unwrap();
+        for prefix in ["projection_consumer_binding\t", "vector_index_binding\t"] {
+            let body = body
+                .lines()
+                .filter(|line| !line.starts_with(prefix))
+                .map(|line| format!("{line}\n"))
+                .collect::<String>();
+            let text = format!(
+                "{body}checksum\t{}\n",
+                crate::checksum_bytes(body.as_bytes())
+            );
+            assert!(SearchIndex::in_memory().parse_snapshot_text(&text).is_err());
         }
     }
 

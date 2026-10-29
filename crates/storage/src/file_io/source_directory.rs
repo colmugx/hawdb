@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Captured native directory authority; caller owns publication exclusion and
 //! artifact registrations separately. No pathname is retained or consulted by
@@ -7,6 +7,7 @@
 
 use super::{File, FileBacking, NativeFile};
 use crate::file_descriptors::{DescriptorKind, DescriptorPermit, FileOpenContext};
+use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
 
@@ -14,6 +15,8 @@ mod control_candidate;
 pub use control_candidate::{CapturedControlCandidate, PendingControlPublication};
 mod directory_candidate;
 pub use directory_candidate::CapturedDirectoryCandidate;
+mod directory_component;
+pub use directory_component::CapturedDirectoryComponentCandidate;
 
 #[cfg(unix)]
 #[path = "source_directory/unix.rs"]
@@ -24,7 +27,29 @@ mod platform;
 #[cfg(not(any(unix, windows)))]
 mod platform {
     use super::*;
+    pub(super) fn create_directory_component(
+        _root: &std::fs::File,
+        _name: DirectoryComponent<'_>,
+    ) -> io::Result<()> {
+        Err(unsupported())
+    }
+    pub(super) fn open_directory_component(
+        _root: &std::fs::File,
+        _name: DirectoryComponent<'_>,
+    ) -> io::Result<std::fs::File> {
+        Err(unsupported())
+    }
     pub(super) fn create_directory(_root: &std::fs::File, _name: ChildName<'_>) -> io::Result<()> {
+        Err(unsupported())
+    }
+    pub(super) fn link_child_new(
+        _source: &std::fs::File,
+        _source_name: ChildName<'_>,
+        _expected: &std::fs::File,
+        _target: &std::fs::File,
+        _target_name: ChildName<'_>,
+        _context: &FileOpenContext,
+    ) -> io::Result<()> {
         Err(unsupported())
     }
     pub(super) fn create_control_candidate(
@@ -142,8 +167,9 @@ pub enum SourceDirectoryLockMode {
     ReadWriteCreate,
 }
 
-/// Internal source authority for generated ASCII artifact names, not arbitrary
-/// host paths. Native handles and their descriptor receipts stay together.
+/// Captured native directory authority. Artifact names retain portable ASCII
+/// validation; configured directory components use separate native validation.
+/// Native handles and their descriptor receipts stay together.
 ///
 /// Capture and every method require the caller's I/O admission. This type does
 /// not take publication ownership, register reader pins, exclude concurrent
@@ -421,9 +447,103 @@ impl SourceDirectory {
         let name = ChildName::new(name)?;
         let scope = native_scope(context)?;
         self.require_scope(&scope)?;
+        self.matches_child_file_scoped(context, name, file)
+    }
+
+    fn matches_child_file_scoped(
+        &self,
+        context: &FileOpenContext,
+        name: ChildName<'_>,
+        file: &File,
+    ) -> io::Result<bool> {
         self.root.with_native(|root| {
             file.with_native(|file| platform::matches_child_file(root, name, file, context))
         })
+    }
+
+    /// Reuse one immutable regular file in another captured directory without
+    /// copying its bytes or resolving either directory's diagnostic pathname.
+    /// Both directories must belong to the same project/recorder; `expected`
+    /// pins the original source file. The caller excludes source mutation and
+    /// target-name reuse and owns the target's cleanup/publication custody.
+    ///
+    /// Creation is exclusive. A later identity check or lost response can fail
+    /// after the link exists: retain original target custody rather than adopt
+    /// or retry the name. This does not synchronize the target directory or
+    /// grant integrity, source-watermark, publication or retirement authority.
+    pub fn link_child_new(
+        &self,
+        context: &FileOpenContext,
+        source_name: &str,
+        expected: &File,
+        target: &Self,
+        target_name: &str,
+    ) -> io::Result<()> {
+        self.require_context(context)?;
+        target.require_context(context)?;
+        let FileBacking::Native(native_expected) = &expected.backing else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "immutable link requires an already held native source",
+            ));
+        };
+        self.require_context(&native_expected.permit.context)?;
+        let source_name = ChildName::new(source_name)?;
+        let target_name = ChildName::new(target_name)?;
+        let scope = native_scope(context)?;
+        self.require_scope(&scope)?;
+        target.require_scope(&scope)?;
+        if !self.matches_child_file_scoped(context, source_name, expected)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "immutable link source binding changed",
+            ));
+        }
+        let native = || {
+            self.root
+                .with_native(|source| {
+                    target.root.with_native(|destination| {
+                        // The directory recorder owns model exclusion around
+                        // this native call. Re-entering the file trace would
+                        // recursively lock that same model. Native custody was
+                        // checked above; no cache lookup or fresh open occurs.
+                        platform::link_child_new(
+                            source,
+                            source_name,
+                            &native_expected.inner,
+                            destination,
+                            target_name,
+                            context,
+                        )
+                    })
+                })
+                .map_err(|error| context.map_open_error(error))
+        };
+        #[cfg(any(test, feature = "test-support"))]
+        match (self.trace.as_deref(), target.trace.as_deref()) {
+            (Some(source), Some(target)) => source.link_child_new(
+                Path::new(source_name.0),
+                target,
+                Path::new(target_name.0),
+                native,
+            )?,
+            (None, None) => native()?,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "immutable link has mismatched recorder custody",
+                ))
+            }
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        native()?;
+        if !target.matches_child_file_scoped(context, target_name, expected)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "immutable linked target binding changed",
+            ));
+        }
+        Ok(())
     }
 
     /// Existing current-generation WAL only: no create, truncate or publication.
@@ -577,24 +697,56 @@ impl SourceDirectory {
     pub fn open_directory(&self, context: &FileOpenContext, name: &str) -> io::Result<Self> {
         self.require_context(context)?;
         let name = ChildName::new(name)?;
+        self.open_directory_with(context, Path::new(name.0), |root| {
+            platform::open_directory(root, name)
+        })
+    }
+
+    fn open_directory_with(
+        &self,
+        context: &FileOpenContext,
+        name: &Path,
+        open_native: impl FnOnce(&std::fs::File) -> io::Result<std::fs::File>,
+    ) -> io::Result<Self> {
+        self.require_context(context)?;
         let _native = native_scope(context)?;
         self.require_scope(&_native)?;
         let permit = context.acquire(DescriptorKind::Transient)?;
         let open = || {
             self.root
-                .with_native(|root| platform::open_directory(root, name))
+                .with_native(open_native)
                 .map_err(|error| context.map_open_error(error))
         };
         #[cfg(any(test, feature = "test-support"))]
         let (inner, trace) = match self.trace.as_deref() {
             Some(trace) => {
-                let (inner, trace) = trace.open_directory(Path::new(name.0), open)?;
+                let (inner, trace) = trace.open_directory(name, open)?;
                 (inner, Some(Box::new(trace)))
             }
             None => (open()?, None),
         };
         #[cfg(not(any(test, feature = "test-support")))]
-        let inner = open()?;
+        let inner = {
+            let _ = name;
+            open()?
+        };
+        Self::finish_directory_capture(
+            context,
+            inner,
+            permit,
+            #[cfg(any(test, feature = "test-support"))]
+            trace,
+        )
+    }
+
+    fn finish_directory_capture(
+        context: &FileOpenContext,
+        inner: std::fs::File,
+        permit: DescriptorPermit,
+        #[cfg(any(test, feature = "test-support"))] trace: Option<
+            Box<crate::power_loss::NativeDirectoryTrace>,
+        >,
+    ) -> io::Result<Self> {
         if !inner.metadata()?.is_dir() {
             return Err(io::Error::new(
                 io::ErrorKind::NotADirectory,
@@ -816,6 +968,73 @@ fn counted(inner: std::fs::File, permit: DescriptorPermit) -> File {
             trace: None,
         }),
     }
+}
+
+/// Bounded native input storage, not a filesystem filename-equivalence rule.
+/// Apple permits existing canonical-equivalent spellings beyond NAME_MAX raw
+/// bytes/UTF16 units. Its kernel decides create/lookup eligibility separately.
+pub(crate) fn native_component_within_input_bound(name: &OsStr) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        name.encode_wide().take(256).count() <= 255
+    }
+    #[cfg(all(unix, target_vendor = "apple"))]
+    {
+        name.as_encoded_bytes().len() < libc::PATH_MAX as usize
+    }
+    #[cfg(not(any(windows, all(unix, target_vendor = "apple"))))]
+    {
+        name.as_encoded_bytes().len() <= 255
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DirectoryComponent<'a>(&'a OsStr);
+
+impl<'a> DirectoryComponent<'a> {
+    fn new(name: &'a OsStr) -> io::Result<Self> {
+        if !native_component_within_input_bound(name) {
+            return Err(invalid_directory_component());
+        }
+        let mut components = Path::new(name).components();
+        if !matches!(components.next(), Some(std::path::Component::Normal(value)) if value == name)
+            || components.next().is_some()
+        {
+            return Err(invalid_directory_component());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            if name.as_bytes().iter().any(|byte| matches!(byte, 0 | b'/')) {
+                return Err(invalid_directory_component());
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            if name
+                .encode_wide()
+                .any(|unit| matches!(unit, 0..=31 | 34 | 42 | 47 | 58 | 60 | 62 | 63 | 92 | 124))
+            {
+                return Err(invalid_directory_component());
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native directory components require Unix or Windows",
+        ));
+        #[cfg(any(unix, windows))]
+        Ok(Self(name))
+    }
+}
+
+fn invalid_directory_component() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "invalid native directory component",
+    )
 }
 
 #[derive(Clone, Copy)]

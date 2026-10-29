@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 //! Index queries share the Consumer's native custody, I/O and retention grants.
 
@@ -219,7 +219,17 @@ impl OpenedRoot {
             backend: if request.mode == hawdb_core::VectorIndexQueryMode::Exact {
                 "exact"
             } else {
-                "rabitq"
+                match scan.backend.as_str() {
+                    "hawdb_diskann_out_of_core_candidate_graph" => "diskann",
+                    "hawdb_rabitq_out_of_core_candidate_projection" => "rabitq",
+                    _ if scan.generated_candidate_count == 0 => request.descriptor.backend().name(),
+                    _ => {
+                        return Err(HawDBError::StorageIntegrity(
+                            "vector index used an unexpected candidate backend".into(),
+                        )
+                        .into())
+                    }
+                }
             },
             mode: request.mode,
             filter_position: request.mode.filter_position(),

@@ -1,5 +1,5 @@
 // Copyright 2026 Nowledge
-// Licensed under the Apache License, Version 2.0.
+// SPDX-License-Identifier: Apache-2.0
 
 use super::*;
 use std::num::NonZeroUsize;
@@ -55,6 +55,139 @@ fn assert_gap(store: &GraphStore, cursor: u64, floor: u64) {
         store.capture_projection_feed(cursor, limits()),
         Err(ProjectionFeedError::BehindFloor { .. })
     ));
+}
+
+fn deleted_nodes_after(store: &GraphStore, after: u64) -> (Vec<u64>, Vec<String>, u64) {
+    let mut feed = store.capture_projection_feed(after, limits()).unwrap();
+    let mut nodes = Vec::new();
+    let mut documents = Vec::new();
+    let mut end = None;
+    while !feed.is_complete() {
+        feed.visit_next(limits(), |item| {
+            match item {
+                ProjectionFeedItem::GraphNode { node_id, .. } => nodes.push(node_id),
+                ProjectionFeedItem::DeleteDocument { document_id, .. } => {
+                    documents.push(document_id.to_owned())
+                }
+                ProjectionFeedItem::End { source_epoch } => end = Some(source_epoch),
+                _ => panic!("unexpected deletion source event"),
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+    (nodes, documents, end.unwrap())
+}
+
+#[test]
+fn deleted_native_node_candidates_survive_wal_checkpoint_and_pinned_feed() {
+    for mode in [
+        StorageResidencyMode::Materialized,
+        StorageResidencyMode::OutOfCore,
+    ] {
+        for label in ["Memory", "EmbeddingDoc"] {
+            let path = super::tests::directory();
+            let (mut store, mut catalog) = reopen(&path, mode);
+            store.create_node_table(&mut catalog, label).unwrap();
+            let id = store
+                .create_node(
+                    &mut catalog,
+                    label,
+                    BTreeMap::from([("id".into(), Value::String("a".into()))]),
+                )
+                .unwrap();
+            store.checkpoint(&catalog).unwrap();
+            drop(store);
+            (store, catalog) = reopen(&path, mode);
+            let before = store.commit_epoch();
+            let mut old_feed = store.capture_projection_feed(before, limits()).unwrap();
+            assert_eq!(
+                store
+                    .delete_nodes(&mut catalog, label, None, false)
+                    .unwrap(),
+                [id]
+            );
+            let end = store.commit_epoch();
+            assert!(end > before);
+            assert!(store.node_owned(id).unwrap().is_none());
+            old_feed.visit_next(limits(), |item| {
+                assert!(matches!(item, ProjectionFeedItem::End { source_epoch } if source_epoch == before));
+                Ok(())
+            }).unwrap();
+            assert!(old_feed.is_complete());
+            drop(old_feed);
+            let expected_documents = if label == "Memory" {
+                vec!["memory:a".to_owned()]
+            } else {
+                vec![]
+            };
+            for checkpoint in [false, true] {
+                assert_eq!(
+                    deleted_nodes_after(&store, before),
+                    (vec![id.0], expected_documents.clone(), end)
+                );
+                if checkpoint {
+                    store.checkpoint(&catalog).unwrap();
+                }
+                drop(store);
+                (store, catalog) = reopen(&path, mode);
+                assert_eq!(
+                    deleted_nodes_after(&store, before),
+                    (vec![id.0], expected_documents.clone(), end)
+                );
+                assert!(store.node_owned(id).unwrap().is_none());
+            }
+            drop(store);
+            std::fs::remove_dir_all(path).unwrap();
+        }
+    }
+}
+
+#[test]
+fn rejected_delete_wal_never_advances_native_candidates_before_commit() {
+    for failure in [
+        WalAppendFailure::PartialWrite,
+        WalAppendFailure::Rollback,
+        WalAppendFailure::Sync,
+    ] {
+        let path = super::tests::directory();
+        let mode = StorageResidencyMode::OutOfCore;
+        let (mut store, mut catalog) = reopen(&path, mode);
+        store
+            .create_node_table(&mut catalog, "EmbeddingDoc")
+            .unwrap();
+        let id = store
+            .create_node(&mut catalog, "EmbeddingDoc", BTreeMap::new())
+            .unwrap();
+        let before = store.commit_epoch();
+        let previous = store.search_projection_changes_after(0);
+        set_wal_append_failpoint(failure);
+        assert!(store
+            .delete_nodes(&mut catalog, "EmbeddingDoc", None, false)
+            .is_err());
+        assert_eq!(store.commit_epoch(), before);
+        assert_eq!(store.search_projection_changes_after(0), previous);
+        drop(store);
+        let mut catalog = Catalog::default();
+        let recovered = match GraphStore::open(&path, &mut catalog) {
+            Ok(store) => store,
+            Err(error) => {
+                assert!(failure == WalAppendFailure::Rollback);
+                assert!(error
+                    .to_string()
+                    .contains("strict WAL recovery rejected torn tail"));
+                std::fs::remove_dir_all(path).unwrap();
+                continue;
+            }
+        };
+        if recovered.node_owned(id).unwrap().is_none() {
+            assert_eq!(deleted_nodes_after(&recovered, before).0, [id.0]);
+        } else {
+            assert_eq!(recovered.commit_epoch(), before);
+        }
+        drop(recovered);
+        std::fs::remove_dir_all(path).unwrap();
+    }
 }
 
 #[test]

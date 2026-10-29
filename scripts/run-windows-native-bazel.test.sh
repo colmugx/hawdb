@@ -20,6 +20,10 @@ trap 'rm -rf "$fixture"' EXIT
 mkdir -p "$fixture/testlogs"
 export FAKE_NATIVE_ROOT="$fixture"
 export BAZEL="$fixture/bazel"
+export FAKE_NATIVE_SELECTOR="$root/scripts/vector_recovery_cases.py"
+if command -v cygpath >/dev/null 2>&1; then
+  FAKE_NATIVE_SELECTOR="$(cygpath -m "$FAKE_NATIVE_SELECTOR")"
+fi
 cat >"$BAZEL" <<'MOCK'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -55,17 +59,42 @@ case "${FAKE_NATIVE_MODE:-}" in
   wrong-count) count=9 ;;
 esac
 printf 'test result: ok. %s passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;\n' "$count"
+if [[ "$name" == recovery-* ]]; then
+  python3 - "$FAKE_NATIVE_SELECTOR" "$name" <<'PY'
+import importlib.util
+import os
+import sys
+spec = importlib.util.spec_from_file_location("recovery_cases", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+for index, (origin, cut, durability, graph, updated) in enumerate(sorted(module.expected_combinations(sys.argv[2]))):
+    if index == 0 and os.environ.get("FAKE_NATIVE_MODE") == "missing-recovery":
+        continue
+    print(f"canonical-vector-recovery-power-v1 origin={origin} cut={cut} "
+          f"durability={durability} graph={graph} source_updated={updated} "
+          "plans=7 distinct_reopens=3")
+PY
+fi
 MOCK
 chmod +x "$BAZEL"
-for shard in transactions storage search consumers identities snapshots bindings abandonment; do
+for shard in transactions storage search consumers identities snapshots bindings abandonment \
+  consumers-recovery-births consumers-recovery-unselected consumers-recovery-selected \
+  consumers-recovery-lost-sql consumers-recovery-lost-nodes; do
   export WINDOWS_NATIVE_RESULTS="$fixture/$shard"
   bash "$root/scripts/run-windows-native-bazel.sh" "$shard" >"$fixture/$shard.log" 2>&1
 done
 # Repeated filtered invocations must retain their own XML before overwrite.
 grep -qx instance-identity-default-views "$fixture/snapshots/testlogs/instance-identity-default-views/test.xml"
 grep -qx instance-identity-minimal-views "$fixture/snapshots/testlogs/instance-identity-minimal-views/test.xml"
-# Original 25 Rust selections, Go, and the separate daily eight-group selection.
-[[ "$(wc -l <"$fixture/commands.txt" | tr -d ' ')" == 27 ]]
+# Preserve every original selection, five isolated vector recovery selections,
+# and both default WAL recovery families.
+[[ "$(wc -l <"$fixture/commands.txt" | tr -d ' ')" == 36 ]]
+grep -q -- '--test_arg=recovery_995' "$fixture/commands.txt"
+grep -q -- '--test_arg=api::tests::storage_recovery::wal_tail::' "$fixture/commands.txt"
+grep -q -- '--test_arg=resident_diskann::tests::' "$fixture/commands.txt"
+grep -q -- '--test_arg=vector_index_incremental --test_arg=vector_index_canonical_completion' "$fixture/commands.txt"
+grep -q -- '--test_arg=--skip --test_arg=api::tests::power_loss::consumer_vector_incremental::faults::recovery::' "$fixture/commands.txt"
+[[ "$(grep -c -- '--test_arg=api::tests::power_loss::consumer_vector_incremental::faults::recovery::vector_index_' "$fixture/commands.txt")" == 5 ]]
 grep -q -- '--//:windows_native_profile=facade_all' "$fixture/commands.txt"
 grep -q -- '--test_arg=--test-threads=4' "$fixture/commands.txt"
 grep -q -- '--test_arg=-test.count=1' "$fixture/commands.txt"
@@ -78,6 +107,10 @@ done
 export WINDOWS_NATIVE_RESULTS="$fixture/refuse-count"
 if FAKE_NATIVE_MODE=wrong-count bash "$root/scripts/run-windows-native-bazel.sh" snapshots >"$fixture/refuse-count.log" 2>&1; then
   echo 'native runner accepted wrong exact count' >&2; exit 1
+fi
+export WINDOWS_NATIVE_RESULTS="$fixture/refuse-recovery"
+if FAKE_NATIVE_MODE=missing-recovery bash "$root/scripts/run-windows-native-bazel.sh" consumers-recovery-selected >"$fixture/refuse-recovery.log" 2>&1; then
+  echo 'native runner accepted missing recovery combination' >&2; exit 1
 fi
 export WINDOWS_NATIVE_RESULTS="$fixture/refuse-threads"
 if POWER_LOSS_TEST_THREADS=3 bash "$root/scripts/run-windows-native-bazel.sh" abandonment >"$fixture/refuse-threads.log" 2>&1; then

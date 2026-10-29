@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Incremental RaBitQ sink for the shared generation scan.
+//! Selected candidate sink for the shared generation scan. The RaBitQ writer
+//! streams quantized records; DiskANN retains an admitted private graph source.
 
-use super::{RaBitQGenerationArtifact, SearchOutOfCoreGenerationWriter};
+use super::{SearchOutOfCoreGenerationWriter, VectorGenerationArtifact};
 use crate::build_control::checkpoint;
 use crate::error::Result;
 #[cfg(all(test, feature = "vector-search"))]
@@ -27,7 +28,8 @@ use super::rabitq_memory::Admission;
 use super::{artifact_name::Name, context_memory::OwnedPath, HawDBError};
 
 #[cfg(feature = "vector-search")]
-pub(super) struct RaBitQArtifactBuilder {
+pub(super) struct VectorArtifactBuilder {
+    diskann: Option<super::diskann::DiskAnnArtifactBuilder>,
     writer: Option<hawdb_vector_projection::ProjectionWriter>,
     file_name: Name,
     path: OwnedPath,
@@ -40,7 +42,7 @@ pub(super) struct RaBitQArtifactBuilder {
 }
 
 #[cfg(feature = "vector-search")]
-impl RaBitQArtifactBuilder {
+impl VectorArtifactBuilder {
     pub(super) fn new(input: &SearchOutOfCoreGenerationWriter, generation: u64) -> Result<Self> {
         checkpoint(&input.task_context)?;
         let file_name = Name::rabitq(generation, &input.memory, &input.task_context)?;
@@ -51,7 +53,25 @@ impl RaBitQArtifactBuilder {
             &input.task_context,
         )?;
         let mut admission = None;
-        let writer = if input.vector_document_count == 0 {
+        // Ordinary Search accepts zero cosine vectors and omits their scores.
+        // Keep their legacy encoding; schema-bound cosine validation remains strict.
+        let use_diskann = input.options.vector_index_descriptor.as_ref().map_or(
+            matches!(
+                input.options.vector_backend,
+                Some(hawdb_core::VectorIndexBackend::DiskAnn { .. })
+            ),
+            |definition| {
+                matches!(
+                    definition.backend(),
+                    hawdb_core::VectorIndexBackend::DiskAnn { .. }
+                )
+            },
+        ) && !(input.options.vector_index_descriptor.is_none()
+            && input.has_zero_vector);
+        let diskann = (use_diskann && input.vector_document_count != 0)
+            .then(|| super::diskann::DiskAnnArtifactBuilder::new(input, generation))
+            .transpose()?;
+        let writer = if input.vector_document_count == 0 || diskann.is_some() {
             None
         } else {
             let dimension = input.embedding_dimension.ok_or_else(|| {
@@ -96,6 +116,7 @@ impl RaBitQArtifactBuilder {
             Some(writer)
         };
         Ok(Self {
+            diskann,
             writer,
             file_name,
             path,
@@ -125,6 +146,9 @@ impl RaBitQArtifactBuilder {
 
     fn push_inner(&mut self, embedding: Option<&[f32]>) -> Result<()> {
         checkpoint(&self.task_context)?;
+        if let Some(diskann) = &mut self.diskann {
+            return diskann.push_embedding(embedding);
+        }
         let Some(embedding) = embedding else {
             return Ok(());
         };
@@ -159,12 +183,15 @@ impl RaBitQArtifactBuilder {
         Ok(())
     }
 
-    pub(super) fn finish(mut self) -> Result<Option<RaBitQGenerationArtifact>> {
+    pub(super) fn finish(mut self) -> Result<Option<VectorGenerationArtifact>> {
         checkpoint(&self.task_context)?;
         if self.failed {
             return Err(HawDBError::Storage(
                 "search RaBitQ writer already failed".to_owned(),
             ));
+        }
+        if let Some(diskann) = self.diskann.take() {
+            return diskann.finish();
         }
         if self.vector_ordinal != self.expected_documents as u64 {
             return Err(HawDBError::Storage(
@@ -197,7 +224,8 @@ impl RaBitQArtifactBuilder {
                 &memory.memory,
                 &self.task_context,
             )?;
-        Ok(Some(RaBitQGenerationArtifact {
+        Ok(Some(VectorGenerationArtifact {
+            diskann_source_digest: None,
             file_name: self.file_name,
             artifact_bytes,
             artifact_checksum,
@@ -265,10 +293,10 @@ pub(super) mod evidence {
 }
 
 #[cfg(not(feature = "vector-search"))]
-pub(super) struct RaBitQArtifactBuilder(RuntimeTaskContext);
+pub(super) struct VectorArtifactBuilder(RuntimeTaskContext);
 
 #[cfg(not(feature = "vector-search"))]
-impl RaBitQArtifactBuilder {
+impl VectorArtifactBuilder {
     pub(super) fn new(input: &SearchOutOfCoreGenerationWriter, _: u64) -> Result<Self> {
         checkpoint(&input.task_context)?;
         Ok(Self(input.task_context.clone()))
@@ -276,7 +304,7 @@ impl RaBitQArtifactBuilder {
     pub(super) fn push_embedding(&mut self, _: Option<&[f32]>) -> Result<()> {
         checkpoint(&self.0)
     }
-    pub(super) fn finish(self) -> Result<Option<RaBitQGenerationArtifact>> {
+    pub(super) fn finish(self) -> Result<Option<VectorGenerationArtifact>> {
         checkpoint(&self.0)?;
         Ok(None)
     }

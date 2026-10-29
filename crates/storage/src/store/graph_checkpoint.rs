@@ -216,6 +216,9 @@ fn exact_overflow_publication_error(
 ) -> HawDBError {
     let message = error.to_string();
     match error {
+        hawdb_storage::relational::RelationalOverflowPublicationError::UnsupportedFormat(error) => {
+            HawDBError::UnsupportedStorageFormat(error)
+        }
         hawdb_storage::relational::RelationalOverflowPublicationError::FileDescriptors(error) => {
             HawDBError::FileDescriptors(error)
         }
