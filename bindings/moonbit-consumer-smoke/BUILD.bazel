@@ -1,0 +1,11 @@
+package(default_visibility = ["//visibility:public"])
+
+filegroup(
+    name = "consumer_sources",
+    srcs = [
+        "moon.work",
+        "consumer/main.mbt",
+        "consumer/moon.mod",
+        "consumer/moon.pkg",
+    ],
+)
