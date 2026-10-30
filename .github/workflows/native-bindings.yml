@@ -76,7 +76,7 @@ on:
       - ".bazelversion"
       - ".github/workflows/native-bindings.yml"
   push:
-    branches: [main]
+    branches: [main, feat/moonbit-native-sdk]
     paths:
       - "src/**"
       - "crates/**"
