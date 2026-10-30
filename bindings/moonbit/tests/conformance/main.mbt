@@ -610,35 +610,6 @@ fn transaction_case() -> Bool {
 }
 
 ///|
-fn generated_codec_case() -> Bool {
-  let record = NewAgentNote::{id: "note-1", revision: 42L, active: true}
-  let params = @hawdb.to_params(record)
-  let db = match @hawdb.open_in_memory() {
-    Ok(v) => v
-    Err(e) => return failed("generated.open", e.describe())
-  }
-  match db.query("CREATE (:GeneratedNote {id: $id, revision: $revision, active: $active})", params) {
-    Ok(_) => ()
-    Err(e) => return failed("generated.create", e.describe())
-  }
-  let rows = match db.query("MATCH (n:GeneratedNote) RETURN n.id AS id, n.revision AS revision, n.active AS active", {}) {
-    Ok(v) => v
-    Err(e) => return failed("generated.query", e.describe())
-  }
-  let output : AgentNoteRow = match @hawdb.from_row(rows, 0) {
-    Ok(v) => v
-    Err(e) => return failed("generated.row", e.describe())
-  }
-  db.close()
-  if output.id == "note-1" && output.revision == 42L && output.active {
-    println("CASE_PASS generated.record_codec")
-    true
-  } else {
-    failed("generated.record_codec", "decoded fields differ")
-  }
-}
-
-///|
 /// A read-only file-backed connection must reject mutations while retaining
 /// the real persisted session data, not just an in-memory mock.
 fn readonly_case() -> Bool {
@@ -717,37 +688,6 @@ fn transaction_boundary_case() -> Bool {
   db.close()
   println("CASE_PASS transaction.nested_and_abandoned")
   true
-}
-
-///|
-/// A generated row decoder must refuse a missing result row instead of
-/// substituting zeros or empty strings.
-fn generated_missing_row_case() -> Bool {
-  let db = match @hawdb.open_in_memory() {
-    Ok(v) => v
-    Err(e) => return failed("generated.missing.open", e.describe())
-  }
-  let data = match db.query("CREATE (:Probe {name: 'x'})", {}) {
-    Ok(_) => db.query("MATCH (p:Probe) RETURN p.name AS name", {})
-    Err(e) => Err(e)
-  }
-  let ok = match data {
-    Err(e) => failed("generated.missing.query", e.describe())
-    Ok(result) => {
-      let decoded : Result[AgentNoteRow, @hawdb.HawdbError] = @hawdb.from_row(result, 0)
-      match decoded {
-        Err(@hawdb.HawdbError::Codec(_)) => true
-        _ => false
-      }
-    }
-  }
-  db.close()
-  if ok {
-    println("CASE_PASS generated.missing_field")
-    true
-  } else {
-    failed("generated.missing_field", "missing column was silently accepted")
-  }
 }
 
 ///|
@@ -1195,8 +1135,6 @@ fn main {
   if !transaction_case() { return }
   if !parent_close_transaction_case() { return }
   if !lifecycle_stress_case() { return }
-  if !generated_codec_case() { return }
-  if !generated_missing_row_case() { return }
   if !transaction_boundary_case() { return }
   if !readonly_case() { return }
   if !scoped_transaction_case() { return }

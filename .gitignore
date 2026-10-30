@@ -19,5 +19,3 @@ MODULE.bazel.lock
 /docs/benchmarks/architecture_2026_10_24/final/publication-*.json
 /docs/benchmarks/architecture_2026_10_24/final/measurement-source.json
 
-# SDK uses rolling HawDB path dependency; generated only within each build.
-/bindings/moonbit/native/Cargo.lock

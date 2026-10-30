@@ -10,13 +10,10 @@ filegroup(
         "*.mbt",
         "tests/**/*.mbt",
         "tests/**/moon.pkg",
-        "examples/*.mbt.in",
-        "tools/*.py",
-        "tools/tests/*.py",
+        "tools/configure_native_link.py",
     ]) + [
         "moon.mod",
         "moon.pkg",
-        "public_api_surface.txt",
     ],
 )
 

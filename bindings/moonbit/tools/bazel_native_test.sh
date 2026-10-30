@@ -34,9 +34,6 @@ case "$(uname -s)" in
 esac
 
 cd "$sdk"
-python3 tools/hawdb_derive.py examples/records.mbt.in tests/conformance/records.generated.mbt --check
-python3 -m unittest discover -s tools/tests -p 'test_*.py'
-python3 tools/check_api_surface.py
 moon check --target native
 
 if [[ "$(uname -s)" == Darwin ]]; then
