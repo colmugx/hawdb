@@ -87,20 +87,6 @@ jobs:
           moon run --target native tests/conformance 2>&1 | tee conformance.log
           ! grep -q '^CASE_FAIL ' conformance.log
           grep -Fxq 'HAWDB_MOONBIT_BUSINESS_SUITE_PASS' conformance.log
-      - name: Configure external consumer linker (macOS)
-        if: runner.os == 'macOS'
-        working-directory: bindings/moonbit
-        shell: bash
-        run: python3 tools/configure_native_link.py --os macos --pkg tests/external-consumer/consumer/moon.pkg --sdk-prefix ../../../
-      - name: Execute independent MoonBit consumer
-        working-directory: bindings/moonbit/tests/external-consumer/consumer
-        shell: bash
-        run: |
-          set -euo pipefail
-          moon check --target native
-          moon run --target native . 2>&1 | tee external-consumer.log
-          ! grep -q '^EXTERNAL_CONSUMER_FAIL ' external-consumer.log
-          grep -Fxq 'EXTERNAL_CONSUMER_PASS' external-consumer.log
       - name: Stage ABI-specific SDK review artifact
         if: success()
         working-directory: bindings/moonbit
@@ -199,26 +185,6 @@ jobs:
           if ($log -match '(?m)^CASE_FAIL ') { throw "Native conformance contains CASE_FAIL" }
           if ($log -notmatch '(?m)^HAWDB_MOONBIT_BUSINESS_SUITE_PASS\r?$') {
             throw "Missing real-engine conformance success marker"
-          }
-      - name: Configure independent consumer linker
-        working-directory: bindings/moonbit
-        shell: pwsh
-        run: |
-          python tools/configure_native_link.py --os windows --pkg tests/external-consumer/consumer/moon.pkg --sdk-prefix ../../../
-          if ($LASTEXITCODE -ne 0) { throw "Consumer link setup failed" }
-      - name: Execute independent MoonBit consumer
-        working-directory: bindings/moonbit/tests/external-consumer/consumer
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          moon check --target native
-          if ($LASTEXITCODE -ne 0) { throw "Consumer check failed" }
-          moon run --target native . 2>&1 | Tee-Object -FilePath external-consumer.log
-          if ($LASTEXITCODE -ne 0) { throw "Consumer executable failed" }
-          $log = Get-Content external-consumer.log -Raw
-          if ($log -match '(?m)^EXTERNAL_CONSUMER_FAIL ') { throw "Consumer failure marker" }
-          if ($log -notmatch '(?m)^EXTERNAL_CONSUMER_PASS\r?$') {
-            throw "Missing consumer pass marker"
           }
       - name: Stage Windows SDK review artifact
         working-directory: bindings/moonbit

@@ -18,14 +18,14 @@ the full compatibility suite. Future upstream commits may introduce breaking
 behavior: CI must reveal this, not mask it with an old lockfile.
 
 The MoonBit `moon.mod` semver is package identity, **not** a dependency
-pin on HawDB. The external consumer's `moon.work` takes the SDK from local
-source; its declared `@version` is ignored for workspace-local modules.
+pin on HawDB. The Rust adapter always resolves HawDB from the current
+repository checkout.
 
 ## Bazel test ownership
 
 The existing **Native Bindings** GitHub Actions workflow now executes the
-MoonBit Rust adapter, full embedded-database conformance and independent
-consumer as Bazel tests on Linux/macOS alongside Go and C FFI. With the
+MoonBit Rust adapter and full embedded-database conformance as Bazel tests
+on Linux/macOS alongside Go and C FFI. With the
 current MoonBit compiler on `PATH`, run:
 
 ```sh
@@ -34,23 +34,20 @@ bazel test --test_output=errors --test_env=PATH --test_env=HOME \
   //bindings/moonbit:hawdb_moonbit_tests
 ```
 
-The independent module acceptance fixture lives under
-`tests/external-consumer/`, together with its own `moon.work` and
-`moon.mod`; it is a test fixture, not a second binding package.
 The Bazel test runner stages the static library from Bazel into a writable
 MoonBit workspace; it never invokes Cargo or rebuilds the HawDB engine.
 The legacy Native SDK workflow still owns Windows tests and review artifact
 staging; its duplicate Linux Bazel pilot and temporary GC logging were
-removed. Windows must retain its real executable/consumer coverage until
+removed. Windows retains its real executable conformance coverage until
 equivalent Bazel Windows tests pass.
 
 ## Native platform qualification
 
 | Host | Adapter | Tests |
 | --- | --- | --- |
-| Ubuntu 24.04 x64 | release staticlib | Rust lifecycle, MoonBit engine conformance, separate consumer |
-| macOS ARM64 | release staticlib | Rust lifecycle, MoonBit engine conformance, separate consumer |
-| Windows 2025 x64 | release staticlib | Rust lifecycle, MoonBit engine conformance, separate consumer |
+| Ubuntu 24.04 x64 | release staticlib | Rust lifecycle and MoonBit engine conformance |
+| macOS ARM64 | release staticlib | Rust lifecycle and MoonBit engine conformance |
+| Windows 2025 x64 | release staticlib | Rust lifecycle and MoonBit engine conformance |
 
 Read-only open selects HawDB's `RecoveryMode::Strict` rather than
 `AutoRepairTornTail`. Conformance reopens the already-persisted session

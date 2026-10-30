@@ -130,7 +130,6 @@ bindings/moonbit/
   value.mbt                  MoonBit ADT, typed codec, query/row API
   native/                    Independent Rust staticlib, direct engine dependency
   tests/conformance/         Executable cross-language behavior contracts
-  tests/external-consumer/   Independent module import/link test fixture
 ```
 
 See `bindings/python/tests/` and `bindings/go/hawdb_test.go` for

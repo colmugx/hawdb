@@ -79,15 +79,13 @@ See `tests/conformance/main.mbt` (real engine) and
 `.github/workflows/moonbit-native.yml` (Linux, macOS, Windows).
 No test may be deleted to make a build green.
 
-## API drift guard and independent consumer
+## API drift guard
 
 The committed `public_api_surface.txt` is the reviewed export list; the
 `tools/check_api_surface.py` guard prevents accidental changes to public
-declaration names/kinds. The separate module in
-`bindings/moonbit-consumer-smoke/` is built and executed on all three native
-CI hosts against an unpublished local workspace dependency. Its success marker
-is `EXTERNAL_CONSUMER_PASS`. This verifies local-source consumption, not a
-registry install, prebuilt binary distribution or cross-thread safety.
+declaration names/kinds. Engine-backed conformance is run on all three
+native CI hosts. This does not certify a registry install, prebuilt binary
+distribution or cross-thread safety.
 
 ## Native lifecycle hardening candidate
 
@@ -108,4 +106,4 @@ CI uses rolling Rust stable/MoonBit installers and no Cargo --locked flag.
 The generated dependency graph and toolchain versions are retained **only**
 as provenance for a particular review archive. SDK module package identity
 is not a pin on HawDB. Breaking upstream changes are surfaced by full native
-and external-consumer CI rather than blocked by stale dependency locks.
+CI rather than blocked by stale dependency locks.

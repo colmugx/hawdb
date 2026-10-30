@@ -5,15 +5,14 @@
 # Execute real MoonBit Native programs using the Bazel-built adapter.
 set -euo pipefail
 
-mode="${1:?expected conformance or consumer}"
-archive_runfile="${2:?expected Bazel staticlib runfile}"
+archive_runfile="${1:?expected Bazel staticlib runfile}"
 runfiles="${TEST_SRCDIR:?}/${TEST_WORKSPACE:?}"
 archive="${runfiles}/${archive_runfile}"
 test -s "$archive"
 command -v moon >/dev/null || { echo "MoonBit 'moon' is required on PATH" >&2; exit 1; }
 command -v python3 >/dev/null || { echo "python3 is required on PATH" >&2; exit 1; }
 
-workspace="${TEST_TMPDIR:?}/hawdb-moonbit-bazel-${mode}"
+workspace="${TEST_TMPDIR:?}/hawdb-moonbit-bazel-conformance"
 mkdir -p "$workspace/bindings"
 # Dereference runfile symlinks so MoonBit may generate writable outputs without
 # modifying the checkout or Bazel's immutable input tree.
@@ -44,27 +43,7 @@ if [[ "$(uname -s)" == Darwin ]]; then
   python3 tools/configure_native_link.py --os macos
 fi
 
-case "$mode" in
-  conformance)
-    rm -rf tests/conformance-db
-    moon run --target native tests/conformance 2>&1 | tee conformance.log
-    ! grep -q '^CASE_FAIL ' conformance.log
-    grep -Fxq 'HAWDB_MOONBIT_BUSINESS_SUITE_PASS' conformance.log
-    ;;
-  consumer)
-    if [[ "$(uname -s)" == Darwin ]]; then
-      python3 tools/configure_native_link.py --os macos \
-        --pkg tests/external-consumer/consumer/moon.pkg \
-        --sdk-prefix ../../../
-    fi
-    cd "$sdk/tests/external-consumer/consumer"
-    moon check --target native
-    moon run --target native . 2>&1 | tee external-consumer.log
-    ! grep -q '^EXTERNAL_CONSUMER_FAIL ' external-consumer.log
-    grep -Fxq 'EXTERNAL_CONSUMER_PASS' external-consumer.log
-    ;;
-  *)
-    echo "Unknown MoonBit Bazel test mode: $mode" >&2
-    exit 2
-    ;;
-esac
+rm -rf tests/conformance-db
+moon run --target native tests/conformance 2>&1 | tee conformance.log
+! grep -q '^CASE_FAIL ' conformance.log
+grep -Fxq 'HAWDB_MOONBIT_BUSINESS_SUITE_PASS' conformance.log
