@@ -2,7 +2,7 @@ name: MoonBit Native SDK
 
 on:
   push:
-    branches: [feat/moonbit-native-sdk]
+    branches: [main]
     paths:
       - "bindings/moonbit/**"
       - "Cargo.toml"
