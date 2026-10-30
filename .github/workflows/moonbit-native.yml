@@ -30,38 +30,6 @@ permissions:
   contents: read
 
 jobs:
-  # Migration gate: prove a single Bazel engine compile feeds the MoonBit
-  # Rust adapter and real external Native consumers before replacing Cargo CI.
-  bazel-integration:
-    name: Bazel MoonBit integration (ubuntu-24.04)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    env:
-      USE_BAZEL_VERSION: "9.3.1"
-    steps:
-      - uses: actions/checkout@v7
-      - uses: bazel-contrib/setup-bazel@0.19.1
-        with:
-          bazelisk-cache: true
-          disk-cache: ${{ github.workflow }}-${{ github.job }}
-          repository-cache: true
-          external-cache: true
-      - name: Install MoonBit Native toolchain
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash
-          echo "$HOME/.moon/bin" >> "$GITHUB_PATH"
-      - name: Run Bazel Rust and MoonBit real-engine tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          moon version --all
-          bazel test --test_output=errors --test_env=PATH --test_env=HOME \
-            //bindings/moonbit/native:hawdb_moonbit_rust_tests \
-            //bindings/moonbit:hawdb_moonbit_conformance_test \
-            //bindings/moonbit:hawdb_moonbit_consumer_test
-
   native-conformance:
     name: Full native conformance (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -118,7 +86,7 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf tests/conformance-db
-          HAWDB_MOONBIT_TRACE=1 moon run --target native tests/conformance 2>&1 | tee conformance.log
+          moon run --target native tests/conformance 2>&1 | tee conformance.log
           ! grep -q '^CASE_FAIL ' conformance.log
           grep -Fxq 'HAWDB_MOONBIT_BUSINESS_SUITE_PASS' conformance.log
       - name: Configure external consumer linker (macOS)
@@ -189,7 +157,6 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           moon version --all
-          $version = moon version --all
           rustc --version
           cargo --version
           python --version
@@ -228,7 +195,6 @@ jobs:
           if (Test-Path tests/conformance-db) {
             Remove-Item -Recurse -Force tests/conformance-db
           }
-          $env:HAWDB_MOONBIT_TRACE = "1"
           moon run --target native tests/conformance 2>&1 | Tee-Object -FilePath conformance.log
           if ($LASTEXITCODE -ne 0) { throw "MoonBit/HawDB native executable failed" }
           $log = Get-Content -Path conformance.log -Raw

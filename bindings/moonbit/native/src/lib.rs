@@ -144,9 +144,7 @@ fn close_db(handle: *mut Handle) {
 extern "C" fn finalize(payload: *mut c_void) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let handle = payload.cast::<Handle>();
-        gc_trace("finalize.before_close");
         close_db(handle);
-        gc_trace("finalize.before_drop");
         // External payload memory belongs to MoonBit; Rust must drop fields.
         unsafe {
             let state = (*handle).state;
@@ -155,18 +153,10 @@ extern "C" fn finalize(payload: *mut c_void) {
                 drop(Box::from_raw(state));
             }
         }
-        gc_trace("finalize.done");
     }));
 }
 
-fn gc_trace(stage: &str) {
-    if std::env::var_os("HAWDB_MOONBIT_TRACE").is_some() {
-        eprintln!("HAWDB_NATIVE_TRACE {stage}");
-    }
-}
-
 fn allocate_handle() -> *mut Handle {
-    gc_trace("allocate_handle.entry");
     let ptr = unsafe {
         moonbit_make_external_object(Some(finalize), std::mem::size_of::<Handle>() as u32)
     }
@@ -184,7 +174,6 @@ fn allocate_handle() -> *mut Handle {
             );
         };
     }
-    gc_trace("allocate_handle.exit");
     ptr
 }
 
@@ -405,7 +394,6 @@ pub extern "C" fn moonbit_hawdb_open(path: *const u8, len: i32, read_only: i32) 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn moonbit_hawdb_open_in_memory() -> *mut Handle {
-    gc_trace("open_in_memory.entry");
     let handle = allocate_handle();
     if handle.is_null() {
         return handle;
@@ -422,13 +410,11 @@ pub extern "C" fn moonbit_hawdb_open_in_memory() -> *mut Handle {
             error_json(fail("panic", "panic during open_in_memory")),
         ),
     }
-    gc_trace("open_in_memory.exit");
     handle
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn moonbit_hawdb_is_open(handle: *mut Handle) -> i32 {
-    gc_trace("is_open.entry");
     i32::from(clone_database(handle).is_some_and(|db| !db.closed.load(Ordering::Acquire)))
 }
 
@@ -446,9 +432,7 @@ pub extern "C" fn moonbit_hawdb_execute(
     params_len: i32,
     sql: i32,
 ) -> *mut u8 {
-    gc_trace("execute.entry");
     let Some(db) = clone_database(handle) else {
-        gc_trace("execute.closed");
         return to_moonbit_bytes(&[]);
     };
     clear_error(handle);
@@ -477,7 +461,6 @@ pub extern "C" fn moonbit_hawdb_execute(
             Ok::<_, Failure>(encode_result(&answer))
         }
     }));
-    gc_trace("execute.finished");
     match result {
         Ok(Ok(text)) => to_moonbit_bytes(text.as_bytes()),
         Ok(Err(e)) => {

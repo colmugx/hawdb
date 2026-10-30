@@ -21,6 +21,26 @@ The MoonBit `moon.mod` semver is package identity, **not** a dependency
 pin on HawDB. The external consumer's `moon.work` takes the SDK from local
 source; its declared `@version` is ignored for workspace-local modules.
 
+## Bazel test ownership
+
+The existing **Native Bindings** GitHub Actions workflow now executes the
+MoonBit Rust adapter, full embedded-database conformance and independent
+consumer as Bazel tests on Linux/macOS alongside Go and C FFI. With the
+current MoonBit compiler on `PATH`, run:
+
+```sh
+bazel build //bindings/moonbit/native:hawdb_moonbit_static
+bazel test --test_output=errors --test_env=PATH --test_env=HOME \
+  //bindings/moonbit:hawdb_moonbit_tests
+```
+
+The Bazel test runner stages the static library from Bazel into a writable
+MoonBit workspace; it never invokes Cargo or rebuilds the HawDB engine.
+The legacy Native SDK workflow still owns Windows tests and review artifact
+staging; its duplicate Linux Bazel pilot and temporary GC logging were
+removed. Windows must retain its real executable/consumer coverage until
+equivalent Bazel Windows tests pass.
+
 ## Native platform qualification
 
 | Host | Adapter | Tests |
