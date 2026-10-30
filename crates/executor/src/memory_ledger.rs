@@ -658,6 +658,19 @@ impl QueryMemoryLease {
         })
     }
 
+    /// Takes over another lease's charge on the same account. The ledger
+    /// charge is unchanged; a lease from another account is returned intact.
+    pub(crate) fn absorb(&mut self, mut other: Self) -> std::result::Result<(), Self> {
+        if self.account.account_id != other.account.account_id
+            || !Arc::ptr_eq(&self.account.ledger.inner, &other.account.ledger.inner)
+        {
+            return Err(other);
+        }
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        other.bytes = 0;
+        Ok(())
+    }
+
     pub fn grow(&mut self, bytes: usize) -> Result<()> {
         self.account
             .ledger

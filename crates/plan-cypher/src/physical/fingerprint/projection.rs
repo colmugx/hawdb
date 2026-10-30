@@ -377,6 +377,62 @@ pub fn write_projection_expression(output: &mut String, expression: &ProjectionE
             write_identifier(output, property);
             output.push(')');
         }
+        ProjectionExpression::ListFunction {
+            function,
+            arguments,
+        } => {
+            output.push_str("list_function(");
+            output.push_str(function.function_name());
+            for argument in arguments {
+                output.push(',');
+                write_projection_expression(output, argument);
+            }
+            output.push(')');
+        }
+        ProjectionExpression::ListComprehension(comprehension) => {
+            output.push_str("list_comprehension(");
+            write_identifier(output, &comprehension.variable);
+            output.push(',');
+            write_projection_expression(output, &comprehension.list);
+            output.push_str(",where=");
+            if let Some(predicate) = &comprehension.predicate {
+                write_projection_expression(output, predicate);
+            }
+            output.push_str(",map=");
+            if let Some(projection) = &comprehension.projection {
+                write_projection_expression(output, projection);
+            }
+            output.push(')');
+        }
+        ProjectionExpression::LocalVariable { name, property } => {
+            output.push_str("local(");
+            write_identifier(output, name);
+            if let Some(property) = property {
+                output.push('.');
+                write_identifier(output, property);
+            }
+            output.push(')');
+        }
+        ProjectionExpression::ListIndex { list, index } => {
+            output.push_str("list_index(");
+            write_projection_expression(output, list);
+            output.push(',');
+            write_projection_expression(output, index);
+            output.push(')');
+        }
+        ProjectionExpression::ListSlice { list, start, end } => {
+            output.push_str("list_slice(");
+            write_projection_expression(output, list);
+            output.push_str(",start=");
+            if let Some(start) = start {
+                write_projection_expression(output, start);
+            }
+            output.push_str(",end=");
+            if let Some(end) = end {
+                write_projection_expression(output, end);
+            }
+            output.push(')');
+        }
     }
 }
 
@@ -395,6 +451,7 @@ fn write_aggregation(output: &mut String, item: &Aggregation) {
     output.push_str("Aggregation(");
     match item.function {
         AggregateFunction::Count => output.push_str("count"),
+        AggregateFunction::Sum => output.push_str("sum"),
         AggregateFunction::Min => output.push_str("min"),
         AggregateFunction::Max => output.push_str("max"),
         AggregateFunction::Avg => output.push_str("avg"),
@@ -430,6 +487,10 @@ fn write_aggregation(output: &mut String, item: &Aggregation) {
             write_identifier(output, variable);
             output.push('.');
             write_identifier(output, property);
+        }
+        AggregateTarget::Expression(expression) => {
+            output.push_str("expression:");
+            write_projection_expression(output, expression);
         }
     }
     output.push_str(") as ");

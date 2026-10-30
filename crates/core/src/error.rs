@@ -17,6 +17,8 @@ use std::fmt::{Display, Formatter};
 
 mod resource;
 pub use resource::{ResourceBudgetError, ResourceBudgetKind, ResourceBudgetScope};
+mod transaction;
+pub use transaction::{TransactionRetryError, TransactionRetryReason};
 mod storage_format;
 pub use storage_format::StorageFormatError;
 
@@ -124,6 +126,8 @@ pub enum HawDBError {
         committed_epoch: u64,
         key: String,
     },
+    /// A pessimistic conflict requires retrying the complete transaction.
+    TransactionRetryRequired(Box<TransactionRetryError>),
     /// Requested read validation cannot be proved; never downgrade isolation.
     TransactionReadDependencyRefused {
         reason: String,
@@ -190,6 +194,7 @@ impl Display for HawDBError {
                 f,
                 "transaction conflict on {key}: transaction read epoch {read_epoch}, conflicting commit epoch {committed_epoch}"
             ),
+            HawDBError::TransactionRetryRequired(error) => Display::fmt(error, f),
             HawDBError::AppendSequenceExhausted {
                 table,
                 watermark,
@@ -231,6 +236,7 @@ impl std::error::Error for HawDBError {
             Self::FileDescriptors(error) => Some(error),
             Self::ResourceBudgetExceeded(error) => Some(error.as_ref()),
             Self::ReadBudgetExceeded(error) => Some(error),
+            Self::TransactionRetryRequired(error) => Some(error.as_ref()),
             Self::UnsupportedStorageFormat(error) => Some(error),
             Self::BranchReclamationBlocked { cause, .. } => Some(cause.as_ref()),
             _ => None,
@@ -280,8 +286,13 @@ impl HawDBError {
         }
     }
 
+    /// Retry the complete transaction, never only the failed statement.
+    /// Lock timeouts and generic execution/storage failures are not classified here.
     pub const fn is_retryable_transaction_conflict(&self) -> bool {
-        matches!(self, Self::TransactionConflict { .. })
+        matches!(
+            self,
+            Self::TransactionConflict { .. } | Self::TransactionRetryRequired(_)
+        )
     }
 }
 

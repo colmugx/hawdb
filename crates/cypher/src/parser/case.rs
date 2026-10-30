@@ -69,7 +69,7 @@ impl Parser<'_> {
         self.parse_scalar_expression()
     }
 
-    fn parse_case_or(&mut self) -> Result<ScalarExpression> {
+    pub(super) fn parse_case_or(&mut self) -> Result<ScalarExpression> {
         self.skip_ws();
         let start = self.pos;
         let mut expression = self.parse_case_and()?;
@@ -162,6 +162,8 @@ impl Parser<'_> {
             ScalarBinaryOp::Gt
         } else if self.consume_keyword("CONTAINS") {
             ScalarBinaryOp::Contains
+        } else if self.consume_keyword("IN") {
+            ScalarBinaryOp::In
         } else {
             return Ok(left);
         };

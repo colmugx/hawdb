@@ -793,7 +793,9 @@ comparison predicates. Nowledge-used case-insensitive grep predicates such as
 `LOWER(COALESCE(m.content, '')) CONTAINS LOWER($needle)` and
 `LOWER(e.name) = LOWER($mention)` are supported through the same limited scalar
 expression evaluator; broader predicate function composition remains separate
-follow-up work.
+follow-up work. openCypher list functions (`size`, `head`, `last`, `tail`,
+`reverse`, `range`), list comprehensions, list indexing/slicing and generic
+`IN` are described in [Cypher list functions](CYPHER_LIST_FUNCTIONS.md).
 Parenthesized predicate groups preserve explicit `AND`/`OR` precedence. String
 literals support escaped quotes, backslashes, and common control escapes. Graph algorithm procedure options such
 as `dampingFactor`, `maxIterations`, and `maxLevels` accept bound parameters and
@@ -805,7 +807,20 @@ alias-based ordering, `ORDER BY COUNT(variable)` over the projected aggregate
 column, and pagination. Nowledge-used `MIN(variable.property)` is
 implemented for schema verification reads such as `min(r.weight)`, and
 Nowledge-used `AVG(variable.property)` is implemented for health aggregate reads
-such as `avg(m.decay_score_cached)`. One-hop
+such as `avg(m.decay_score_cached)`. openCypher `SUM` is implemented: it ignores
+NULL, returns an integer for all-integer input (failing on `i64` overflow), a
+float once any float is summed, `0` for empty or all-NULL input, and fails on
+non-numeric input. `AVG` keeps its earlier lenient behavior, which Nowledge
+health reads rely on: it skips non-numeric values and does not reject a
+non-finite running total, so over the same rows `avg(x)` can return a value
+(or infinity) where `sum(x)` fails. `COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, and `COLLECT` accept
+any aggregate-free projection expression as their argument, each with optional
+`DISTINCT` over the argument value, for example
+`sum(CASE WHEN n.x > 1 THEN 1 ELSE 0 END)`, `count(DISTINCT n.x % 2)`,
+`avg(n.x * 2)`, `max(-n.x)`, or `sum(x * 2)` over a `WITH` column. The fixed
+`variable[.property]` shapes keep their previous logical plans; other arguments
+are evaluated per input row by the aggregate operator. Aggregates nested inside
+an aggregate argument are rejected. One-hop
 relationship variables can be returned, filtered, sorted, and counted through relationship properties, for example
 `RETURN r.weight`, `WHERE r.weight > 1`, `ORDER BY r.weight`, `COUNT(r)`, and
 `COUNT(r.weight)`. Stable logical identities can be projected, filtered, and

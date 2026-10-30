@@ -7,7 +7,10 @@
 use super::*;
 use crate::binding::map_memory_bytes;
 use crate::{QueryMemoryAccount, QueryMemoryLease};
+use hawdb_core::{MAX_LIST_EXPRESSION_WORK, MAX_UNACCOUNTED_LIST_BYTES};
 use std::borrow::Cow;
+
+mod list;
 
 pub(crate) struct ProjectedValue<'a> {
     value: Cow<'a, Value>,
@@ -138,7 +141,89 @@ pub(crate) fn evaluate_projection_borrowed<'a>(
     binding: &'a Binding,
     account: Option<&QueryMemoryAccount>,
 ) -> Result<ProjectedValue<'a>> {
-    let evaluate = |expression| evaluate_projection_borrowed(expression, catalog, binding, account);
+    evaluate_scoped(
+        expression,
+        catalog,
+        binding,
+        None,
+        account,
+        &ListWork::default(),
+    )
+}
+
+/// Work and unaccounted memory spent by list expressions in one evaluation,
+/// bounded by [`MAX_LIST_EXPRESSION_WORK`] and [`MAX_UNACCOUNTED_LIST_BYTES`].
+#[derive(Default)]
+pub(super) struct ListWork {
+    units: std::cell::Cell<usize>,
+    unaccounted_bytes: std::cell::Cell<usize>,
+}
+
+impl ListWork {
+    pub(super) fn charge(&self, units: usize) -> Result<()> {
+        let total = self
+            .units
+            .get()
+            .checked_add(units)
+            .filter(|total| *total <= MAX_LIST_EXPRESSION_WORK)
+            .ok_or_else(|| {
+                HawDBError::Execution(format!(
+                    "list expressions exceed the work limit of {MAX_LIST_EXPRESSION_WORK} units"
+                ))
+            })?;
+        self.units.set(total);
+        Ok(())
+    }
+
+    /// Charges bytes materialized without a query memory account. The total
+    /// is cumulative for the evaluation, so it bounds peak usage as well.
+    pub(super) fn charge_unaccounted(&self, bytes: usize) -> Result<()> {
+        let total = self
+            .unaccounted_bytes
+            .get()
+            .checked_add(bytes)
+            .filter(|total| *total <= MAX_UNACCOUNTED_LIST_BYTES)
+            .ok_or_else(|| {
+                HawDBError::Execution(format!(
+                    "list expressions exceed {MAX_UNACCOUNTED_LIST_BYTES} bytes without a query memory account"
+                ))
+            })?;
+        self.unaccounted_bytes.set(total);
+        Ok(())
+    }
+}
+
+/// Elements bound by enclosing list comprehensions, innermost first.
+#[derive(Clone, Copy)]
+struct ListLocals<'a> {
+    name: &'a str,
+    value: &'a Value,
+    parent: Option<&'a ListLocals<'a>>,
+}
+
+impl<'a> ListLocals<'a> {
+    fn get(&self, name: &str) -> Option<&'a Value> {
+        let mut current = Some(self);
+        while let Some(frame) = current {
+            if frame.name == name {
+                return Some(frame.value);
+            }
+            current = frame.parent;
+        }
+        None
+    }
+}
+
+fn evaluate_scoped<'a>(
+    expression: &'a ProjectionExpression,
+    catalog: &'a Catalog,
+    binding: &'a Binding,
+    locals: Option<&'a ListLocals<'a>>,
+    account: Option<&QueryMemoryAccount>,
+    work: &ListWork,
+) -> Result<ProjectedValue<'a>> {
+    let evaluate =
+        |expression| evaluate_scoped(expression, catalog, binding, locals, account, work);
     match expression {
         ProjectionExpression::Case {
             operand,
@@ -169,7 +254,98 @@ pub(crate) fn evaluate_projection_borrowed<'a>(
                 .map(|value| value.unwrap_or_else(|| ProjectedValue::scalar(Value::Null)))
         }
         ProjectionExpression::Binary { left, op, right } => {
-            binary(left, *op, right, catalog, binding, account)
+            binary(left, *op, right, evaluate, account, work)
+        }
+        ProjectionExpression::ListFunction {
+            function,
+            arguments,
+        } => list::function(*function, arguments, evaluate, account, work),
+        ProjectionExpression::ListComprehension(comprehension) => {
+            let list = evaluate(&comprehension.list)?;
+            let values = match list.as_ref() {
+                Value::Null => return Ok(ProjectedValue::scalar(Value::Null)),
+                Value::List(values) => values,
+                value => {
+                    return Err(HawDBError::Execution(format!(
+                        "list comprehension requires a list, got {:?}",
+                        description(value, account)
+                    )))
+                }
+            };
+            let mut output = list::ListBuilder::new(account, work, values.len())?;
+            for value in values {
+                work.charge(1)?;
+                let frame = ListLocals {
+                    name: &comprehension.variable,
+                    value,
+                    parent: locals,
+                };
+                if let Some(predicate) = &comprehension.predicate {
+                    let truth =
+                        evaluate_scoped(predicate, catalog, binding, Some(&frame), account, work)?;
+                    let keep = match truth.as_ref() {
+                        Value::Bool(value) => *value,
+                        Value::Null => false,
+                        value => {
+                            return Err(HawDBError::Execution(format!(
+                                "list comprehension WHERE requires a boolean value, got {:?}",
+                                description(value, account)
+                            )))
+                        }
+                    };
+                    if !keep {
+                        continue;
+                    }
+                }
+                match &comprehension.projection {
+                    Some(projection) => output.push_projected(evaluate_scoped(
+                        projection,
+                        catalog,
+                        binding,
+                        Some(&frame),
+                        account,
+                        work,
+                    )?)?,
+                    None => output.push_cloned(value)?,
+                }
+            }
+            Ok(output.finish())
+        }
+        ProjectionExpression::LocalVariable { name, property } => {
+            let value = locals.and_then(|locals| locals.get(name)).ok_or_else(|| {
+                HawDBError::Execution(format!(
+                    "missing list comprehension variable '{name}' during projection"
+                ))
+            })?;
+            match (property, value) {
+                (None, value) => Ok(ProjectedValue::borrowed(value)),
+                (Some(_), Value::Null) => Ok(ProjectedValue::scalar(Value::Null)),
+                (Some(property), Value::Map(values)) => Ok(values
+                    .get(property)
+                    .map(ProjectedValue::borrowed)
+                    .unwrap_or_else(|| ProjectedValue::scalar(Value::Null))),
+                (Some(_), value) => Err(HawDBError::Execution(format!(
+                    "property access on list comprehension variable '{name}' requires a map value, got {:?}",
+                    description(value, account)
+                ))),
+            }
+        }
+        ProjectionExpression::ListIndex { list, index } => {
+            let list = evaluate(list)?;
+            let index = evaluate(index)?;
+            list::index(list, index.as_ref(), account)
+        }
+        ProjectionExpression::ListSlice { list, start, end } => {
+            let list = evaluate(list)?;
+            let start = start.as_deref().map(evaluate).transpose()?;
+            let end = end.as_deref().map(evaluate).transpose()?;
+            list::slice(
+                list,
+                start.as_ref().map(AsRef::as_ref),
+                end.as_ref().map(AsRef::as_ref),
+                account,
+                work,
+            )
         }
         ProjectionExpression::Not(child) => Ok(ProjectedValue::scalar(truth_value(
             scoped_truth(evaluate(child)?.as_ref(), account)?.not(),
@@ -613,11 +789,11 @@ fn binary<'a>(
     left: &'a ProjectionExpression,
     op: ScalarBinaryOp,
     right: &'a ProjectionExpression,
-    catalog: &'a Catalog,
-    binding: &'a Binding,
+    evaluate: impl Fn(&'a ProjectionExpression) -> Result<ProjectedValue<'a>>,
     account: Option<&QueryMemoryAccount>,
+    work: &ListWork,
 ) -> Result<ProjectedValue<'a>> {
-    let left = evaluate_projection_borrowed(left, catalog, binding, account)?;
+    let left = evaluate(left)?;
     if matches!(op, ScalarBinaryOp::And | ScalarBinaryOp::Or) {
         let left = scoped_truth(left.as_ref(), account)?;
         if (op == ScalarBinaryOp::And && left == PredicateTruth::False)
@@ -625,7 +801,7 @@ fn binary<'a>(
         {
             return Ok(ProjectedValue::scalar(truth_value(left)));
         }
-        let right = evaluate_projection_borrowed(right, catalog, binding, account)?;
+        let right = evaluate(right)?;
         let right = scoped_truth(right.as_ref(), account)?;
         return Ok(ProjectedValue::scalar(truth_value(
             if op == ScalarBinaryOp::And {
@@ -635,7 +811,11 @@ fn binary<'a>(
             },
         )));
     }
-    let right = evaluate_projection_borrowed(right, catalog, binding, account)?;
+    let right = evaluate(right)?;
+    if op == ScalarBinaryOp::In {
+        return list::contains(left.as_ref(), right.as_ref(), account, work)
+            .map(ProjectedValue::scalar);
+    }
     if matches!(
         op,
         ScalarBinaryOp::Add

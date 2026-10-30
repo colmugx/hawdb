@@ -27,6 +27,11 @@ type MatchRelationshipPattern = (
     usize,
 );
 
+enum InRight {
+    Value(ValueExpression),
+    Expression(ScalarExpression),
+}
+
 enum PropertyPredicateRight {
     Value(ValueExpression),
     Expression(ScalarExpression),
@@ -88,9 +93,30 @@ impl Parser<'_> {
             self.expect_char(')')?;
             return Ok(predicate);
         }
-        if self.consume_char('$') {
+        if self.peek_char() == Some('$') {
+            let start = self.pos;
+            self.pos += 1;
             let parameter = self.parse_ident()?;
+            let parameter_span = self.source_span(start);
             self.skip_ws();
+            if self.consume_keyword("IN") {
+                let element = AstNode::from_source(
+                    ScalarExpressionKind::Value(AstNode::from_source(
+                        ValueExpressionKind::Parameter(parameter),
+                        parameter_span,
+                    )),
+                    parameter_span,
+                );
+                return Ok(match self.parse_in_right()? {
+                    InRight::Value(values) => PropertyPredicate::ExpressionIn {
+                        expression: element,
+                        values,
+                    },
+                    InRight::Expression(list) => {
+                        self.boolean_expression_predicate(element, list, start)
+                    }
+                });
+            }
             if self.consume_char('=') {
                 return Ok(PropertyPredicate::ParameterEq {
                     left: parameter,
@@ -150,10 +176,11 @@ impl Parser<'_> {
             self.expect_char(')')?;
             return Ok(PropertyPredicate::ExpressionContains { expression, value });
         }
-        if matches_ignore_ascii_case(
+        if (matches_ignore_ascii_case(
             &variable,
             &["coalesce", "left", "lower", "json_value", "case"],
-        ) && self.peek_char() == Some('(')
+        ) || hawdb_core::ListFunction::from_function_name(&variable).is_some())
+            && self.peek_char() == Some('(')
         {
             self.restore(expression_start);
             let expression = self.parse_scalar_expression()?;
@@ -170,6 +197,11 @@ impl Parser<'_> {
             return self.parse_id_predicate(variable);
         }
         self.skip_ws();
+        if allow_columns && self.peek_char() == Some('[') {
+            self.restore(expression_start);
+            let expression = self.parse_scalar_expression()?;
+            return self.parse_expression_predicate(expression);
+        }
         if allow_columns && self.peek_char() != Some('.') {
             let expression = self.source_node(
                 ScalarExpressionKind::Variable(variable),
@@ -181,6 +213,11 @@ impl Parser<'_> {
         let property = self.parse_ident()?;
         let property_span = self.source_span(expression_start.pos);
         self.skip_ws();
+        if self.peek_char() == Some('[') {
+            self.restore(expression_start);
+            let expression = self.parse_scalar_expression()?;
+            return self.parse_expression_predicate(expression);
+        }
         if self.consume_keyword("IS") {
             let is_not = self.consume_keyword("NOT");
             if !self.consume_keyword("NULL") {
@@ -192,12 +229,21 @@ impl Parser<'_> {
                 Ok(PropertyPredicate::IsNull { variable, property })
             }
         } else if self.consume_keyword("IN") {
-            let values = self.parse_value()?;
-            Ok(PropertyPredicate::In {
-                variable,
-                property,
-                values,
-            })
+            match self.parse_in_right()? {
+                InRight::Value(values) => Ok(PropertyPredicate::In {
+                    variable,
+                    property,
+                    values,
+                }),
+                InRight::Expression(list) => Ok(self.boolean_expression_predicate(
+                    AstNode::from_source(
+                        ScalarExpressionKind::Property { variable, property },
+                        property_span,
+                    ),
+                    list,
+                    expression_start.pos,
+                )),
+            }
         } else if self.consume_keyword("CONTAINS") {
             let value = self.parse_value()?;
             Ok(PropertyPredicate::Contains {
@@ -389,7 +435,12 @@ impl Parser<'_> {
             index += ch.len_utf8();
         }
         ["case", "coalesce", "left", "lower"]
-            .iter()
+            .into_iter()
+            .chain(
+                hawdb_core::ListFunction::ALL
+                    .into_iter()
+                    .map(hawdb_core::ListFunction::function_name),
+            )
             .any(|keyword| keyword_matches_at(self.input, index, keyword))
             && self.parenthesized_expression_is_followed_by_comparison(index)
     }
@@ -522,9 +573,12 @@ impl Parser<'_> {
     ) -> Result<PropertyPredicate> {
         self.skip_ws();
         if self.consume_keyword("IN") {
-            return Ok(PropertyPredicate::ExpressionIn {
-                expression,
-                values: self.parse_value()?,
+            let start = expression.span.map_or(self.pos, |span| span.start);
+            return Ok(match self.parse_in_right()? {
+                InRight::Value(values) => PropertyPredicate::ExpressionIn { expression, values },
+                InRight::Expression(list) => {
+                    self.boolean_expression_predicate(expression, list, start)
+                }
             });
         }
         if self.consume_char('<') {
@@ -568,6 +622,50 @@ impl Parser<'_> {
             expression,
             value: self.parse_scalar_expression()?,
         })
+    }
+
+    /// Parses the right side of `IN`. Literal lists and parameters keep the
+    /// value-list predicate forms; any other scalar list uses the generic
+    /// three-valued `IN` operator.
+    fn parse_in_right(&mut self) -> Result<InRight> {
+        self.skip_ws();
+        let checkpoint = self.checkpoint();
+        if matches!(self.peek_char(), Some('$' | '[')) && !self.next_is_list_comprehension() {
+            if let Ok(value) = self.parse_value() {
+                self.skip_ws();
+                if self.peek_char() != Some('[')
+                    && !matches!(value.kind, ValueExpressionKind::BindingProperty { .. })
+                {
+                    return Ok(InRight::Value(value));
+                }
+            }
+            self.restore(checkpoint);
+        }
+        self.parse_case_scalar().map(InRight::Expression)
+    }
+
+    /// `element IN list` as a WHERE predicate over the scalar `IN` operator.
+    /// Comparing with `true` keeps NULL (unknown) rows out, as WHERE requires.
+    fn boolean_expression_predicate(
+        &self,
+        element: ScalarExpression,
+        list: ScalarExpression,
+        start: usize,
+    ) -> PropertyPredicate {
+        let span = self.source_span(start);
+        PropertyPredicate::ExpressionEq {
+            expression: AstNode::from_source(
+                ScalarExpressionKind::Binary {
+                    left: Box::new(element),
+                    op: ScalarBinaryOp::In,
+                    right: Box::new(list),
+                },
+                span,
+            ),
+            value: AstNode::synthetic(ScalarExpressionKind::Value(AstNode::synthetic(
+                ValueExpressionKind::Literal(hawdb_core::Value::Bool(true)),
+            ))),
+        }
     }
 
     fn parse_id_predicate(&mut self, variable: String) -> Result<PropertyPredicate> {

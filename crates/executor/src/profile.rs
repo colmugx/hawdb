@@ -481,6 +481,7 @@ pub struct QueryRowsBuilder {
     row_count: usize,
     row_capacity_hint: usize,
     segments: Option<Vec<Vec<Value>>>,
+    input_order: Option<owned_result::InputOrder>,
 }
 
 impl QueryRowsBuilder {
@@ -497,6 +498,7 @@ impl QueryRowsBuilder {
             row_count: 0,
             row_capacity_hint: row_capacity,
             segments: None,
+            input_order: None,
         }
     }
 
@@ -507,6 +509,7 @@ impl QueryRowsBuilder {
             row_count: 0,
             row_capacity_hint: row_capacity,
             segments: None,
+            input_order: None,
         }
     }
 

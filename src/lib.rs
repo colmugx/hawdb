@@ -284,7 +284,8 @@ pub use embedded_tokio::{
 };
 pub use error::{
     FileDescriptorError, HawDBError, ReadBudgetError, ReadBudgetResource, ResourceBudgetError,
-    ResourceBudgetKind, ResourceBudgetScope, Result, StorageFormatError,
+    ResourceBudgetKind, ResourceBudgetScope, Result, StorageFormatError, TransactionRetryError,
+    TransactionRetryReason,
 };
 pub use executor::{
     ProjectedRowRef, QueryRow, QueryRowRef, QueryRows, QuerySchema, ReadExecutionProfile, Row,

@@ -180,7 +180,8 @@ impl Parser<'_> {
         }
         while let Some(ch) = self.input[index..].chars().next() {
             if ch == '.' {
-                return true;
+                // `1..3` is a slice or hop range, not the float `1.`.
+                return !self.input[index + 1..].starts_with('.');
             }
             if !ch.is_ascii_digit() {
                 return false;

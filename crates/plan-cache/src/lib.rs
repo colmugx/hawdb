@@ -15,7 +15,16 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
+mod binding_cache;
+mod schema;
 mod template;
+
+#[doc(hidden)]
+pub use binding_cache::{
+    ParameterBindingAdmission, ParameterBindingCache, ParameterBindingCacheConfig,
+};
+#[doc(hidden)]
+pub use schema::OptimizerSchemaKey;
 
 pub use template::{
     bind_physical_plan_parameters, parameter_binding_shape_fingerprint, parameter_scalar_types,

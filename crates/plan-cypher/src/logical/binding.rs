@@ -1413,10 +1413,27 @@ pub(super) fn collect_scalar_expression_variables(
         ScalarExpressionKind::CaseCoalesceDifferenceFloorZero { variable, .. } => {
             variables.insert(variable.clone());
         }
+        ScalarExpressionKind::ListComprehension {
+            variable,
+            list,
+            predicate,
+            projection,
+        } => {
+            collect_scalar_expression_variables(list, variables);
+            let mut body = BTreeSet::new();
+            for expression in predicate.iter().chain(projection.iter()) {
+                collect_scalar_expression_variables(expression, &mut body);
+            }
+            body.remove(variable);
+            variables.extend(body);
+        }
         ScalarExpressionKind::Case { .. }
         | ScalarExpressionKind::Binary { .. }
         | ScalarExpressionKind::Not(_)
-        | ScalarExpressionKind::IsNull { .. } => {
+        | ScalarExpressionKind::IsNull { .. }
+        | ScalarExpressionKind::ListFunction { .. }
+        | ScalarExpressionKind::ListIndex { .. }
+        | ScalarExpressionKind::ListSlice { .. } => {
             expression.kind.all_children(|child| {
                 collect_scalar_expression_variables(child, variables);
                 true

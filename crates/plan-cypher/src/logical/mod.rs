@@ -14,7 +14,7 @@
 
 use hawdb_core::{HawDBError, Result, ValidatedRegex, Value};
 use hawdb_cypher::{
-    AggregateExpression, ComparisonOp as CypherComparisonOp,
+    AggregateExpression, AggregateFunctionName, ComparisonOp as CypherComparisonOp,
     GraphAlgorithmKind as CypherGraphAlgorithmKind,
     GraphAlgorithmOptions as CypherGraphAlgorithmOptions, OrderDirection as CypherOrderDirection,
     OrderExpression, OrderItem, PropertyPredicate, RelationshipDirection, ReturnExpression,
@@ -27,8 +27,8 @@ use hawdb_cypher::{
 pub use hawdb_ddl::{SchemaObjectState, SchemaPropertyType, SchemaTableKind};
 pub use hawdb_expression::{
     CaseColumnSearchRankProjection, CaseEntitySearchRankProjection,
-    CoalesceDifferenceProjectionTerm, ComparisonOp, DatePart, Predicate, ProjectionExpression,
-    ScalarBinaryOp, SortDirection, SortItem, SortKey,
+    CoalesceDifferenceProjectionTerm, ComparisonOp, DatePart, ListComprehensionProjection,
+    Predicate, ProjectionExpression, ScalarBinaryOp, SortDirection, SortItem, SortKey,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -39,10 +39,13 @@ mod visibility;
 pub use graph_match::*;
 pub use pipeline::{
     plan_normalized_pipeline_query, plan_parsed_pipeline_query, plan_pipeline_query,
+    unique_projection_names,
 };
 pub use visibility::apply_node_visibility_predicates;
 mod binding;
 mod case;
+#[cfg(test)]
+mod list_tests;
 mod projection;
 mod statement;
 
@@ -52,6 +55,17 @@ use projection::*;
 pub use statement::{plan, plan_with_params};
 
 const MAX_RETRIEVER_SEEDED_GRAPH_HOPS: usize = 2;
+
+/// Public projection of the specialized thread-repair summary operator.
+pub const THREAD_REPAIR_STATS_COLUMNS: [&str; 7] = [
+    "t.id",
+    "t.thread_id",
+    "CASE WHEN t.space_id IS NULL OR t.space_id = '' THEN 'default' ELSE t.space_id END",
+    "COALESCE(t.message_count, 0)",
+    "identity_refs",
+    "legacy_messages",
+    "COUNT(m)",
+];
 
 /// Shared logical/physical parameters for explicit schema-bound index access.
 /// The attached read domain resolves the index and supplies canonical nodes.
@@ -623,6 +637,7 @@ pub struct Aggregation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregateFunction {
     Count,
+    Sum,
     Min,
     Max,
     Avg,
@@ -647,4 +662,19 @@ pub enum AggregateTarget {
         variable: String,
         property: String,
     },
+    /// A general aggregate-free argument evaluated against each input row.
+    Expression(ProjectionExpression),
+}
+
+impl AggregateFunction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Avg => "avg",
+            Self::Collect => "collect",
+        }
+    }
 }

@@ -330,7 +330,7 @@ pub(super) fn plan_return_items_with_columns(
     if items.iter().any(|item| {
         matches!(
             item.expression.kind,
-            ReturnExpressionKind::Arithmetic { .. }
+            ReturnExpressionKind::Arithmetic { .. } | ReturnExpressionKind::ListFunction { .. }
         )
     }) {
         return super::arithmetic::plan_composed_returns(scope, column_scope, items, parameters);
@@ -351,7 +351,8 @@ pub(super) fn plan_return_items_with_columns(
             match &item.expression.kind {
                 ReturnExpressionKind::Value(_)
                 | ReturnExpressionKind::Path(_)
-                | ReturnExpressionKind::Arithmetic { .. } => {
+                | ReturnExpressionKind::Arithmetic { .. }
+                | ReturnExpressionKind::ListFunction { .. } => {
                     group_keys.push(plan_projection_with_columns(
                         scope,
                         column_scope,
@@ -706,6 +707,22 @@ pub(super) fn plan_projection_with_columns(
             plan_case_scalar(scope, column_scope, value, parameters, true)?,
             "case".to_string(),
         ),
+        ScalarExpressionKind::ListFunction { function, .. } => (
+            plan_scalar_expression_with_columns(scope, column_scope, value, parameters)?,
+            function.function_name().to_string(),
+        ),
+        ScalarExpressionKind::ListComprehension { .. } => (
+            plan_scalar_expression_with_columns(scope, column_scope, value, parameters)?,
+            "list_comprehension".to_string(),
+        ),
+        ScalarExpressionKind::ListIndex { .. } => (
+            plan_scalar_expression_with_columns(scope, column_scope, value, parameters)?,
+            "list_index".to_string(),
+        ),
+        ScalarExpressionKind::ListSlice { .. } => (
+            plan_scalar_expression_with_columns(scope, column_scope, value, parameters)?,
+            "list_slice".to_string(),
+        ),
     };
     Ok(Projection {
         expression,
@@ -860,6 +877,16 @@ pub(super) fn plan_aggregation_with_columns(
         ReturnExpressionKind::Aggregate(aggregate) => aggregate,
         _ => return plan_aggregation(scope, item),
     };
+    if let AggregateExpression::Expression {
+        function,
+        distinct,
+        argument,
+    } = aggregate
+    {
+        return plan_expression_aggregation(
+            scope, columns, item, *function, *distinct, argument, parameters,
+        );
+    }
     let direct = match aggregate {
         AggregateExpression::MaxVariable { variable } => {
             if !columns.contains(variable) {
@@ -912,8 +939,10 @@ pub(super) fn plan_aggregation_with_columns(
         });
     }
     let variable = match aggregate {
-        AggregateExpression::MaxVariable { .. } | AggregateExpression::CollectTop { .. } => {
-            unreachable!("scalar aggregates bound above")
+        AggregateExpression::MaxVariable { .. }
+        | AggregateExpression::CollectTop { .. }
+        | AggregateExpression::Expression { .. } => {
+            unreachable!("scalar and expression aggregates bound above")
         }
         AggregateExpression::CountAll => return plan_aggregation(scope, item),
         AggregateExpression::CountVariable { variable, .. }
@@ -941,6 +970,61 @@ pub(super) fn plan_aggregation_with_columns(
     Ok(result)
 }
 
+/// Plans an aggregate over a general argument expression. Plain variable and
+/// property arguments reuse the direct targets; any other aggregate-free
+/// argument is evaluated per input row by the aggregate operator itself.
+fn plan_expression_aggregation(
+    scope: &BTreeSet<String>,
+    columns: &BTreeSet<String>,
+    item: &ReturnItem,
+    function: AggregateFunctionName,
+    distinct: bool,
+    argument: &ReturnExpression,
+    parameters: &BTreeMap<String, Value>,
+) -> Result<Aggregation> {
+    let function = match function {
+        AggregateFunctionName::Count => AggregateFunction::Count,
+        AggregateFunctionName::Sum => AggregateFunction::Sum,
+        AggregateFunctionName::Min => AggregateFunction::Min,
+        AggregateFunctionName::Max => AggregateFunction::Max,
+        AggregateFunctionName::Avg => AggregateFunction::Avg,
+        AggregateFunctionName::Collect => AggregateFunction::Collect,
+    };
+    let (expression, argument_name) =
+        super::arithmetic::bind_aggregate_argument(scope, columns, argument, parameters)?;
+    let argument_name = match &argument.kind {
+        ReturnExpressionKind::Arithmetic { .. } => argument_name
+            .strip_prefix('(')
+            .and_then(|name| name.strip_suffix(')'))
+            .map(str::to_string)
+            .unwrap_or(argument_name),
+        _ => argument_name,
+    };
+    let target = match expression {
+        ProjectionExpression::Column(column) => AggregateTarget::Column(column),
+        ProjectionExpression::ColumnProperty { column, property } => {
+            AggregateTarget::ColumnProperty { column, property }
+        }
+        ProjectionExpression::Property { variable, property } => {
+            AggregateTarget::Property { variable, property }
+        }
+        expression => AggregateTarget::Expression(expression),
+    };
+    let name = item.alias.clone().unwrap_or_else(|| {
+        format!(
+            "{}({}{argument_name})",
+            function.as_str(),
+            if distinct { "DISTINCT " } else { "" }
+        )
+    });
+    Ok(Aggregation {
+        function,
+        target,
+        distinct,
+        name,
+    })
+}
+
 pub(super) fn plan_aggregation(scope: &BTreeSet<String>, item: &ReturnItem) -> Result<Aggregation> {
     let AstNode {
         kind: ReturnExpressionKind::Aggregate(value),
@@ -952,7 +1036,9 @@ pub(super) fn plan_aggregation(scope: &BTreeSet<String>, item: &ReturnItem) -> R
         ));
     };
     let (function, target, distinct) = match value {
-        AggregateExpression::MaxVariable { .. } | AggregateExpression::CollectTop { .. } => {
+        AggregateExpression::MaxVariable { .. }
+        | AggregateExpression::CollectTop { .. }
+        | AggregateExpression::Expression { .. } => {
             return Err(HawDBError::Semantic(
                 "scalar aggregate requires column-aware binding".into(),
             ));
@@ -1325,7 +1411,141 @@ pub(super) fn plan_scalar_expression_with_columns(
         | ScalarExpressionKind::IsNull { .. } => {
             plan_case_scalar(scope, column_scope, expression, parameters, false)
         }
+        ScalarExpressionKind::ListFunction {
+            function,
+            arguments,
+        } => Ok(ProjectionExpression::ListFunction {
+            function: *function,
+            arguments: arguments
+                .iter()
+                .map(|argument| {
+                    plan_scalar_expression_with_columns(scope, column_scope, argument, parameters)
+                })
+                .collect::<Result<Vec<_>>>()?,
+        }),
+        ScalarExpressionKind::ListComprehension {
+            variable,
+            list,
+            predicate,
+            projection,
+        } => plan_list_comprehension(
+            scope,
+            column_scope,
+            ListComprehensionParts {
+                variable,
+                list,
+                predicate: predicate.as_deref(),
+                projection: projection.as_deref(),
+            },
+            parameters,
+        ),
+        ScalarExpressionKind::ListIndex { list, index } => Ok(ProjectionExpression::ListIndex {
+            list: Box::new(plan_scalar_expression_with_columns(
+                scope,
+                column_scope,
+                list,
+                parameters,
+            )?),
+            index: Box::new(plan_scalar_expression_with_columns(
+                scope,
+                column_scope,
+                index,
+                parameters,
+            )?),
+        }),
+        ScalarExpressionKind::ListSlice { list, start, end } => {
+            let bind = |expression: &ScalarExpression| {
+                plan_scalar_expression_with_columns(scope, column_scope, expression, parameters)
+                    .map(Box::new)
+            };
+            Ok(ProjectionExpression::ListSlice {
+                list: bind(list)?,
+                start: start.as_deref().map(bind).transpose()?,
+                end: end.as_deref().map(bind).transpose()?,
+            })
+        }
     }
+}
+
+struct ListComprehensionParts<'a> {
+    variable: &'a str,
+    list: &'a ScalarExpression,
+    predicate: Option<&'a ScalarExpression>,
+    projection: Option<&'a ScalarExpression>,
+}
+
+/// Plans `[variable IN list WHERE predicate | projection]`.
+///
+/// The element variable must not shadow a graph variable or a column that is
+/// already visible; reusing a name would make `x` mean different values inside
+/// and outside the brackets. Inside the body the element is planned as a
+/// column and then rebound to [`ProjectionExpression::LocalVariable`], so no
+/// row-column analysis ever sees it.
+fn plan_list_comprehension(
+    scope: &BTreeSet<String>,
+    column_scope: &BTreeSet<String>,
+    parts: ListComprehensionParts<'_>,
+    parameters: &BTreeMap<String, Value>,
+) -> Result<ProjectionExpression> {
+    let variable = parts.variable;
+    if scope.contains(variable) || column_scope.contains(variable) {
+        return Err(HawDBError::Semantic(format!(
+            "list comprehension variable '{variable}' shadows a variable that is already in scope; use a different name"
+        )));
+    }
+    let list = plan_scalar_expression_with_columns(scope, column_scope, parts.list, parameters)?;
+    let mut body_columns = column_scope.clone();
+    body_columns.insert(variable.to_string());
+    let bind_body = |expression: &ScalarExpression| {
+        let mut planned =
+            plan_scalar_expression_with_columns(scope, &body_columns, expression, parameters)?;
+        bind_list_local(&mut planned, variable)?;
+        Ok::<_, HawDBError>(planned)
+    };
+    Ok(ProjectionExpression::ListComprehension(Box::new(
+        ListComprehensionProjection {
+            variable: variable.to_string(),
+            list,
+            predicate: parts.predicate.map(bind_body).transpose()?,
+            projection: parts.projection.map(bind_body).transpose()?,
+        },
+    )))
+}
+
+fn bind_list_local(expression: &mut ProjectionExpression, variable: &str) -> Result<()> {
+    match expression {
+        ProjectionExpression::Column(column) if column == variable => {
+            *expression = ProjectionExpression::LocalVariable {
+                name: variable.to_string(),
+                property: None,
+            };
+            Ok(())
+        }
+        ProjectionExpression::ColumnProperty { column, property } if column == variable => {
+            *expression = ProjectionExpression::LocalVariable {
+                name: variable.to_string(),
+                property: Some(property.clone()),
+            };
+            Ok(())
+        }
+        ProjectionExpression::ColumnDefaultIfNullOrEq { column, .. }
+        | ProjectionExpression::ColumnValueDefaultIfNull { column, .. }
+        | ProjectionExpression::ColumnValueCasePropertyNotNullOrEq { column, .. }
+            if column == variable =>
+        {
+            Err(unsupported_list_local(variable))
+        }
+        ProjectionExpression::CaseColumnSearchRank(rank) if rank.column == variable => {
+            Err(unsupported_list_local(variable))
+        }
+        _ => expression.try_for_each_child_mut(|child| bind_list_local(child, variable)),
+    }
+}
+
+fn unsupported_list_local(variable: &str) -> HawDBError {
+    HawDBError::Semantic(format!(
+        "this CASE form is not supported over list comprehension variable '{variable}'; use a generic CASE WHEN expression"
+    ))
 }
 
 pub(super) fn bind_coalesce_difference_terms(
@@ -1398,6 +1618,7 @@ pub(super) fn default_aggregation_name(
                 distinct,
             )
         }
+        AggregateTarget::Expression(_) => return format!("{}(?)", function.as_str()),
         _ => {}
     }
     match (function, target) {
@@ -1415,6 +1636,12 @@ pub(super) fn default_aggregation_name(
         }
         (AggregateFunction::Count, AggregateTarget::Property { variable, property }) => {
             format!("count({variable}.{property})")
+        }
+        (AggregateFunction::Sum, AggregateTarget::Property { variable, property }) => {
+            format!("sum({variable}.{property})")
+        }
+        (AggregateFunction::Sum, AggregateTarget::All | AggregateTarget::Variable(_)) => {
+            "sum(?)".to_string()
         }
         (AggregateFunction::Min, AggregateTarget::Property { variable, property }) => {
             format!("min({variable}.{property})")
@@ -1452,7 +1679,8 @@ pub(super) fn default_aggregation_name(
             _,
             AggregateTarget::Ranked { .. }
             | AggregateTarget::Column(_)
-            | AggregateTarget::ColumnProperty { .. },
+            | AggregateTarget::ColumnProperty { .. }
+            | AggregateTarget::Expression(_),
         ) => {
             unreachable!("columns normalized before naming")
         }

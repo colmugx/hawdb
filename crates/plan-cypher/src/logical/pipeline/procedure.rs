@@ -474,6 +474,11 @@ fn collect_algorithm_return_columns(
                 collect_algorithm_return_columns(expression, names);
             }
         }
+        ReturnExpressionKind::ListFunction { arguments, .. } => {
+            for expression in arguments {
+                collect_algorithm_return_columns(expression, names);
+            }
+        }
         ReturnExpressionKind::Aggregate(aggregate) => match aggregate {
             AggregateExpression::CountAll => {}
             AggregateExpression::CollectTop {
@@ -491,6 +496,9 @@ fn collect_algorithm_return_columns(
             | AggregateExpression::MaxProperty { variable, .. }
             | AggregateExpression::AvgProperty { variable, .. } => {
                 names.insert(variable.clone());
+            }
+            AggregateExpression::Expression { argument, .. } => {
+                collect_algorithm_return_columns(argument, names);
             }
         },
         ReturnExpressionKind::Path(_) => {}

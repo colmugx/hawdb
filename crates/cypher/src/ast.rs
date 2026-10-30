@@ -510,6 +510,32 @@ pub enum ScalarExpressionKind {
         expression: Box<ScalarExpression>,
         negated: bool,
     },
+    /// `size`, `head`, `last`, `tail`, `reverse` or `range`.
+    ListFunction {
+        function: hawdb_core::ListFunction,
+        arguments: Vec<ScalarExpression>,
+    },
+    /// `[variable IN list WHERE predicate | projection]`.
+    ///
+    /// `variable` is scoped to `predicate` and `projection`; it must not
+    /// shadow a variable or column already visible to the comprehension.
+    ListComprehension {
+        variable: String,
+        list: Box<ScalarExpression>,
+        predicate: Option<Box<ScalarExpression>>,
+        projection: Option<Box<ScalarExpression>>,
+    },
+    /// `list[index]`; negative indexes count from the end.
+    ListIndex {
+        list: Box<ScalarExpression>,
+        index: Box<ScalarExpression>,
+    },
+    /// `list[start..end]`; either bound may be omitted.
+    ListSlice {
+        list: Box<ScalarExpression>,
+        start: Option<Box<ScalarExpression>>,
+        end: Option<Box<ScalarExpression>>,
+    },
 }
 
 /// A projection or grouping expression, with aggregation explicit in its type.
@@ -522,6 +548,13 @@ pub enum ReturnExpressionKind {
         rest: Vec<(ArithmeticOp, ReturnExpression)>,
     },
     Path(ShortestPathReturnExpression),
+    /// A list function applied to an expression containing an aggregate,
+    /// such as `size(collect(x))`. Scalar-only calls use
+    /// [`ScalarExpressionKind::ListFunction`].
+    ListFunction {
+        function: hawdb_core::ListFunction,
+        arguments: Vec<ReturnExpression>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -574,6 +607,39 @@ pub enum AggregateExpression {
         variable: String,
         property: String,
     },
+    /// An aggregate over an arbitrary aggregate-free argument expression.
+    ///
+    /// The parser keeps the historical fixed shapes above for the forms they
+    /// cover, so this variant only carries arguments outside those shapes.
+    Expression {
+        function: AggregateFunctionName,
+        distinct: bool,
+        argument: Box<ReturnExpression>,
+    },
+}
+
+/// The general aggregate functions accepted with an expression argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFunctionName {
+    Count,
+    Sum,
+    Min,
+    Max,
+    Avg,
+    Collect,
+}
+
+impl AggregateFunctionName {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::Min => "min",
+            Self::Max => "max",
+            Self::Avg => "avg",
+            Self::Collect => "collect",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -586,6 +652,8 @@ pub enum ScalarBinaryOp {
     Gte,
     Contains,
     ListContains,
+    /// `element IN list` with openCypher three-valued semantics.
+    In,
     And,
     Or,
 }
@@ -652,7 +720,27 @@ impl ScalarExpressionKind {
             | Self::Lower(expression)
             | Self::Left { expression, .. }
             | Self::JsonValue { expression, .. } => visit(expression),
-            Self::Coalesce(expressions) => expressions.iter().all(visit),
+            Self::Coalesce(expressions)
+            | Self::ListFunction {
+                arguments: expressions,
+                ..
+            } => expressions.iter().all(visit),
+            Self::ListComprehension {
+                list,
+                predicate,
+                projection,
+                ..
+            } => [Some(list), predicate.as_ref(), projection.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(Box::as_ref)
+                .all(visit),
+            Self::ListIndex { list, index } => visit(list) && visit(index),
+            Self::ListSlice { list, start, end } => [Some(list), start.as_ref(), end.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(Box::as_ref)
+                .all(visit),
             _ => true,
         }
     }

@@ -230,6 +230,39 @@ fn expression_bytes(expression: &ProjectionExpression) -> Option<usize> {
             value_bytes(non_empty),
             value_bytes(null_or_empty),
         ]),
+        E::ListFunction {
+            function: _,
+            arguments,
+        } => vector(arguments, expression_bytes),
+        E::ListComprehension(comprehension) => boxed(comprehension.as_ref(), |comprehension| {
+            sum([
+                Some(comprehension.variable.capacity()),
+                expression_bytes(&comprehension.list),
+                comprehension
+                    .predicate
+                    .as_ref()
+                    .map_or(Some(0), expression_bytes),
+                comprehension
+                    .projection
+                    .as_ref()
+                    .map_or(Some(0), expression_bytes),
+            ])
+        }),
+        E::LocalVariable { name, property } => name
+            .capacity()
+            .checked_add(property.as_ref().map_or(0, String::capacity)),
+        E::ListIndex { list, index } => sum([
+            boxed(list.as_ref(), expression_bytes),
+            boxed(index.as_ref(), expression_bytes),
+        ]),
+        E::ListSlice { list, start, end } => sum([
+            boxed(list.as_ref(), expression_bytes),
+            start
+                .as_ref()
+                .map_or(Some(0), |value| boxed(value.as_ref(), expression_bytes)),
+            end.as_ref()
+                .map_or(Some(0), |value| boxed(value.as_ref(), expression_bytes)),
+        ]),
         // Opaque/specialized expressions are deliberately not admitted yet.
         E::CaseEntitySearchRank(_) | E::CaseColumnSearchRank(_) => None,
     }

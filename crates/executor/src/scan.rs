@@ -305,7 +305,9 @@ pub(crate) fn stream_expand_binding_admitted(
         || spec.rel_variable.is_some()
         || !spec.rel_properties.is_empty()
         || filters.relationship_scan_filter.is_some()
-        || spec.direction != RelationshipDirection::Outgoing
+        || (spec.direction != RelationshipDirection::Outgoing
+            && spec.min_hops == 1
+            && spec.max_hops == 1)
     {
         visit_one_hop_relationships_with_context(
             store,
@@ -363,6 +365,7 @@ pub(crate) fn stream_expand_binding_admitted(
             BoundedExpandSpec {
                 source: source.id,
                 rel_type_id,
+                direction: spec.direction,
                 target_label_ids,
                 min_hops: spec.min_hops,
                 max_hops: spec.max_hops,

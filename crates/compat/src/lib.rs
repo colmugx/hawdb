@@ -438,6 +438,7 @@ impl ExpectedErrorClass {
             | HawDBError::GraphExpansionCandidateLimitExceeded { .. }
             | HawDBError::GraphExpansionPayloadLimitExceeded { .. }
             | HawDBError::TransactionConflict { .. }
+            | HawDBError::TransactionRetryRequired(_)
             | HawDBError::TransactionReadDependencyRefused { .. }
             | HawDBError::BranchCommandUnsupported { .. } => Self::Execution,
             HawDBError::CapabilityUnavailable { .. } => Self::CapabilityUnavailable,

@@ -2475,6 +2475,7 @@ fn run_point_read_admission(persisted: bool, case: PointReadCase) {
             hawdb_executor::traversal::BoundedExpandSpec {
                 source,
                 rel_type_id,
+                direction: hawdb_core::RelationshipDirection::Outgoing,
                 target_label_ids: Some(&label_ids),
                 min_hops: 1,
                 max_hops: 1,

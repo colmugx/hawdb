@@ -1,24 +1,27 @@
+// Copyright 2026 Nowledge
+// SPDX-License-Identifier: Apache-2.0
+
 use super::super::ast::*;
-use super::{Parser, MAX_CYPHER_INPUT_BYTES, MAX_CYPHER_PARSER_DEPTH};
-use hawdb_core::{HawDBError, Result};
+use super::{Parser, MAX_CYPHER_PARSER_DEPTH};
+use hawdb_core::Result;
 
 /// Parses ordered query clauses independently of statement-template lowering.
 #[doc(hidden)]
 pub fn parse_pipeline(input: &str) -> Result<QueryPipeline> {
-    if input.len() > MAX_CYPHER_INPUT_BYTES {
-        return Err(HawDBError::Parse(format!(
-            "Cypher input exceeds maximum length of {MAX_CYPHER_INPUT_BYTES} bytes"
-        )));
-    }
-    let mut parser = Parser::new(input);
-    let pipeline = parser.parse_query_pipeline()?;
-    parser.consume_char(';');
-    parser.expect_eof()?;
-    Ok(pipeline)
+    super::frontend::parse_pipeline(input)
 }
 
 impl Parser<'_> {
     pub(super) fn parse_query_pipeline(&mut self) -> Result<QueryPipeline> {
+        #[cfg(test)]
+        if !self.peg {
+            return self.parse_legacy_query_pipeline();
+        }
+        super::frontend::pipeline_at(self)
+    }
+
+    #[cfg(test)]
+    fn parse_legacy_query_pipeline(&mut self) -> Result<QueryPipeline> {
         self.skip_ws();
         let start = self.pos;
         let mut clauses = Vec::new();
@@ -26,59 +29,11 @@ impl Parser<'_> {
         while !terminal {
             self.skip_ws();
             let clause_start = self.pos;
-            let kind = if self.consume_keyword("UNWIND") {
-                self.parse_pipeline_unwind()?
-            } else if self.consume_keyword("MATCH") {
-                self.parse_pipeline_match(false)?
-            } else if self.consume_keyword("OPTIONAL") {
-                self.expect_keyword("MATCH")?;
-                self.parse_pipeline_match(true)?
-            } else if self.consume_keyword("WITH") {
-                ClauseKind::With(self.parse_pipeline_projection(true)?)
-            } else if self.consume_keyword("RETURN") {
-                terminal = true;
-                ClauseKind::Return(self.parse_pipeline_projection(false)?)
-            } else if self.consume_keyword("CALL") {
-                self.parse_pipeline_call()?
-            } else if self.consume_keyword("CREATE") {
-                ClauseKind::Create(self.parse_pipeline_patterns()?)
-            } else if self.consume_keyword("MERGE") {
-                let pattern = self.parse_pipeline_pattern()?;
-                let mut on_create = Vec::new();
-                let mut on_match = Vec::new();
-                while self.consume_keyword("ON") {
-                    let sets = if self.consume_keyword("CREATE") {
-                        &mut on_create
-                    } else {
-                        self.expect_keyword("MATCH")?;
-                        &mut on_match
-                    };
-                    if !sets.is_empty() {
-                        return Err(self.error("duplicate MERGE action"));
-                    }
-                    self.expect_keyword("SET")?;
-                    *sets = self.parse_set_properties()?;
-                }
-                ClauseKind::Merge {
-                    pattern,
-                    on_create,
-                    on_match,
-                }
-            } else if self.consume_keyword("SET") {
-                ClauseKind::Set(self.parse_set_properties()?)
-            } else if self.next_keyword_is("DETACH") || self.next_keyword_is("DELETE") {
-                let detach = self.consume_keyword("DETACH");
-                self.expect_keyword("DELETE")?;
-                let mut variables = vec![self.parse_ident()?];
-                while self.consume_char(',') {
-                    variables.push(self.parse_ident()?);
-                }
-                ClauseKind::Delete { detach, variables }
-            } else if !clauses.is_empty() && matches!(self.peek_char(), None | Some(';')) {
+            if !clauses.is_empty() && matches!(self.peek_char(), None | Some(';')) {
                 break;
-            } else {
-                return Err(self.error("expected a query clause"));
-            };
+            }
+            let kind = self.parse_pipeline_clause()?;
+            terminal = matches!(kind, ClauseKind::Return(_));
             clauses.push(self.source_node(kind, clause_start));
         }
         if !matches!(
@@ -95,6 +50,59 @@ impl Parser<'_> {
             return Err(self.error("query requires RETURN or a concluding mutation"));
         }
         Ok(self.source_node(QueryPipelineKind { clauses }, start))
+    }
+
+    pub(super) fn parse_pipeline_clause(&mut self) -> Result<ClauseKind> {
+        Ok(if self.consume_keyword("UNWIND") {
+            self.parse_pipeline_unwind()?
+        } else if self.consume_keyword("MATCH") {
+            self.parse_pipeline_match(false)?
+        } else if self.consume_keyword("OPTIONAL") {
+            self.expect_keyword("MATCH")?;
+            self.parse_pipeline_match(true)?
+        } else if self.consume_keyword("WITH") {
+            ClauseKind::With(self.parse_pipeline_projection(true)?)
+        } else if self.consume_keyword("RETURN") {
+            ClauseKind::Return(self.parse_pipeline_projection(false)?)
+        } else if self.consume_keyword("CALL") {
+            self.parse_pipeline_call()?
+        } else if self.consume_keyword("CREATE") {
+            ClauseKind::Create(self.parse_pipeline_patterns()?)
+        } else if self.consume_keyword("MERGE") {
+            let pattern = self.parse_pipeline_pattern()?;
+            let mut on_create = Vec::new();
+            let mut on_match = Vec::new();
+            while self.consume_keyword("ON") {
+                let sets = if self.consume_keyword("CREATE") {
+                    &mut on_create
+                } else {
+                    self.expect_keyword("MATCH")?;
+                    &mut on_match
+                };
+                if !sets.is_empty() {
+                    return Err(self.error("duplicate MERGE action"));
+                }
+                self.expect_keyword("SET")?;
+                *sets = self.parse_set_properties()?;
+            }
+            ClauseKind::Merge {
+                pattern,
+                on_create,
+                on_match,
+            }
+        } else if self.consume_keyword("SET") {
+            ClauseKind::Set(self.parse_set_properties()?)
+        } else if self.next_keyword_is("DETACH") || self.next_keyword_is("DELETE") {
+            let detach = self.consume_keyword("DETACH");
+            self.expect_keyword("DELETE")?;
+            let mut variables = vec![self.parse_ident()?];
+            while self.consume_char(',') {
+                variables.push(self.parse_ident()?);
+            }
+            ClauseKind::Delete { detach, variables }
+        } else {
+            return Err(self.error("expected a query clause"));
+        })
     }
 
     fn parse_pipeline_unwind(&mut self) -> Result<ClauseKind> {
@@ -259,7 +267,7 @@ impl Parser<'_> {
         Ok(items)
     }
 
-    fn parse_pipeline_arithmetic(&mut self, product: bool) -> Result<ReturnExpression> {
+    pub(super) fn parse_pipeline_arithmetic(&mut self, product: bool) -> Result<ReturnExpression> {
         self.skip_ws();
         let start = self.pos;
         let mut first = if product {
@@ -310,6 +318,29 @@ impl Parser<'_> {
                 parser.expect_char(')')?;
                 return Ok(parser.source_node(expression.kind, start));
             }
+            if parser.peek_char() == Some('-')
+                && !parser.input[parser.pos + 1..].starts_with(|ch: char| ch.is_ascii_digit())
+            {
+                // Unary minus over a non-literal operand: `-x` is `-1 * x`,
+                // which preserves the operand's numeric type and NULL.
+                parser.pos += 1;
+                let operand = parser.parse_pipeline_return_atom()?;
+                let minus_one = parser.source_node(
+                    ReturnExpressionKind::Value(AstNode::synthetic(ScalarExpressionKind::Value(
+                        AstNode::synthetic(ValueExpressionKind::Literal(hawdb_core::Value::Int(
+                            -1,
+                        ))),
+                    ))),
+                    start,
+                );
+                return Ok(parser.source_node(
+                    ReturnExpressionKind::Arithmetic {
+                        first: Box::new(minus_one),
+                        rest: vec![(ArithmeticOp::Multiply, operand)],
+                    },
+                    start,
+                ));
+            }
             let kind = if parser.consume_pipeline_function("PROPERTIES") {
                 parser.expect_keyword("NODES")?;
                 parser.expect_char('(')?;
@@ -329,11 +360,53 @@ impl Parser<'_> {
                 let path_variable = parser.parse_ident()?;
                 parser.expect_char(')')?;
                 ReturnExpressionKind::Path(ShortestPathReturnExpression::Length { path_variable })
+            } else if let Some(kind) = parser.parse_aggregate_list_function()? {
+                kind
             } else {
                 parser.parse_return_atom()?
             };
             Ok(parser.source_node(kind, start))
         })
+    }
+
+    /// Parses `size(collect(x))`-style calls whose argument contains an
+    /// aggregate. Calls over plain scalars are left to the scalar grammar.
+    fn parse_aggregate_list_function(&mut self) -> Result<Option<ReturnExpressionKind>> {
+        let checkpoint = self.checkpoint();
+        let Ok(name) = self.parse_ident() else {
+            self.restore(checkpoint);
+            return Ok(None);
+        };
+        let Some(function) = hawdb_core::ListFunction::from_function_name(&name) else {
+            self.restore(checkpoint);
+            return Ok(None);
+        };
+        if !self.consume_char('(') {
+            self.restore(checkpoint);
+            return Ok(None);
+        }
+        let mut arguments = Vec::new();
+        let parsed = (|| -> Result<()> {
+            if self.consume_char(')') {
+                return Ok(());
+            }
+            loop {
+                arguments.push(self.parse_pipeline_arithmetic(false)?);
+                if self.consume_char(')') {
+                    return Ok(());
+                }
+                self.expect_char(',')?;
+            }
+        })();
+        if parsed.is_err() || !arguments.iter().any(return_contains_aggregate) {
+            self.restore(checkpoint);
+            return Ok(None);
+        }
+        self.check_list_function_arity(function, arguments.len())?;
+        Ok(Some(ReturnExpressionKind::ListFunction {
+            function,
+            arguments,
+        }))
     }
 
     fn consume_pipeline_function(&mut self, name: &str) -> bool {
@@ -440,7 +513,26 @@ fn arithmetic_depth(expression: &ReturnExpression) -> usize {
             .fold(arithmetic_depth(first), |depth, (_, right)| {
                 depth.max(arithmetic_depth(right)) + 1
             }),
+        ReturnExpressionKind::ListFunction { arguments, .. } => {
+            arguments.iter().map(arithmetic_depth).max().unwrap_or(0) + 1
+        }
         _ => 1,
+    }
+}
+
+fn return_contains_aggregate(expression: &ReturnExpression) -> bool {
+    match &expression.kind {
+        ReturnExpressionKind::Aggregate(_) => true,
+        ReturnExpressionKind::Arithmetic { first, rest } => {
+            return_contains_aggregate(first)
+                || rest
+                    .iter()
+                    .any(|(_, child)| return_contains_aggregate(child))
+        }
+        ReturnExpressionKind::ListFunction { arguments, .. } => {
+            arguments.iter().any(return_contains_aggregate)
+        }
+        ReturnExpressionKind::Value(_) | ReturnExpressionKind::Path(_) => false,
     }
 }
 

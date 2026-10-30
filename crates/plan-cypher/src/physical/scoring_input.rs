@@ -353,7 +353,14 @@ fn public_expression_at(expression: &ProjectionExpression, depth: usize) -> bool
         | ProjectionExpression::VectorDistance { .. }
         | ProjectionExpression::Binary { .. }
         | ProjectionExpression::Not(_)
-        | ProjectionExpression::IsNull { .. } => true,
+        | ProjectionExpression::IsNull { .. }
+        | ProjectionExpression::ListFunction { .. }
+        | ProjectionExpression::ListIndex { .. }
+        | ProjectionExpression::ListSlice { .. } => true,
+        ProjectionExpression::ListComprehension(comprehension) => {
+            public_name(&comprehension.variable)
+        }
+        ProjectionExpression::LocalVariable { name, .. } => public_name(name),
     };
     own_names && expression.all_children(|child| public_expression_at(child, depth + 1))
 }

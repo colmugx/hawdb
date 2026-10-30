@@ -114,7 +114,11 @@ fn scalar_is_deterministic(expression: &cypher::ScalarExpression) -> bool {
         | Scalar::VectorDistance { .. }
         | Scalar::Binary { .. }
         | Scalar::Not(_)
-        | Scalar::IsNull { .. } => true,
+        | Scalar::IsNull { .. }
+        | Scalar::ListFunction { .. }
+        | Scalar::ListComprehension { .. }
+        | Scalar::ListIndex { .. }
+        | Scalar::ListSlice { .. } => true,
     };
     values_are_deterministic && expression.kind.all_children(scalar_is_deterministic)
 }
@@ -125,6 +129,13 @@ fn return_is_deterministic(expression: &cypher::ReturnExpression) -> bool {
         cypher::ReturnExpressionKind::Arithmetic { first, rest } => {
             return_is_deterministic(first)
                 && rest.iter().all(|(_, value)| return_is_deterministic(value))
+        }
+        cypher::ReturnExpressionKind::Aggregate(cypher::AggregateExpression::Expression {
+            argument,
+            ..
+        }) => return_is_deterministic(argument),
+        cypher::ReturnExpressionKind::ListFunction { arguments, .. } => {
+            arguments.iter().all(return_is_deterministic)
         }
         cypher::ReturnExpressionKind::Aggregate(_) | cypher::ReturnExpressionKind::Path(_) => true,
     }

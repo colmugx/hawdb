@@ -16,7 +16,7 @@ use super::{BoundedScoreCollector, CandidateSet, SearchOutOfCoreMetrics, SearchO
 use crate::build_memory::{checked_add as add, SET_ENTRY_BYTES};
 use crate::error::{HawDBError, Result};
 use crate::lexical_projection::QueryContext;
-use crate::{cosine_similarity, CompressedVectorSearchMode, SearchFallbackReasonCode};
+use crate::{CompressedVectorSearchMode, CosineQuery, SearchFallbackReasonCode};
 use hawdb_executor::QueryMemoryLease;
 #[cfg(feature = "vector-search")]
 use std::cmp::{Ordering, Reverse};
@@ -558,6 +558,12 @@ impl SearchOutOfCoreReader {
             )?,
             None => BoundedScoreCollector::new(retained_limit, max_scored_documents)?,
         };
+        let query_scorer = CosineQuery::with_work(query_embedding, || {
+            context.map_or_else(
+                || checkpoint_vector_task(task_context),
+                |query| query.checkpoint(),
+            )
+        })?;
         let mut vector_document_count = 0usize;
         let mut segment_scan_count = 0usize;
         let mut id_memory = context
@@ -604,7 +610,7 @@ impl SearchOutOfCoreReader {
                     vector_bytes_read = vector_bytes_read.saturating_add(
                         (embedding.len() as u64).saturating_mul(std::mem::size_of::<f32>() as u64),
                     );
-                    if let Some(score) = cosine_similarity(query_embedding, embedding)
+                    if let Some(score) = query_scorer.score(embedding)
                         && score > 0.0
                     {
                         if context.is_some() {
@@ -905,6 +911,19 @@ impl SearchOutOfCoreReader {
             admitted_score_entries(self.config.max_score_entries.get(), scan_working_bytes),
             policy.query,
         )?;
+        let query_scorer = if selected.is_empty() {
+            CosineQuery {
+                query: query_embedding,
+                prepared: None,
+            }
+        } else {
+            CosineQuery::with_work(query_embedding, || {
+                policy.query.map_or_else(
+                    || checkpoint_vector_task(task_context),
+                    |query| query.checkpoint(),
+                )
+            })?
+        };
         let mut raw_segment_scan_count = 0usize;
         let mut reranked_candidate_count = 0usize;
         let mut selected_start = 0usize;
@@ -958,7 +977,7 @@ impl SearchOutOfCoreReader {
                                     (document.embedding.len() as u64).saturating_mul(4),
                                 );
                                 if let Some(score) = rerank_score(
-                                    query_embedding,
+                                    &query_scorer,
                                     &document.embedding,
                                     policy.distance,
                                     || query.checkpoint(),
@@ -995,12 +1014,11 @@ impl SearchOutOfCoreReader {
                             .saturating_mul(std::mem::size_of::<f32>() as u64),
                     );
                     reranked_candidate_count = reranked_candidate_count.saturating_add(1);
-                    if let Some(score) = rerank_score(
-                        query_embedding,
-                        &document.embedding,
-                        policy.distance,
-                        || checkpoint_vector_task(task_context),
-                    )? {
+                    if let Some(score) =
+                        rerank_score(&query_scorer, &document.embedding, policy.distance, || {
+                            checkpoint_vector_task(task_context)
+                        })?
+                    {
                         collector.push(document.id, score)?;
                     }
                 }
@@ -1201,7 +1219,7 @@ impl SearchOutOfCoreReader {
 
 #[cfg(feature = "vector-search")]
 fn rerank_score(
-    query: &[f32],
+    query: &CosineQuery<'_>,
     embedding: &[f32],
     distance: Option<hawdb_core::VectorDistance>,
     checkpoint: impl FnMut() -> Result<()>,
@@ -1209,11 +1227,13 @@ fn rerank_score(
     if let Some(distance) = distance {
         // The shared collector maximizes scores. Only this internal value is
         // negated; the indexed-distance result exposes the mathematical distance.
-        return distance
-            .distance_slices_with_work(query, embedding, checkpoint)
-            .map(|distance| Some(-distance));
+        return match &query.prepared {
+            Some(prepared) => prepared.distance_slices_with_work(distance, embedding, checkpoint),
+            None => distance.distance_slices_with_work(query.query, embedding, checkpoint),
+        }
+        .map(|distance| Some(-distance));
     }
-    Ok(cosine_similarity(query, embedding).filter(|score| *score > 0.0))
+    Ok(query.score(embedding).filter(|score| *score > 0.0))
 }
 
 fn checkpoint_vector_task(task_context: Option<&crate::RuntimeTaskContext>) -> Result<()> {

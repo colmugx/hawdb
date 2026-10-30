@@ -412,9 +412,15 @@ fn collect_projection_columns(
         | ProjectionExpression::VectorDistance { .. }
         | ProjectionExpression::Binary { .. }
         | ProjectionExpression::Not(_)
-        | ProjectionExpression::IsNull { .. } => {
+        | ProjectionExpression::IsNull { .. }
+        | ProjectionExpression::ListFunction { .. }
+        | ProjectionExpression::ListComprehension(_)
+        | ProjectionExpression::ListIndex { .. }
+        | ProjectionExpression::ListSlice { .. } => {
             expression.all_children(|child| collect_projection_columns(child, columns))
         }
+        // Comprehension elements are bound by the enclosing expression.
+        ProjectionExpression::LocalVariable { .. } => true,
         ProjectionExpression::Column(column) => {
             columns.insert(column.clone());
             true
@@ -460,9 +466,14 @@ fn projection_expression_references_column(expression: &ProjectionExpression) ->
         | ProjectionExpression::VectorDistance { .. }
         | ProjectionExpression::Binary { .. }
         | ProjectionExpression::Not(_)
-        | ProjectionExpression::IsNull { .. } => {
+        | ProjectionExpression::IsNull { .. }
+        | ProjectionExpression::ListFunction { .. }
+        | ProjectionExpression::ListComprehension(_)
+        | ProjectionExpression::ListIndex { .. }
+        | ProjectionExpression::ListSlice { .. } => {
             !expression.all_children(|child| !projection_expression_references_column(child))
         }
+        ProjectionExpression::LocalVariable { .. } => false,
         ProjectionExpression::Column(_)
         | ProjectionExpression::ColumnDefaultIfNullOrEq { .. }
         | ProjectionExpression::ColumnValueDefaultIfNull { .. }

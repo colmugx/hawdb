@@ -240,6 +240,14 @@ fn has_native_bindings(expression: &ProjectionExpression, input: &LogicalPlan) -
             has_native_bindings(left, input) && has_native_bindings(right, input)
         }
         ProjectionExpression::IsNull { expression, .. } => has_native_bindings(expression, input),
+        ProjectionExpression::ListFunction { .. }
+        | ProjectionExpression::ListComprehension(_)
+        | ProjectionExpression::ListIndex { .. }
+        | ProjectionExpression::ListSlice { .. } => {
+            expression.all_children(|child| has_native_bindings(child, input))
+        }
+        // A comprehension element is bound by its enclosing expression.
+        ProjectionExpression::LocalVariable { .. } => true,
         ProjectionExpression::CaseEntitySearchRank(rank) => {
             has_native_binding(input, &rank.variable)
         }

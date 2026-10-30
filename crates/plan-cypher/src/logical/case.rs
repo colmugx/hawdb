@@ -41,6 +41,7 @@ pub(super) fn plan_case_scalar(
                 AstOp::Gte => ScalarBinaryOp::Gte,
                 AstOp::Contains => ScalarBinaryOp::Contains,
                 AstOp::ListContains => ScalarBinaryOp::ListContains,
+                AstOp::In => ScalarBinaryOp::In,
                 AstOp::And => ScalarBinaryOp::And,
                 AstOp::Or => ScalarBinaryOp::Or,
             },

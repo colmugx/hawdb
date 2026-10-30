@@ -247,6 +247,40 @@ pub enum ProjectionExpression {
         column: String,
         property: String,
     },
+    /// `size`, `head`, `last`, `tail`, `reverse` or `range`.
+    ListFunction {
+        function: hawdb_core::ListFunction,
+        arguments: Vec<ProjectionExpression>,
+    },
+    /// `[variable IN list WHERE predicate | projection]`.
+    ListComprehension(Box<ListComprehensionProjection>),
+    /// The element bound by an enclosing list comprehension, optionally
+    /// followed by a map-key lookup (`x.key`). It reads no row column.
+    LocalVariable {
+        name: String,
+        property: Option<String>,
+    },
+    /// `list[index]`; negative indexes count from the end.
+    ListIndex {
+        list: Box<ProjectionExpression>,
+        index: Box<ProjectionExpression>,
+    },
+    /// `list[start..end]`; omitted bounds select from the start or to the end.
+    ListSlice {
+        list: Box<ProjectionExpression>,
+        start: Option<Box<ProjectionExpression>>,
+        end: Option<Box<ProjectionExpression>>,
+    },
+}
+
+/// A list comprehension. `variable` is visible only to `predicate` and
+/// `projection`, as [`ProjectionExpression::LocalVariable`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListComprehensionProjection {
+    pub variable: String,
+    pub list: ProjectionExpression,
+    pub predicate: Option<ProjectionExpression>,
+    pub projection: Option<ProjectionExpression>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +298,8 @@ pub enum ScalarBinaryOp {
     Gte,
     Contains,
     ListContains,
+    /// `element IN list` with openCypher three-valued semantics.
+    In,
     And,
     Or,
 }
@@ -323,7 +359,25 @@ impl ProjectionExpression {
             | Self::Lower(expression)
             | Self::Left { expression, .. }
             | Self::JsonValue { expression, .. } => visit(expression),
-            Self::Coalesce(expressions) => expressions.iter().all(visit),
+            Self::Coalesce(expressions)
+            | Self::ListFunction {
+                arguments: expressions,
+                ..
+            } => expressions.iter().all(visit),
+            Self::ListComprehension(comprehension) => [
+                Some(&comprehension.list),
+                comprehension.predicate.as_ref(),
+                comprehension.projection.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .all(visit),
+            Self::ListIndex { list, index } => visit(list) && visit(index),
+            Self::ListSlice { list, start, end } => [Some(list), start.as_ref(), end.as_ref()]
+                .into_iter()
+                .flatten()
+                .map(Box::as_ref)
+                .all(visit),
             _ => true,
         }
     }
@@ -363,9 +417,41 @@ impl ProjectionExpression {
             | Self::Lower(expression)
             | Self::Left { expression, .. }
             | Self::JsonValue { expression, .. } => visit(expression)?,
-            Self::Coalesce(expressions) => {
+            Self::Coalesce(expressions)
+            | Self::ListFunction {
+                arguments: expressions,
+                ..
+            } => {
                 for expression in expressions {
                     visit(expression)?;
+                }
+            }
+            Self::ListComprehension(comprehension) => {
+                let ListComprehensionProjection {
+                    list,
+                    predicate,
+                    projection,
+                    ..
+                } = comprehension.as_mut();
+                visit(list)?;
+                if let Some(predicate) = predicate {
+                    visit(predicate)?;
+                }
+                if let Some(projection) = projection {
+                    visit(projection)?;
+                }
+            }
+            Self::ListIndex { list, index } => {
+                visit(list)?;
+                visit(index)?;
+            }
+            Self::ListSlice { list, start, end } => {
+                visit(list)?;
+                if let Some(start) = start {
+                    visit(start)?;
+                }
+                if let Some(end) = end {
+                    visit(end)?;
                 }
             }
             _ => {}

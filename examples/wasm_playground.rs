@@ -99,7 +99,8 @@ impl QueryBridge {
                     HawDBError::BranchEvidenceBudgetExceeded { .. } => {
                         "branch_evidence_budget_exceeded"
                     }
-                    HawDBError::TransactionConflict { .. } => "transaction_conflict",
+                    HawDBError::TransactionConflict { .. }
+                    | HawDBError::TransactionRetryRequired(_) => "transaction_conflict",
                     HawDBError::AppendSequenceExhausted { .. } => "append_sequence_exhausted",
                     HawDBError::CapabilityUnavailable { .. } => "capability_unavailable",
                 };

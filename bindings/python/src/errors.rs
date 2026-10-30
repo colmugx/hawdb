@@ -178,9 +178,9 @@ pub fn format_hawdb_error(error: &HawDBError) -> PyErr {
         | HawDBError::ReadBudgetExceeded(_)
         | HawDBError::GraphExpansionCandidateLimitExceeded { .. }
         | HawDBError::GraphExpansionPayloadLimitExceeded { .. } => ExecutionError::new_err(message),
-        HawDBError::TransactionConflict { .. } | HawDBError::AppendSequenceExhausted { .. } => {
-            ConflictError::new_err(message)
-        }
+        HawDBError::TransactionConflict { .. }
+        | HawDBError::TransactionRetryRequired(_)
+        | HawDBError::AppendSequenceExhausted { .. } => ConflictError::new_err(message),
         HawDBError::CapabilityUnavailable { .. } => CapabilityError::new_err(message),
         HawDBError::BranchCommandUnsupported { .. }
         | HawDBError::BranchBusy { .. }

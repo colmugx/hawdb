@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub(super) mod determinism;
+mod output_schema;
 
 use super::query_request::{BoundScoringRequest, ScoringPlanCacheKey};
 use super::{
@@ -33,10 +34,13 @@ use hawdb_optimizer::graph::{
     node_equality_index_seek_is_cheaper, optimizer_catalog_from_graph_statistics,
     NODE_INDEX_SMALL_LABEL_SCAN_THRESHOLD,
 };
+#[cfg(test)]
+use hawdb_plan_cache::ParameterBindingTemplate;
 use hawdb_plan_cache::{
-    bind_physical_plan_parameters, parameter_binding_shape_fingerprint, parameter_scalar_types,
-    parameterize_logical_plan, parameterize_value_list, resolve_plan_template_value, LfuCache,
-    ParameterBindingTemplate, ParameterizedLogicalPlan, PlanParameterCacheKey,
+    bind_physical_plan_parameters, parameter_scalar_types, parameterize_logical_plan,
+    parameterize_value_list, resolve_plan_template_value, LfuCache, OptimizerSchemaKey,
+    ParameterBindingCache, ParameterBindingCacheConfig, ParameterizedLogicalPlan,
+    PlanParameterCacheKey,
 };
 pub use hawdb_plan_cache::{PlanCacheBypassReason, PlanCacheLookup, PlanCacheStats};
 use hawdb_plan_cypher::{BatchMutationOperation, ProjectionExpression};
@@ -76,11 +80,27 @@ pub(super) struct OptimizedQueryPlan {
     // takes this after planning so cache hits preserve the current text hash.
     pub(super) query_identity: Option<hawdb_query::QueryIdentity>,
     pub(super) physical_plan: PhysicalPlan,
+    pub(super) output_columns: Option<Vec<String>>,
     pub(super) trace: OptimizerTrace,
     pub(super) plan_cache_lookup: PlanCacheLookup,
     pub(super) optimizer_environment: OptimizerEnvironmentKey,
     pub(super) configured_max_optimizer_groups: Option<usize>,
     pub(super) effective_max_optimizer_groups: usize,
+}
+
+impl OptimizedQueryPlan {
+    pub(super) fn collect_named_rows(
+        &self,
+        rows: Vec<crate::executor::Row>,
+    ) -> Result<hawdb_executor::QueryRows> {
+        match &self.output_columns {
+            Some(columns) => hawdb_executor::QueryRows::try_from_named_rows(
+                hawdb_executor::QuerySchema::try_new(columns.iter().cloned())?,
+                rows,
+            ),
+            None => Ok(rows.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -359,36 +379,6 @@ fn ordered_range_indexes<R: hawdb_storage::graph_engine::GraphReadEngine>(
         .collect()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct OptimizerSchemaKey {
-    labels: Vec<String>,
-    unique_constraints: Vec<(crate::schema::ConstraintSubject, String)>,
-    relationship_types: Vec<String>,
-    equality_indexes: Vec<(String, String)>,
-    range_indexes: Vec<(String, String)>,
-    full_text_indexes: Vec<(String, String)>,
-    composite_indexes: Vec<(String, Vec<String>)>,
-    /// Declared property descriptors, because declaring or altering a
-    /// property's type/nullability/state changes which properties are
-    /// eligible for optimizer statistics even when labels and indexes are
-    /// unchanged. Without them a descriptor DDL inside the commit-lag window
-    /// would leave now-ineligible statistics cached.
-    property_descriptors: Vec<SchemaPropertyDescriptor>,
-}
-
-/// Property-descriptor identity for [`OptimizerSchemaKey`]. Lifecycle states
-/// (`SchemaObjectState`) are intentionally excluded: they transition as online
-/// DDL machinery backfills and would churn the shared schema key without
-/// changing statistics eligibility, which depends only on the declared type.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct SchemaPropertyDescriptor {
-    table: String,
-    table_kind: TableKind,
-    property: String,
-    value_type: PropertyType,
-    nullable: bool,
-}
-
 #[derive(Debug, Clone)]
 struct CachedOptimizerCatalog {
     environment: OptimizerEnvironmentKey,
@@ -422,7 +412,7 @@ struct StatisticsCacheRefresh {
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct OptimizerPlanningCache {
-    parameter_bindings: Option<LfuCache<(String, u64), Arc<ParameterBindingTemplate>>>,
+    parameter_bindings: Option<ParameterBindingCache>,
     statistics: Option<Arc<GraphStatistics>>,
     statistics_schema: Option<OptimizerSchemaKey>,
     statistics_source_graph_commit_epoch: Option<u64>,
@@ -435,65 +425,6 @@ struct OptimizerCatalogAccess {
     environment: OptimizerEnvironmentKey,
     catalog: Arc<OptimizerCatalog>,
     decisions: Vec<String>,
-}
-
-impl OptimizerSchemaKey {
-    fn from_catalog(catalog: &Catalog) -> Self {
-        let labels = catalog.labels().map(|label| label.name.clone()).collect();
-        let relationship_types = catalog
-            .rel_types()
-            .map(|rel_type| rel_type.name.clone())
-            .collect();
-        let mut equality_indexes = Vec::new();
-        let mut range_indexes = Vec::new();
-        let mut full_text_indexes = Vec::new();
-        for index in catalog.property_indexes() {
-            let Some(label) = catalog.label_name(index.label_id) else {
-                continue;
-            };
-            let descriptor = (label.to_string(), index.property.clone());
-            match index.kind {
-                IndexKind::Equality => equality_indexes.push(descriptor),
-                IndexKind::Range => range_indexes.push(descriptor),
-                IndexKind::FullText => full_text_indexes.push(descriptor),
-            }
-        }
-        let composite_indexes = catalog
-            .composite_property_indexes()
-            .filter_map(|index| {
-                catalog
-                    .label_name(index.label_id)
-                    .map(|label| (label.to_string(), index.properties.clone()))
-            })
-            .collect();
-        let mut property_descriptors = catalog
-            .property_descriptors()
-            .filter_map(|property| {
-                let table = catalog.table_descriptor(property.table_id)?;
-                Some(SchemaPropertyDescriptor {
-                    table: table.name.clone(),
-                    table_kind: table.kind,
-                    property: property.name.clone(),
-                    value_type: property.value_type,
-                    nullable: property.nullable,
-                })
-            })
-            .collect::<Vec<_>>();
-        property_descriptors.sort();
-        Self {
-            unique_constraints: catalog
-                .unique_constraints()
-                .map(|constraint| (constraint.subject, constraint.property.clone()))
-                .collect(),
-            labels,
-            relationship_types,
-            equality_indexes,
-            range_indexes,
-            full_text_indexes,
-            composite_indexes,
-            property_descriptors,
-        }
-    }
 }
 
 impl OptimizerEnvironmentKey {
@@ -541,44 +472,41 @@ impl OptimizerPlanningCache {
         max_entries: Option<usize>,
         max_bytes: usize,
     ) -> Result<(ParameterizedLogicalPlan, bool)> {
-        let key = (
-            normalized_query.to_owned(),
-            parameter_binding_shape_fingerprint(parameters),
-        );
+        let config = ParameterBindingCacheConfig {
+            max_entries,
+            max_bytes,
+        };
+        let key = ParameterBindingCache::key(normalized_query, parameters);
         let cached = shared
             .borrow_mut()
-            .parameter_binding_cache(max_entries, max_bytes)
-            .get(&key);
-        // Bind/clone outside the shared lock; a large cohort must not serialize
-        // independent readers while it validates or prepares a template.
+            .parameter_binding_cache(config)
+            .lookup(&key);
+        // Template validation and planning stay outside the shared lock.
         if let Some(template) = cached
             && let Some(plan) = template.reuse(parameters)
         {
             return Ok((plan, true));
         }
         let plan = parameterize_logical_plan(statement, parameters)?;
-        if let Some(template) = ParameterBindingTemplate::new(&plan, parameters)
-            && let Some(bytes) = template
-                .retained_heap_bytes()
-                .and_then(|bytes| bytes.checked_add(key.0.capacity()))
-        {
+        if let Some(candidate) = ParameterBindingCache::prepare_admission(key, &plan, parameters) {
             shared
                 .borrow_mut()
-                .parameter_binding_cache(max_entries, max_bytes)
-                .insert_weighted(key, Arc::new(template), bytes);
+                .parameter_binding_cache(config)
+                .admit(candidate);
         }
         Ok((plan, false))
     }
 
     fn parameter_binding_cache(
         &mut self,
-        max_entries: Option<usize>,
-        max_bytes: usize,
-    ) -> &mut LfuCache<(String, u64), Arc<ParameterBindingTemplate>> {
-        if self.parameter_bindings.as_ref().is_none_or(|cache| {
-            cache.stats().max_entries != max_entries || cache.max_bytes() != Some(max_bytes)
-        }) {
-            self.parameter_bindings = Some(LfuCache::with_byte_limit(max_entries, Some(max_bytes)));
+        config: ParameterBindingCacheConfig,
+    ) -> &mut ParameterBindingCache {
+        if self
+            .parameter_bindings
+            .as_ref()
+            .is_none_or(|cache| cache.config() != config)
+        {
+            self.parameter_bindings = Some(ParameterBindingCache::new(config));
         }
         self.parameter_bindings
             .as_mut()
@@ -881,6 +809,13 @@ pub(super) fn optimized_query_plan_for<S: crate::executor::ExecutionStore>(
             record_access_control_plan_decision(&mut trace, context.access_control);
             return Ok(OptimizedQueryPlan {
                 query_identity: Some(query_identity),
+                output_columns: output_schema::logical_output_columns(
+                    parameterized
+                        .as_ref()
+                        .expect("cached plans have a logical template")
+                        .logical(),
+                    context.scoring,
+                ),
                 physical_plan,
                 trace,
                 plan_cache_lookup: PlanCacheLookup::Hit,
@@ -895,6 +830,7 @@ pub(super) fn optimized_query_plan_for<S: crate::executor::ExecutionStore>(
     } else {
         planner::plan_with_params(statement_body(statement), parameters)?
     };
+    let output_columns = output_schema::logical_output_columns(&logical, context.scoring);
     if let Some(access_control) = context.access_control {
         logical = apply_access_control_to_logical_plan(
             logical,
@@ -1012,6 +948,7 @@ pub(super) fn optimized_query_plan_for<S: crate::executor::ExecutionStore>(
             .push("plan cache miss: optimized parameterized physical plan template".to_string());
         return Ok(OptimizedQueryPlan {
             query_identity: Some(query_identity),
+            output_columns,
             physical_plan,
             trace,
             plan_cache_lookup: PlanCacheLookup::Miss,
@@ -1026,6 +963,7 @@ pub(super) fn optimized_query_plan_for<S: crate::executor::ExecutionStore>(
             .push(format!("plan cache bypass: {}", reason.as_str()));
         return Ok(OptimizedQueryPlan {
             query_identity: Some(query_identity),
+            output_columns,
             physical_plan,
             trace,
             plan_cache_lookup: PlanCacheLookup::Bypass(reason),
@@ -1298,7 +1236,6 @@ pub(super) fn statement_uses_plan_cache(statement: &cypher::Statement) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::SchemaObjectState;
     use std::collections::BTreeMap;
 
     fn binding_parameters(length: usize, nullable: bool) -> BTreeMap<String, Value> {
@@ -2613,26 +2550,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&path);
-    }
-
-    /// Online DDL lifecycle transitions (`DeleteOnly`→…→`Public`) must not
-    /// churn the shared schema key: statistics eligibility depends on the
-    /// declared type, not on how far the machinery has backfilled.
-    #[test]
-    fn schema_key_ignores_descriptor_lifecycle_states() {
-        let mut catalog = Catalog::default();
-        let table = catalog.get_or_create_table(TableKind::Node, "T");
-        let property = catalog.get_or_create_property(table, "body", PropertyType::String, true);
-        let baseline = OptimizerSchemaKey::from_catalog(&catalog);
-
-        let mut churned = catalog.clone();
-        churned.set_property_state(property, SchemaObjectState::Backfill);
-        churned.set_table_state(table, SchemaObjectState::Validating);
-        assert_eq!(baseline, OptimizerSchemaKey::from_catalog(&churned));
-
-        let mut extended = catalog.clone();
-        extended.get_or_create_property(table, "title", PropertyType::Text, false);
-        assert_ne!(baseline, OptimizerSchemaKey::from_catalog(&extended));
     }
 
     /// The planning cache is shared across snapshots: a call planning against

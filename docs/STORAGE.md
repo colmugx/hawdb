@@ -408,6 +408,16 @@ dependencies that close a cycle aborts the current waiter as the deterministic
 deadlock victim and releases all of its locks. Wakeup, timeout, commit,
 rollback, and drop remove both held locks and wait dependencies.
 
+Hosts can use `HawDBError::is_retryable_transaction_conflict()` for both
+optimistic conflicts and pessimistic snapshot/deadlock failures. The latter
+carry `TransactionRetryRequired(TransactionRetryError)` with a typed reason
+and transaction identity. Calls made after that abort retain the original
+reason and set `already_aborted`; retry the complete transaction with a fresh
+snapshot. Lock timeouts keep their existing statement/transaction rollback
+policy and are not included in this transaction-retry classification. Generic
+execution, cancellation, poisoned-manager and storage errors are not promoted
+to retryable errors by their message text.
+
 Every durable open acquires an exclusive process-lifetime lease on the database
 directory. The host opens one root `Database` handle and derives sessions,
 transactions, and snapshot readers from that handle. A process-local canonical
