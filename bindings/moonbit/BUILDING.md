@@ -34,6 +34,9 @@ bazel test --test_output=errors --test_env=PATH --test_env=HOME \
   //bindings/moonbit:hawdb_moonbit_tests
 ```
 
+The independent module acceptance fixture lives under
+`tests/external-consumer/`, together with its own `moon.work` and
+`moon.mod`; it is a test fixture, not a second binding package.
 The Bazel test runner stages the static library from Bazel into a writable
 MoonBit workspace; it never invokes Cargo or rebuilds the HawDB engine.
 The legacy Native SDK workflow still owns Windows tests and review artifact

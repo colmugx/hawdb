@@ -116,7 +116,8 @@ indexes, idempotent append/update contracts, versioned metadata, conflict
 handling, crash/fault-injection tests and recovery policy; the existing
 Session-like conformance test does **not** yet qualify a production adapter.
 
-See `BUILDING.md` for frozen Cargo dependencies and the platform matrix.
+See `BUILDING.md` for Bazel test entry points, the rolling HawDB
+dependency policy and the platform matrix.
 Attribute-driven record generation is opt-in and deliberately restricted
 to simple struct types; see `tools/README.md`.
 
@@ -129,6 +130,7 @@ bindings/moonbit/
   value.mbt                  MoonBit ADT, typed codec, query/row API
   native/                    Independent Rust staticlib, direct engine dependency
   tests/conformance/         Executable cross-language behavior contracts
+  tests/external-consumer/   Independent module import/link test fixture
 ```
 
 See `bindings/python/tests/` and `bindings/go/hawdb_test.go` for

@@ -5,7 +5,7 @@ pkgtype(kind: "executable")
 options(
   link: {
     "native": {
-      "cc-link-flags": "../../moonbit/native/target/release/libhawdb_moonbit.a -ldl -lpthread -lm",
+      "cc-link-flags": "../../../native/target/release/libhawdb_moonbit.a -ldl -lpthread -lm",
     },
   },
 )

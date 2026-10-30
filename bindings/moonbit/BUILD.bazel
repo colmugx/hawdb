@@ -10,6 +10,8 @@ filegroup(
         "*.mbt",
         "tests/**/*.mbt",
         "tests/**/moon.pkg",
+        "tests/**/moon.mod",
+        "tests/**/moon.work",
         "examples/*.mbt.in",
         "tools/*.py",
         "tools/tests/*.py",
@@ -32,7 +34,6 @@ filegroup(
         ],
         data = [
             ":sdk_sources",
-            "//bindings/moonbit-consumer-smoke:consumer_sources",
             "//bindings/moonbit/native:hawdb_moonbit_static",
         ],
         target_compatible_with = select({

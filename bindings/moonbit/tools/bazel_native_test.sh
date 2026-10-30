@@ -18,7 +18,6 @@ mkdir -p "$workspace/bindings"
 # Dereference runfile symlinks so MoonBit may generate writable outputs without
 # modifying the checkout or Bazel's immutable input tree.
 cp -RL "$runfiles/bindings/moonbit" "$workspace/bindings/"
-cp -RL "$runfiles/bindings/moonbit-consumer-smoke" "$workspace/bindings/"
 sdk="$workspace/bindings/moonbit"
 mkdir -p "$sdk/native/target/release"
 
@@ -55,10 +54,10 @@ case "$mode" in
   consumer)
     if [[ "$(uname -s)" == Darwin ]]; then
       python3 tools/configure_native_link.py --os macos \
-        --pkg ../moonbit-consumer-smoke/consumer/moon.pkg \
-        --sdk-prefix ../../moonbit/
+        --pkg tests/external-consumer/consumer/moon.pkg \
+        --sdk-prefix ../../../
     fi
-    cd "$workspace/bindings/moonbit-consumer-smoke/consumer"
+    cd "$sdk/tests/external-consumer/consumer"
     moon check --target native
     moon run --target native . 2>&1 | tee external-consumer.log
     ! grep -q '^EXTERNAL_CONSUMER_FAIL ' external-consumer.log

@@ -5,7 +5,6 @@ on:
     branches: [feat/moonbit-native-sdk]
     paths:
       - "bindings/moonbit/**"
-      - "bindings/moonbit-consumer-smoke/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**"
@@ -14,7 +13,6 @@ on:
   pull_request:
     paths:
       - "bindings/moonbit/**"
-      - "bindings/moonbit-consumer-smoke/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**"
@@ -93,9 +91,9 @@ jobs:
         if: runner.os == 'macOS'
         working-directory: bindings/moonbit
         shell: bash
-        run: python3 tools/configure_native_link.py --os macos --pkg ../moonbit-consumer-smoke/consumer/moon.pkg --sdk-prefix ../../moonbit/
+        run: python3 tools/configure_native_link.py --os macos --pkg tests/external-consumer/consumer/moon.pkg --sdk-prefix ../../../
       - name: Execute independent MoonBit consumer
-        working-directory: bindings/moonbit-consumer-smoke/consumer
+        working-directory: bindings/moonbit/tests/external-consumer/consumer
         shell: bash
         run: |
           set -euo pipefail
@@ -206,10 +204,10 @@ jobs:
         working-directory: bindings/moonbit
         shell: pwsh
         run: |
-          python tools/configure_native_link.py --os windows --pkg ../moonbit-consumer-smoke/consumer/moon.pkg --sdk-prefix ../../moonbit/
+          python tools/configure_native_link.py --os windows --pkg tests/external-consumer/consumer/moon.pkg --sdk-prefix ../../../
           if ($LASTEXITCODE -ne 0) { throw "Consumer link setup failed" }
       - name: Execute independent MoonBit consumer
-        working-directory: bindings/moonbit-consumer-smoke/consumer
+        working-directory: bindings/moonbit/tests/external-consumer/consumer
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
